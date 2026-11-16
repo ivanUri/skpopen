@@ -180,6 +180,15 @@ export default function HomePage() {
 
   const activeScene = activeSceneIndex === null ? null : scenes[activeSceneIndex] ?? null;
   const activeSectionPlane = activeSectionPlaneIndex === null ? null : modelInfo?.sectionPlanes[activeSectionPlaneIndex] ?? null;
+  const selectedAbfPart = useMemo(() => {
+    const boardIndex = selectedEntity?.abf?.boardIndex;
+    if (!boardIndex) return null;
+    return modelInfo?.abf?.parts.find((part) => part.boardIndex === boardIndex) ?? null;
+  }, [modelInfo?.abf?.parts, selectedEntity?.abf?.boardIndex]);
+  const selectedAbfSheet = useMemo(() => {
+    if (!selectedEntity?.groupPath || !modelInfo?.abf) return null;
+    return modelInfo.abf.nestingSheets.find((sheet) => selectedEntity.groupPath === sheet.path || selectedEntity.groupPath.startsWith(`${sheet.path} / `)) ?? null;
+  }, [modelInfo?.abf, selectedEntity?.groupPath]);
 
   const handleModelInfo = useCallback((info: ModelInfo) => {
     setModelInfo(info);
@@ -521,6 +530,7 @@ export default function HomePage() {
                   <span>Size</span><strong>{formatDimension(selectedEntity.sizeMm[0])} × {formatDimension(selectedEntity.sizeMm[1])} × {formatDimension(selectedEntity.sizeMm[2])}</strong>
                   <span>Position</span><strong>{Math.round(selectedEntity.positionMm[0])}, {Math.round(selectedEntity.positionMm[1])}, {Math.round(selectedEntity.positionMm[2])} mm</strong>
                 </div>
+                {selectedAbfPart && <div className="entity-properties entity-board-properties"><strong>Board specification</strong><span><em>Board index</em>#{selectedAbfPart.boardIndex}</span><span><em>Part name</em>{selectedAbfPart.name.replace(/^__\d+\.?\s*/, "")}</span><span><em>Material</em>{selectedAbfPart.material}</span><span><em>Dimensions</em>{formatDimension(selectedAbfPart.sizeMm[0])} × {formatDimension(selectedAbfPart.sizeMm[1])} × {formatDimension(selectedAbfPart.sizeMm[2])}</span><span><em>Label rotation</em>{selectedAbfPart.labelRotation ? `${selectedAbfPart.labelRotation}°` : "—"}</span><span><em>Edge banding</em>{selectedAbfPart.edgeBandTypes || "None"}</span>{selectedAbfSheet && <span><em>Nesting sheet</em>{selectedAbfSheet.name}</span>}</div>}
                 {Object.entries(selectedEntity.properties).length > 0 && <div className="entity-properties"><strong>Dynamic attributes</strong>{Object.entries(selectedEntity.properties).slice(0, 8).map(([key, value]) => <span key={key}><em>{key}</em>{value}</span>)}</div>}
                 {selectedEntity.abf && <div className="entity-properties entity-abf-properties"><strong>ABF production</strong><span><em>Role</em>{selectedEntity.abf.role}</span><span><em>In nesting</em>{selectedEntity.abf.inNesting ? "Yes" : "No"}</span>{selectedEntity.abf.boardIndex && <span><em>Board index</em>{selectedEntity.abf.boardIndex}</span>}{selectedEntity.abf.edgeBandTypes && <span><em>Edge band</em>{selectedEntity.abf.edgeBandTypes}</span>}{selectedEntity.abf.settingName && <span><em>Operation</em>{selectedEntity.abf.settingName}</span>}</div>}
                 {Object.entries(selectedEntity.attributeDictionaries).slice(0, 4).map(([dictionary, values]) => <div className="entity-properties" key={dictionary}><strong>{dictionary}</strong>{Object.entries(values).slice(0, 8).map(([key, value]) => <span key={key}><em>{key}</em>{value}</span>)}</div>)}

@@ -161,6 +161,8 @@ h1 { margin: 0; max-width: 190px; overflow: hidden; text-overflow: ellipsis; whi
 .entity-properties > strong { color: #526a6a; font-size: 9px; }
 .entity-properties > span { display: flex; justify-content: space-between; gap: 10px; color: #718083; font: 8px 'DM Mono', monospace; }
 .entity-properties em { overflow: hidden; color: #98a5a3; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.entity-board-properties { border-color: #c5d8d0; background: #f2f8f5; }
+.entity-board-properties > strong { color: #365657; }
 .annotation-toggle-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
 .annotation-toggle-grid button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-height: 32px; border: 1px solid transparent; border-radius: 5px; background: #edf1ef; color: #718083; font-size: 9px; }
 .annotation-toggle-grid button:hover, .annotation-toggle-grid button.selected { border-color: #b8cac5; background: #e0ebe7; color: #365657; }
