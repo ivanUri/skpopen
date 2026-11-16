@@ -323,13 +323,16 @@ function abfOperation(metadata: AbfMetadata, abf: AbfEntityInfo) {
 function applyExplode(root: THREE.Object3D, factor: number) {
   const modelBox = new THREE.Box3().setFromObject(root);
   const modelCenter = modelBox.getCenter(new THREE.Vector3());
+  const modelSize = modelBox.getSize(new THREE.Vector3()).length();
+  const maxExplodeDistance = Math.max(2.8, modelSize * 0.65);
   root.traverse((object) => {
     if (!(object instanceof THREE.Mesh) || !object.userData.isSkpMesh) return;
     if (!object.userData.explodeOffset) {
       const objectCenter = new THREE.Box3().setFromObject(object).getCenter(new THREE.Vector3());
       const direction = objectCenter.sub(modelCenter);
       if (direction.lengthSq() < 1e-8) direction.set(0, 1, 0);
-      object.userData.explodeOffset = direction.normalize().multiplyScalar(Math.min(1.1, Math.max(0.12, objectCenter.distanceTo(modelCenter) * 0.18)));
+      const distance = Math.max(0.25, objectCenter.distanceTo(modelCenter) * 0.58);
+      object.userData.explodeOffset = direction.normalize().multiplyScalar(Math.min(maxExplodeDistance, distance));
     }
     object.position.copy(object.userData.explodeOffset).multiplyScalar(factor);
   });
