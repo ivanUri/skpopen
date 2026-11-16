@@ -1650,15 +1650,50 @@ function toSceneDirection(point: [number, number, number]) {
   return new THREE.Vector3(point[0], point[2], -point[1]).normalize();
 }
 
-function FitCamera({ model, preset, projection, fov, activeScene, selectedInstallId, selectedGroupPath }: { model: THREE.Object3D | null; preset: "iso" | "front" | "top"; projection: Projection; fov: number; activeScene: ScenePage | null; selectedInstallId: string | null; selectedGroupPath: string | null }) {
+function sceneModelBounds(model: THREE.Object3D, activeLayer: string, hiddenLayers: string[], selectedInstallId: string | null, selectedGroupPath: string | null) {
+  const bounds = new THREE.Box3();
+  const hiddenLayerSet = new Set(hiddenLayers.map(normalizeLayerName));
+  model.updateMatrixWorld(true);
+  model.traverse((object) => {
+    if (!(object instanceof THREE.Mesh)) return;
+    const layer = normalizeLayerName(object.userData.layer);
+    if (hiddenLayerSet.has(layer) || (activeLayer !== "All layers" && layer !== normalizeLayerName(activeLayer))) return;
+    if (selectedInstallId && object.userData.installId !== selectedInstallId) return;
+    const groupPath = String(object.userData.groupPath || "ROOT");
+    if (selectedGroupPath && groupPath !== selectedGroupPath && !groupPath.startsWith(`${selectedGroupPath} / `)) return;
+    bounds.expandByObject(object);
+  });
+  return bounds;
+}
+
+function sceneCameraFrame(model: THREE.Object3D, scene: ScenePage, activeLayer: string, hiddenLayers: string[], selectedInstallId: string | null, selectedGroupPath: string | null) {
+  const eye = scene.eye ? toScenePoint(scene.eye) : new THREE.Vector3();
+  const savedTarget = scene.target ? toScenePoint(scene.target) : eye.clone().add(new THREE.Vector3(0, 0, -1));
+  const bounds = sceneModelBounds(model, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath);
+  if (bounds.isEmpty()) return { position: eye, target: savedTarget };
+  const center = bounds.getCenter(new THREE.Vector3());
+  const size = bounds.getSize(new THREE.Vector3());
+  const maxSize = Math.max(size.x, size.y, size.z, 1);
+  const direction = savedTarget.clone().sub(eye);
+  if (direction.lengthSq() < 1e-8) direction.copy(center).sub(eye);
+  if (direction.lengthSq() < 1e-8) direction.set(0, 0, -1);
+  direction.normalize();
+  const projectedDistance = center.clone().sub(eye).dot(direction);
+  const projectedTarget = eye.clone().addScaledVector(direction, Math.max(projectedDistance, maxSize * 0.05));
+  const target = projectedTarget.clone().clamp(bounds.min, bounds.max);
+  return { position: eye, target };
+}
+
+function FitCamera({ model, preset, projection, fov, activeLayer, hiddenLayers, activeScene, selectedInstallId, selectedGroupPath }: { model: THREE.Object3D | null; preset: "iso" | "front" | "top"; projection: Projection; fov: number; activeLayer: string; hiddenLayers: string[]; activeScene: ScenePage | null; selectedInstallId: string | null; selectedGroupPath: string | null }) {
   const { camera } = useThree();
   const controls = useRef<any>(null);
 
   const frameModel = useCallback((nextPreset: "iso" | "front" | "top" = preset) => {
     if (!model) return;
     if (activeScene?.eye && activeScene.target) {
-      camera.position.copy(toScenePoint(activeScene.eye));
-      controls.current?.target.copy(toScenePoint(activeScene.target));
+      const frame = sceneCameraFrame(model, activeScene, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath);
+      camera.position.copy(frame.position);
+      controls.current?.target.copy(frame.target);
       if (activeScene.up) camera.up.copy(toSceneDirection(activeScene.up));
       if (camera instanceof THREE.PerspectiveCamera) camera.fov = activeScene.fov || fov;
       if (camera instanceof THREE.OrthographicCamera) camera.zoom = activeScene.orthoHeight > 0 ? 1 / (activeScene.orthoHeight * INCH_TO_METRE) : 1;
@@ -1692,7 +1727,7 @@ function FitCamera({ model, preset, projection, fov, activeScene, selectedInstal
     camera.updateProjectionMatrix();
     controls.current?.target.copy(center);
     controls.current?.update();
-  }, [activeScene, camera, fov, model, preset, selectedGroupPath, selectedInstallId]);
+  }, [activeLayer, activeScene, camera, fov, hiddenLayers, model, preset, selectedGroupPath, selectedInstallId]);
 
   useEffect(() => frameModel(), [frameModel, projection]);
 
@@ -1746,7 +1781,7 @@ export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, 
       <MeasurementOverlay points={measurementPoints} />
       <AbfLabelsOverlay model={model} visible={abfVisibility.labels} showNesting={abfVisibility.nesting} />
       <ModelAnnotations info={modelInfo} showDimensions={showDimensions} showGuides={showGuides} activeSectionPlane={activeSectionPlane} />
-      <FitCamera model={model} preset={viewPreset} projection={projection} fov={fov} activeScene={activeScene} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} />
+      <FitCamera model={model} preset={viewPreset} projection={projection} fov={fov} activeLayer={activeLayer} hiddenLayers={hiddenLayers} activeScene={activeScene} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} />
     </Canvas>
   );
 }

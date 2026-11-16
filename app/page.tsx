@@ -298,6 +298,16 @@ export default function HomePage() {
     setSelectedEntity(null);
   }, [scenes]);
 
+  const selectViewPreset = useCallback((preset: "iso" | "front" | "top") => {
+    setActiveSceneIndex(null);
+    setActiveLayer("All layers");
+    setHiddenLayers(modelInfo?.hiddenLayers ?? []);
+    setSelectedInstallId(null);
+    setSelectedGroupPath(null);
+    setSelectedEntity(null);
+    setViewPreset(preset);
+  }, [modelInfo?.hiddenLayers]);
+
   const handleEntitySelect = useCallback((entity: PickedEntity | null) => {
     setSelectedEntity(entity);
     if (!entity) {
@@ -404,9 +414,9 @@ export default function HomePage() {
                   <input id="header-fov" type="range" min="20" max="80" value={fov} disabled={projection === "orthographic"} onChange={(event) => { setFov(Number(event.target.value)); setActiveSceneIndex(null); }} />
                 </div>
                 <div className="header-menu-divider" />
-                <button onClick={() => { setViewPreset("iso"); setOpenMenu(null); }}><Rotate3D size={14} /> Isometric</button>
-                <button onClick={() => { setViewPreset("front"); setOpenMenu(null); }}><Scan size={14} /> Front</button>
-                <button onClick={() => { setViewPreset("top"); setOpenMenu(null); }}><Grid3X3 size={14} /> Top</button>
+                <button onClick={() => { selectViewPreset("iso"); setOpenMenu(null); }}><Rotate3D size={14} /> Isometric</button>
+                <button onClick={() => { selectViewPreset("front"); setOpenMenu(null); }}><Scan size={14} /> Front</button>
+                <button onClick={() => { selectViewPreset("top"); setOpenMenu(null); }}><Grid3X3 size={14} /> Top</button>
                 <div className="header-menu-divider" />
                 <button onClick={() => { window.dispatchEvent(new Event("skp-fit-model")); setOpenMenu(null); }}><Maximize size={14} /> Fit model <span>F</span></button>
                 <button onClick={() => { window.dispatchEvent(new Event("skp-zoom-in")); setOpenMenu(null); }}><ZoomIn size={14} /> Zoom in</button>
@@ -667,9 +677,9 @@ export default function HomePage() {
           {selectedEntity && selectedAbfPart && <div className="selected-board-screen-card"><span className="selected-board-screen-kicker">SELECTED BOARD</span><strong>#{selectedAbfPart.boardIndex} · {selectedAbfPart.name.replace(/^__\d+\.?\s*/, "")}</strong><span>{selectedAbfPart.material} · {formatDimension(selectedAbfPart.sizeMm[0])} × {formatDimension(selectedAbfPart.sizeMm[1])} × {formatDimension(selectedAbfPart.sizeMm[2])}</span><span>{selectedAbfPart.edgeBandTypes ? `Cạnh dán: ${selectedAbfPart.edgeBandTypes}` : "Không có cạnh dán"}</span></div>}
           {measureMode && <div className="measure-mode-chip"><Ruler size={13} /><span>MEASURE</span><strong>{measurementDistance === null ? "Chọn 2 điểm trên model" : `${measurementDistance.toFixed(3)} m`}</strong><button onClick={() => { setMeasurementPoints([]); setMeasureMode(false); }}>×</button></div>}
           <div className="view-cube" aria-label="View presets">
-            <button className={viewPreset === "top" ? "selected" : ""} onClick={() => setViewPreset("top")}>TOP</button>
-            <button className={viewPreset === "iso" ? "selected" : ""} onClick={() => setViewPreset("iso")}>ISO</button>
-            <button className={viewPreset === "front" ? "selected" : ""} onClick={() => setViewPreset("front")}>FRONT</button>
+            <button className={viewPreset === "top" ? "selected" : ""} onClick={() => selectViewPreset("top")}>TOP</button>
+            <button className={viewPreset === "iso" ? "selected" : ""} onClick={() => selectViewPreset("iso")}>ISO</button>
+            <button className={viewPreset === "front" ? "selected" : ""} onClick={() => selectViewPreset("front")}>FRONT</button>
           </div>
           <SketchupCanvas
             buffer={buffer}
