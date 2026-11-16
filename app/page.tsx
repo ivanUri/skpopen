@@ -24,7 +24,7 @@ import {
   Upload,
   ZoomIn,
 } from "lucide-react";
-import SketchupCanvas, { InstallationItem, Projection, RenderStyle, SceneGroup } from "../components/SketchupCanvas";
+import SketchupCanvas, { InstallationItem, PickedEntity, Projection, RenderStyle, SceneGroup, ScenePage } from "../components/SketchupCanvas";
 
 type ModelStats = {
   version?: string;
@@ -75,13 +75,20 @@ export default function HomePage() {
   const [showAxes, setShowAxes] = useState(true);
   const [renderStyle, setRenderStyle] = useState<RenderStyle>("shaded");
   const [projection, setProjection] = useState<Projection>("perspective");
+  const [fov, setFov] = useState(35);
   const [leftPanel, setLeftPanel] = useState(true);
   const [activeLayer, setActiveLayer] = useState("All layers");
+  const [hiddenLayers, setHiddenLayers] = useState<string[]>([]);
   const [viewPreset, setViewPreset] = useState<"iso" | "front" | "top">("iso");
   const [installationItems, setInstallationItems] = useState<InstallationItem[]>([]);
   const [sceneGroups, setSceneGroups] = useState<SceneGroup[]>([]);
+  const [scenes, setScenes] = useState<ScenePage[]>([]);
+  const [activeSceneIndex, setActiveSceneIndex] = useState<number | null>(null);
   const [selectedInstallId, setSelectedInstallId] = useState<string | null>(null);
   const [selectedGroupPath, setSelectedGroupPath] = useState<string | null>(null);
+  const [selectedEntity, setSelectedEntity] = useState<PickedEntity | null>(null);
+  const [measureMode, setMeasureMode] = useState(false);
+  const [measurementPoints, setMeasurementPoints] = useState<[number, number, number][]>([]);
   const [openMenu, setOpenMenu] = useState<HeaderMenu>(null);
 
   const readFile = useCallback(async (nextFile: File) => {
@@ -93,8 +100,14 @@ export default function HomePage() {
     setError(null);
     setSelectedInstallId(null);
     setSelectedGroupPath(null);
+    setSelectedEntity(null);
     setInstallationItems([]);
     setSceneGroups([]);
+    setScenes([]);
+    setActiveSceneIndex(null);
+    setHiddenLayers([]);
+    setMeasureMode(false);
+    setMeasurementPoints([]);
     setIsLoading(true);
     setProgress(8);
     setFile(nextFile);
@@ -141,6 +154,45 @@ export default function HomePage() {
   useEffect(() => {
     if (!layers.includes(activeLayer)) setActiveLayer("All layers");
   }, [activeLayer, layers]);
+
+  const activeScene = activeSceneIndex === null ? null : scenes[activeSceneIndex] ?? null;
+
+  const selectScene = useCallback((index: number) => {
+    const scene = scenes[index];
+    if (!scene) return;
+    setActiveSceneIndex(index);
+    setFov(Math.round(scene.fov || 35));
+    setProjection(scene.parallel ? "orthographic" : "perspective");
+    setHiddenLayers(scene.hiddenLayers);
+    setSelectedInstallId(null);
+    setSelectedGroupPath(null);
+    setSelectedEntity(null);
+  }, [scenes]);
+
+  const handleEntitySelect = useCallback((entity: PickedEntity | null) => {
+    setSelectedEntity(entity);
+    if (!entity) {
+      setSelectedInstallId(null);
+      setSelectedGroupPath(null);
+      return;
+    }
+    setSelectedInstallId(entity.installId || null);
+    setSelectedGroupPath(entity.groupPath === "ROOT" ? null : entity.groupPath);
+    setMeasureMode(false);
+  }, []);
+
+  const handleMeasurePoint = useCallback((point: [number, number, number]) => {
+    setSelectedEntity(null);
+    setMeasurementPoints((current) => current.length === 2 ? [point] : [...current, point]);
+  }, []);
+
+  const measurementDistance = measurementPoints.length === 2
+    ? Math.sqrt(
+      (measurementPoints[1][0] - measurementPoints[0][0]) ** 2
+      + (measurementPoints[1][1] - measurementPoints[0][1]) ** 2
+      + (measurementPoints[1][2] - measurementPoints[0][2]) ** 2,
+    )
+    : null;
 
   useEffect(() => {
     const closeMenu = (event: MouseEvent) => {
@@ -192,7 +244,7 @@ export default function HomePage() {
                 <button onClick={() => { inputRef.current?.click(); setOpenMenu(null); }}><Upload size={14} /> Mở file SketchUp <span>⌘O</span></button>
                 <button disabled={installationItems.length === 0} onClick={() => { exportInstallationCsv(); setOpenMenu(null); }}><Download size={14} /> Xuất danh sách lắp đặt <span>CSV</span></button>
                 <div className="header-menu-divider" />
-                <button onClick={() => { setBuffer(null); setFile(null); setStats(initialStats); setActiveLayer("All layers"); setInstallationItems([]); setSceneGroups([]); setSelectedInstallId(null); setSelectedGroupPath(null); setError(null); setOpenMenu(null); }}><Box size={14} /> Đóng model</button>
+                <button onClick={() => { setBuffer(null); setFile(null); setStats(initialStats); setActiveLayer("All layers"); setHiddenLayers([]); setInstallationItems([]); setSceneGroups([]); setScenes([]); setActiveSceneIndex(null); setSelectedInstallId(null); setSelectedGroupPath(null); setSelectedEntity(null); setMeasureMode(false); setMeasurementPoints([]); setError(null); setOpenMenu(null); }}><Box size={14} /> Đóng model</button>
               </div>
             )}
           </div>
@@ -216,6 +268,10 @@ export default function HomePage() {
               <div className="header-menu-panel">
                 <button className={projection === "perspective" ? "menu-option-active" : ""} onClick={() => { setProjection("perspective"); setOpenMenu(null); }}><Camera size={14} /> Perspective {projection === "perspective" && <span>✓</span>}</button>
                 <button className={projection === "orthographic" ? "menu-option-active" : ""} onClick={() => { setProjection("orthographic"); setOpenMenu(null); }}><Camera size={14} /> Orthographic {projection === "orthographic" && <span>✓</span>}</button>
+                <div className="header-menu-control">
+                  <label htmlFor="header-fov">Field of view <strong>{fov}°</strong></label>
+                  <input id="header-fov" type="range" min="20" max="80" value={fov} disabled={projection === "orthographic"} onChange={(event) => { setFov(Number(event.target.value)); setActiveSceneIndex(null); }} />
+                </div>
                 <div className="header-menu-divider" />
                 <button onClick={() => { setViewPreset("iso"); setOpenMenu(null); }}><Rotate3D size={14} /> Isometric</button>
                 <button onClick={() => { setViewPreset("front"); setOpenMenu(null); }}><Scan size={14} /> Front</button>
@@ -328,6 +384,35 @@ export default function HomePage() {
               {sceneGroups.length > 120 && <span className="list-overflow">+ {sceneGroups.length - 120} groups khác</span>}
             </div>
 
+            <div className="sidebar-section scenes-section">
+              <div className="section-title-row"><span>Scenes / Pages</span><span className="section-count">{scenes.length}</span></div>
+              <p className="section-caption">Khôi phục camera, FOV, projection và layer visibility đã lưu trong file SKP.</p>
+              <div className="scene-list">
+                {scenes.length === 0 && <div className="empty-installation">File chưa lưu scene/page.</div>}
+                {scenes.map((scene, index) => (
+                  <button key={`${scene.name}-${index}`} className={`scene-row ${activeSceneIndex === index ? "selected" : ""}`} onClick={() => selectScene(index)}>
+                    <span className="scene-index">{index + 1}</span>
+                    <span className="scene-copy"><strong>{scene.name || `Scene ${index + 1}`}</strong><small>{scene.parallel ? "Orthographic" : "Perspective"} · FOV {Math.round(scene.fov)}°</small></span>
+                    <ChevronRight size={13} />
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {selectedEntity && (
+              <div className="sidebar-section entity-section">
+                <div className="section-title-row"><span>Entity info</span><span className="section-count">PICKED</span></div>
+                <div className="entity-title"><strong>{selectedEntity.name}</strong><small>{selectedEntity.definitionName || "SketchUp object"}</small></div>
+                <div className="entity-grid">
+                  <span>Type</span><strong>Group / Component</strong>
+                  <span>Layer</span><strong>{selectedEntity.layer}</strong>
+                  <span>Size</span><strong>{formatDimension(selectedEntity.sizeMm[0])} × {formatDimension(selectedEntity.sizeMm[1])} × {formatDimension(selectedEntity.sizeMm[2])}</strong>
+                  <span>Position</span><strong>{Math.round(selectedEntity.positionMm[0])}, {Math.round(selectedEntity.positionMm[1])}, {Math.round(selectedEntity.positionMm[2])} mm</strong>
+                </div>
+                <small className="entity-path">{selectedEntity.groupPath}</small>
+              </div>
+            )}
+
             <div className="sidebar-section style-section">
               <div className="section-title-row"><span>Display style</span><Sun size={15} /></div>
               <div className="style-grid">
@@ -348,10 +433,10 @@ export default function HomePage() {
               <div className="section-title-row"><span>Layers</span><Layers3 size={15} /></div>
               <div className="layer-list">
                 {layers.map((layer, index) => (
-                  <button key={layer} className={`layer-row ${activeLayer === layer ? "selected" : ""}`} onClick={() => setActiveLayer(layer)}>
+                  <button key={layer} className={`layer-row ${activeLayer === layer ? "selected" : ""} ${hiddenLayers.includes(layer) ? "hidden" : ""}`} onClick={() => setActiveLayer(layer)} onContextMenu={(event) => { event.preventDefault(); if (layer !== "All layers") setHiddenLayers((current) => current.includes(layer) ? current.filter((value) => value !== layer) : [...current, layer]); }} title={layer === "All layers" ? "Chọn tất cả layers" : "Click chọn layer · click phải để ẩn/hiện layer"}>
                     <span className={`layer-swatch swatch-${index}`} />
                     <span>{layer}</span>
-                    <Eye size={14} className="layer-eye" />
+                    {hiddenLayers.includes(layer) ? <EyeOff size={14} className="layer-eye" /> : <Eye size={14} className="layer-eye" />}
                   </button>
                 ))}
               </div>
@@ -375,6 +460,7 @@ export default function HomePage() {
           {!leftPanel && <button className="reopen-sidebar" title="Hiện bảng điều khiển" onClick={() => setLeftPanel(true)}><PanelLeft size={17} /></button>}
           <div className="viewport-label"><span className="live-dot" /> REAL-TIME VIEWPORT</div>
           {selectedGroupPath && <div className="group-selection-chip"><Layers3 size={13} /><span>GROUP</span><strong>{selectedGroupPath.split(" / ").pop()}</strong></div>}
+          {measureMode && <div className="measure-mode-chip"><Ruler size={13} /><span>MEASURE</span><strong>{measurementDistance === null ? "Chọn 2 điểm trên model" : `${measurementDistance.toFixed(3)} m`}</strong><button onClick={() => { setMeasurementPoints([]); setMeasureMode(false); }}>×</button></div>}
           <div className="view-cube" aria-label="View presets">
             <button className={viewPreset === "top" ? "selected" : ""} onClick={() => setViewPreset("top")}>TOP</button>
             <button className={viewPreset === "iso" ? "selected" : ""} onClick={() => setViewPreset("iso")}>ISO</button>
@@ -387,13 +473,21 @@ export default function HomePage() {
             showAxes={showAxes}
             renderStyle={renderStyle}
             projection={projection}
+            fov={fov}
             activeLayer={activeLayer}
+            hiddenLayers={hiddenLayers}
             selectedInstallId={selectedInstallId}
             selectedGroupPath={selectedGroupPath}
+            activeScene={activeScene}
+            measureMode={measureMode}
+            measurementPoints={measurementPoints}
             viewPreset={viewPreset}
             onStats={setStats}
             onInstallationItems={setInstallationItems}
             onGroups={setSceneGroups}
+            onScenes={setScenes}
+            onEntitySelect={handleEntitySelect}
+            onMeasurePoint={handleMeasurePoint}
             onProgress={setProgress}
             onError={setError}
           />
@@ -421,6 +515,7 @@ export default function HomePage() {
             <button className={`tool-button ${showGrid ? "active" : ""}`} title="Bật/tắt lưới" onClick={() => setShowGrid((value) => !value)}><Grid3X3 size={17} /></button>
             <button className={`tool-button ${showEdges ? "active" : ""}`} title="Bật/tắt edge thật" onClick={() => setShowEdges((value) => !value)}><Rotate3D size={17} /></button>
             <button className={`tool-button ${projection === "orthographic" ? "active" : ""}`} title="Perspective / Orthographic" onClick={() => setProjection((value) => value === "perspective" ? "orthographic" : "perspective")}><Camera size={17} /></button>
+            <button className={`tool-button ${measureMode ? "active" : ""}`} title="Đo khoảng cách" onClick={() => { setMeasureMode((value) => !value); setMeasurementPoints([]); setSelectedEntity(null); }}><Ruler size={17} /></button>
             <div className="toolbar-separator" />
             <button className="tool-button" title="Fit model" onClick={() => window.dispatchEvent(new Event("skp-fit-model"))}><Maximize size={17} /></button>
             <button className="tool-button" title="Zoom in" onClick={() => window.dispatchEvent(new Event("skp-zoom-in"))}><ZoomIn size={17} /></button>

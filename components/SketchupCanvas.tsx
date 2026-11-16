@@ -1,6 +1,6 @@
 "use client";
 
-import { OrthographicCamera, OrbitControls, PerspectiveCamera } from "@react-three/drei";
+import { Line, OrthographicCamera, OrbitControls, PerspectiveCamera } from "@react-three/drei";
 import { Canvas, useThree } from "@react-three/fiber";
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
@@ -33,6 +33,28 @@ export type SceneGroup = {
   positionMm: [number, number, number];
 };
 
+export type ScenePage = {
+  name: string;
+  eye: [number, number, number] | null;
+  target: [number, number, number] | null;
+  up: [number, number, number] | null;
+  fov: number;
+  parallel: boolean;
+  orthoHeight: number;
+  hiddenLayers: string[];
+};
+
+export type PickedEntity = {
+  name: string;
+  definitionName: string;
+  layer: string;
+  groupPath: string;
+  installId: string;
+  sizeMm: [number, number, number];
+  positionMm: [number, number, number];
+  properties: Record<string, string>;
+};
+
 type ModelStats = {
   version?: string;
   definitions: number;
@@ -52,13 +74,21 @@ type Props = {
   showAxes: boolean;
   renderStyle: RenderStyle;
   projection: Projection;
+  fov: number;
   activeLayer: string;
+  hiddenLayers: string[];
   selectedInstallId: string | null;
   selectedGroupPath: string | null;
+  activeScene: ScenePage | null;
+  measureMode: boolean;
+  measurementPoints: Point[];
   viewPreset: "iso" | "front" | "top";
   onStats: (stats: ModelStats) => void;
   onInstallationItems: (items: InstallationItem[]) => void;
   onGroups: (groups: SceneGroup[]) => void;
+  onScenes: (scenes: ScenePage[]) => void;
+  onEntitySelect: (entity: PickedEntity | null) => void;
+  onMeasurePoint: (point: Point) => void;
   onProgress: (value: number) => void;
   onError: (message: string | null) => void;
 };
@@ -290,7 +320,7 @@ function makeMaterials(definition: GltfMaterialDefinition | undefined, texture?:
   };
 }
 
-function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, selectedInstallId, selectedGroupPath, onStats, onInstallationItems, onGroups, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "projection" | "viewPreset"> & { onReady: (root: THREE.Object3D) => void }) {
+function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, onStats, onInstallationItems, onGroups, onScenes, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "onEntitySelect" | "onMeasurePoint"> & { onReady: (root: THREE.Object3D) => void }) {
   const { scene } = useThree();
   const modelRef = useRef<THREE.Group | null>(null);
 
@@ -359,6 +389,10 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, selectedInst
             layer: metadata?.layer || "Layer0",
             installId: metadata ? installationId(metadata) : "",
             groupPath: metadata?.path || "ROOT",
+            definitionName: metadata?.definitionName || "",
+            positionMm: metadata?.positionMm || [0, 0, 0],
+            properties: metadata?.properties || {},
+            displayName: metadata?.name || primitive.geomName,
             materialIndex: primitive.materialIndex,
             variants,
           };
@@ -381,6 +415,16 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, selectedInst
         onReady(root);
         onInstallationItems(collectInstallationItems(parsed));
         onGroups(collectSceneGroups(parsed));
+        onScenes(model.pages.map((page) => ({
+          name: page.name,
+          eye: page.eye,
+          target: page.target,
+          up: page.up,
+          fov: page.fov,
+          parallel: page.parallel,
+          orthoHeight: page.orthoHeight,
+          hiddenLayers: page.hiddenLayers,
+        })));
         onStats({
           definitions: model.definitions.size,
           layers: model.layers?.length ?? 0,
@@ -414,7 +458,7 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, selectedInst
       }
       textureUrls.forEach((url) => URL.revokeObjectURL(url));
     };
-  }, [buffer, onError, onGroups, onInstallationItems, onProgress, onReady, onStats, scene]);
+  }, [buffer, onError, onGroups, onInstallationItems, onProgress, onReady, onScenes, onStats, scene]);
 
   useEffect(() => {
     const root = modelRef.current;
@@ -424,7 +468,7 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, selectedInst
       const variants = object.userData.variants as ReturnType<typeof makeMaterials>;
       const materialKey = renderStyle === "hidden-line" ? "hiddenLine" : renderStyle;
       object.material = variants[materialKey];
-      const layerVisible = activeLayer === "All layers" || object.userData.layer === activeLayer;
+      const layerVisible = !hiddenLayers.includes(String(object.userData.layer || "Layer0")) && (activeLayer === "All layers" || object.userData.layer === activeLayer);
       const installVisible = !selectedInstallId || object.userData.installId === selectedInstallId;
       const meshGroupPath = String(object.userData.groupPath || "ROOT");
       const groupVisible = !selectedGroupPath || meshGroupPath === selectedGroupPath || meshGroupPath.startsWith(`${selectedGroupPath} / `);
@@ -435,17 +479,106 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, selectedInst
       edges.visible = showEdges && renderStyle !== "wireframe" && activeLayer === "All layers" && !selectedInstallId && !selectedGroupPath;
       (edges.material as THREE.LineBasicMaterial).opacity = renderStyle === "hidden-line" ? 0.95 : renderStyle === "xray" ? 0.62 : 0.78;
     }
-  }, [activeLayer, renderStyle, selectedGroupPath, selectedInstallId, showEdges]);
+  }, [activeLayer, hiddenLayers, renderStyle, selectedGroupPath, selectedInstallId, showEdges]);
 
   return null;
 }
 
-function FitCamera({ model, preset, projection, selectedInstallId, selectedGroupPath }: { model: THREE.Object3D | null; preset: "iso" | "front" | "top"; projection: Projection; selectedInstallId: string | null; selectedGroupPath: string | null }) {
+function ModelPicker({ model, measureMode, onEntitySelect, onMeasurePoint }: { model: THREE.Object3D | null; measureMode: boolean; onEntitySelect: (entity: PickedEntity | null) => void; onMeasurePoint: (point: Point) => void }) {
+  const { camera, gl } = useThree();
+  const raycaster = useRef(new THREE.Raycaster());
+  const pointerDown = useRef<{ x: number; y: number } | null>(null);
+
+  useEffect(() => {
+    const element = gl.domElement;
+    const getHit = (event: PointerEvent) => {
+      if (!model) return null;
+      const rect = element.getBoundingClientRect();
+      const pointer = new THREE.Vector2(
+        ((event.clientX - rect.left) / rect.width) * 2 - 1,
+        -((event.clientY - rect.top) / rect.height) * 2 + 1,
+      );
+      raycaster.current.setFromCamera(pointer, camera);
+      return raycaster.current.intersectObjects(model.children, true).find((hit) => hit.object instanceof THREE.Mesh && hit.object.visible);
+    };
+    const handleDown = (event: PointerEvent) => {
+      if (event.button === 0) pointerDown.current = { x: event.clientX, y: event.clientY };
+    };
+    const handleUp = (event: PointerEvent) => {
+      const start = pointerDown.current;
+      pointerDown.current = null;
+      if (!start || Math.hypot(event.clientX - start.x, event.clientY - start.y) > 5) return;
+      const hit = getHit(event);
+      if (!hit || !(hit.object instanceof THREE.Mesh)) {
+        if (!measureMode) onEntitySelect(null);
+        return;
+      }
+      if (measureMode) {
+        onMeasurePoint([hit.point.x, hit.point.y, hit.point.z]);
+        return;
+      }
+      const object = hit.object;
+      const box = new THREE.Box3().setFromObject(object);
+      const size = box.getSize(new THREE.Vector3());
+      const data = object.userData;
+      onEntitySelect({
+        name: String(data.displayName || object.name || "Object"),
+        definitionName: String(data.definitionName || ""),
+        layer: String(data.layer || "Layer0"),
+        groupPath: String(data.groupPath || "ROOT"),
+        installId: String(data.installId || ""),
+        sizeMm: [Math.round(size.x * 1000), Math.round(size.y * 1000), Math.round(size.z * 1000)],
+        positionMm: (data.positionMm || [0, 0, 0]) as [number, number, number],
+        properties: (data.properties || {}) as Record<string, string>,
+      });
+    };
+    element.addEventListener("pointerdown", handleDown);
+    element.addEventListener("pointerup", handleUp);
+    return () => {
+      element.removeEventListener("pointerdown", handleDown);
+      element.removeEventListener("pointerup", handleUp);
+    };
+  }, [camera, gl, measureMode, model, onEntitySelect, onMeasurePoint]);
+
+  return null;
+}
+
+function MeasurementOverlay({ points }: { points: Point[] }) {
+  return <>
+    {points.map((point, index) => (
+      <mesh key={`${point.join("-")}-${index}`} position={point}>
+        <sphereGeometry args={[0.025, 12, 12]} />
+        <meshBasicMaterial color="#d47b48" />
+      </mesh>
+    ))}
+    {points.length === 2 && <Line points={points} color="#d47b48" lineWidth={3} dashed={false} />}
+  </>;
+}
+
+function toScenePoint(point: [number, number, number]) {
+  return new THREE.Vector3(...toThreePoint(point));
+}
+
+function toSceneDirection(point: [number, number, number]) {
+  return new THREE.Vector3(point[0], point[2], -point[1]).normalize();
+}
+
+function FitCamera({ model, preset, projection, fov, activeScene, selectedInstallId, selectedGroupPath }: { model: THREE.Object3D | null; preset: "iso" | "front" | "top"; projection: Projection; fov: number; activeScene: ScenePage | null; selectedInstallId: string | null; selectedGroupPath: string | null }) {
   const { camera } = useThree();
   const controls = useRef<any>(null);
 
   const frameModel = useCallback((nextPreset: "iso" | "front" | "top" = preset) => {
     if (!model) return;
+    if (activeScene?.eye && activeScene.target) {
+      camera.position.copy(toScenePoint(activeScene.eye));
+      controls.current?.target.copy(toScenePoint(activeScene.target));
+      if (activeScene.up) camera.up.copy(toSceneDirection(activeScene.up));
+      if (camera instanceof THREE.PerspectiveCamera) camera.fov = activeScene.fov || fov;
+      if (camera instanceof THREE.OrthographicCamera) camera.zoom = activeScene.orthoHeight > 0 ? 1 / (activeScene.orthoHeight * INCH_TO_METRE) : 1;
+      camera.updateProjectionMatrix();
+      controls.current?.update();
+      return;
+    }
     const box = new THREE.Box3();
     model.traverse((object) => {
       if (!(object instanceof THREE.Mesh) || !object.visible) return;
@@ -465,13 +598,14 @@ function FitCamera({ model, preset, projection, selectedInstallId, selectedGroup
       camera.near = 0.001;
       camera.far = Math.max(distance * 100, 1000);
     } else {
+      camera.fov = fov;
       camera.near = Math.max(distance / 1000, 0.001);
       camera.far = Math.max(distance * 100, 1000);
     }
     camera.updateProjectionMatrix();
     controls.current?.target.copy(center);
     controls.current?.update();
-  }, [camera, model, preset, selectedGroupPath, selectedInstallId]);
+  }, [activeScene, camera, fov, model, preset, selectedGroupPath, selectedInstallId]);
 
   useEffect(() => frameModel(), [frameModel, projection]);
 
@@ -495,7 +629,7 @@ function FitCamera({ model, preset, projection, selectedInstallId, selectedGroup
   return <OrbitControls ref={controls} makeDefault enableDamping dampingFactor={0.06} minDistance={0.03} maxDistance={10000} screenSpacePanning />;
 }
 
-export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, renderStyle, projection, activeLayer, selectedInstallId, selectedGroupPath, viewPreset, onStats, onInstallationItems, onGroups, onProgress, onError }: Props) {
+export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, renderStyle, projection, fov, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeScene, measureMode, measurementPoints, viewPreset, onStats, onInstallationItems, onGroups, onScenes, onEntitySelect, onMeasurePoint, onProgress, onError }: Props) {
   const [model, setModel] = useState<THREE.Object3D | null>(null);
   const onReady = useCallback((root: THREE.Object3D) => setModel(root), []);
 
@@ -504,15 +638,17 @@ export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, 
       gl.toneMapping = THREE.NoToneMapping;
       gl.outputColorSpace = THREE.SRGBColorSpace;
     }}>
-      {projection === "orthographic" ? <OrthographicCamera makeDefault position={[5, 4, 5]} zoom={1} /> : <PerspectiveCamera makeDefault position={[5, 4, 5]} fov={38} />}
+      {projection === "orthographic" ? <OrthographicCamera makeDefault position={[5, 4, 5]} zoom={1} /> : <PerspectiveCamera makeDefault position={[5, 4, 5]} fov={fov} />}
       <color attach="background" args={["#e4e8e6"]} />
       <hemisphereLight args={["#ffffff", "#88918e", 0.66]} />
       <ambientLight intensity={0.42} />
       <directionalLight position={[5, 9, 6]} intensity={0.42} color="#fffdf6" />
       {showGrid && <gridHelper args={[100, 100, "#aeb9b5", "#cbd2cf"]} position={[0, -0.015, 0]} />}
       {showAxes && <axesHelper args={[2.6]} />}
-      <ModelLoader buffer={buffer} renderStyle={renderStyle} showEdges={showEdges} activeLayer={activeLayer} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} onStats={onStats} onInstallationItems={onInstallationItems} onGroups={onGroups} onProgress={onProgress} onError={onError} onReady={onReady} />
-      <FitCamera model={model} preset={viewPreset} projection={projection} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} />
+      <ModelLoader buffer={buffer} renderStyle={renderStyle} showEdges={showEdges} activeLayer={activeLayer} hiddenLayers={hiddenLayers} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} onStats={onStats} onInstallationItems={onInstallationItems} onGroups={onGroups} onScenes={onScenes} onProgress={onProgress} onError={onError} onReady={onReady} />
+      <ModelPicker model={model} measureMode={measureMode} onEntitySelect={onEntitySelect} onMeasurePoint={onMeasurePoint} />
+      <MeasurementOverlay points={measurementPoints} />
+      <FitCamera model={model} preset={viewPreset} projection={projection} fov={fov} activeScene={activeScene} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} />
     </Canvas>
   );
 }
