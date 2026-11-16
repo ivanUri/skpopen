@@ -143,6 +143,10 @@ h1 { margin: 0; max-width: 190px; overflow: hidden; text-overflow: ellipsis; whi
 .group-selection-chip svg { flex: 0 0 auto; color: #4f8a6d; }
 .group-selection-chip span { color: #78908a; font: 8px 'DM Mono', monospace; letter-spacing: .08em; }
 .group-selection-chip strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+.selected-board-screen-card { position: absolute; z-index: 20; top: 78px; left: 18px; display: flex; width: min(330px, calc(100% - 36px)); flex-direction: column; gap: 4px; padding: 9px 11px; border: 1px solid #8eafa4; border-radius: 7px; color: #526a6a; background: rgba(247,252,249,.97); box-shadow: 0 8px 24px rgba(42,70,65,.18); pointer-events: none; }
+.selected-board-screen-card .selected-board-screen-kicker { color: #78908a; font: 8px 'DM Mono', monospace; letter-spacing: .1em; }
+.selected-board-screen-card strong { overflow: hidden; color: #2f5552; font: 700 10px 'Manrope', sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+.selected-board-screen-card span:not(.selected-board-screen-kicker) { overflow: hidden; color: #627676; font: 8px 'DM Mono', monospace; text-overflow: ellipsis; white-space: nowrap; }
 .model-dimension-label { display: block; padding: 3px 5px; border: 1px solid #e3b18d; border-radius: 4px; color: #774b30; background: rgba(255,246,238,.96); box-shadow: 0 3px 10px rgba(100,67,48,.14); font: 500 9px 'DM Mono', monospace; white-space: nowrap; }
 .measure-mode-chip { position: absolute; z-index: 20; left: 18px; top: 78px; display: flex; align-items: center; gap: 7px; max-width: min(390px, calc(100% - 36px)); padding: 7px 8px 7px 9px; border: 1px solid #e3b18d; border-radius: 6px; color: #774b30; background: rgba(255,246,238,.96); box-shadow: 0 5px 16px rgba(100,67,48,.12); }
 .measure-mode-chip > svg { flex: 0 0 auto; color: var(--accent); }
@@ -194,9 +198,6 @@ h1 { margin: 0; max-width: 190px; overflow: hidden; text-overflow: ellipsis; whi
 .production-data-list > div strong { color: #365657; }
 .production-empty { margin: 0; padding: 7px; border: 1px dashed #cad6d2; border-radius: 5px; color: #899696; font-size: 8px; line-height: 1.5; }
 .abf-board-label { display: block; max-width: 180px; padding: 3px 5px; border: 1px solid #d4a07e; border-radius: 4px; color: #70452d; background: rgba(255,246,238,.95); box-shadow: 0 3px 10px rgba(100,67,48,.14); font: 500 8px 'DM Mono', monospace; white-space: nowrap; }
-.selected-board-overlay { display: flex; flex-direction: column; gap: 4px; min-width: 190px; max-width: 260px; padding: 9px 10px; border: 1px solid #8eafa4; border-radius: 7px; color: #526a6a; background: rgba(247,252,249,.97); box-shadow: 0 8px 24px rgba(42,70,65,.2); font: 8px 'DM Mono', monospace; }
-.selected-board-overlay strong { overflow: hidden; color: #2f5552; font: 700 10px 'Manrope', sans-serif; text-overflow: ellipsis; white-space: nowrap; }
-.selected-board-overlay span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .entity-abf-properties { border-color: #c8ddd5; background: #f0f7f4; }
 .section-subtitle { margin: 14px 0 7px; color: #899696; font: 8px 'DM Mono', monospace; letter-spacing: .08em; text-transform: uppercase; }
 .section-plane-list { display: flex; flex-direction: column; gap: 3px; }
@@ -256,6 +257,7 @@ h1 { margin: 0; max-width: 190px; overflow: hidden; text-overflow: ellipsis; whi
   .tool-button { width: 38px; height: 38px; }
   .toolbar-separator { margin: 0 2px; }
   .viewport-label { left: 12px; top: 13px; font-size: 8px; }
+  .selected-board-screen-card { top: 82px; left: 12px; width: min(300px, calc(100% - 24px)); }
   .view-cube { top: 12px; }
   .view-cube button { min-width: 45px; padding: 8px 7px; }
   .reopen-sidebar { top: 12px; right: 12px; width: 38px; height: 38px; }

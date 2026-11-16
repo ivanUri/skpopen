@@ -24,7 +24,7 @@ import {
   Upload,
   ZoomIn,
 } from "lucide-react";
-import SketchupCanvas, { AbfPart, AbfVisibility, InstallationItem, ModelInfo, PickedEntity, Projection, RenderStyle, SceneGroup, ScenePage } from "../components/SketchupCanvas";
+import SketchupCanvas, { AbfVisibility, InstallationItem, ModelInfo, PickedEntity, Projection, RenderStyle, SceneGroup, ScenePage } from "../components/SketchupCanvas";
 
 type ModelStats = {
   version?: string;
@@ -585,6 +585,7 @@ export default function HomePage() {
           {!leftPanel && <button className="reopen-sidebar" title="Hiện bảng điều khiển" onClick={() => setLeftPanel(true)}><PanelLeft size={17} /></button>}
           <div className="viewport-label"><span className="live-dot" /> REAL-TIME VIEWPORT</div>
           {selectedGroupPath && <div className="group-selection-chip"><Layers3 size={13} /><span>GROUP</span><strong>{selectedGroupPath.split(" / ").pop()}</strong></div>}
+          {selectedEntity && selectedAbfPart && <div className="selected-board-screen-card"><span className="selected-board-screen-kicker">SELECTED BOARD</span><strong>#{selectedAbfPart.boardIndex} · {selectedAbfPart.name.replace(/^__\d+\.?\s*/, "")}</strong><span>{selectedAbfPart.material} · {formatDimension(selectedAbfPart.sizeMm[0])} × {formatDimension(selectedAbfPart.sizeMm[1])} × {formatDimension(selectedAbfPart.sizeMm[2])}</span><span>{selectedAbfPart.edgeBandTypes ? `Cạnh dán: ${selectedAbfPart.edgeBandTypes}` : "Không có cạnh dán"}</span></div>}
           {measureMode && <div className="measure-mode-chip"><Ruler size={13} /><span>MEASURE</span><strong>{measurementDistance === null ? "Chọn 2 điểm trên model" : `${measurementDistance.toFixed(3)} m`}</strong><button onClick={() => { setMeasurementPoints([]); setMeasureMode(false); }}>×</button></div>}
           <div className="view-cube" aria-label="View presets">
             <button className={viewPreset === "top" ? "selected" : ""} onClick={() => setViewPreset("top")}>TOP</button>
@@ -609,8 +610,6 @@ export default function HomePage() {
             activeSectionPlane={activeSectionPlane}
             abfVisibility={abfVisibility}
             explodeFactor={explodeFactor}
-            selectedEntity={selectedEntity}
-            selectedAbfPart={selectedAbfPart}
             measureMode={measureMode}
             measurementPoints={measurementPoints}
             viewPreset={viewPreset}
