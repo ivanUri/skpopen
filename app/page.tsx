@@ -102,6 +102,7 @@ export default function HomePage() {
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
   const [activeSectionPlaneIndex, setActiveSectionPlaneIndex] = useState<number | null>(null);
   const [abfVisibility, setAbfVisibility] = useState<AbfVisibility>(initialAbfVisibility);
+  const [explodeFactor, setExplodeFactor] = useState(0);
   const [selectedInstallId, setSelectedInstallId] = useState<string | null>(null);
   const [selectedGroupPath, setSelectedGroupPath] = useState<string | null>(null);
   const [selectedEntity, setSelectedEntity] = useState<PickedEntity | null>(null);
@@ -126,6 +127,7 @@ export default function HomePage() {
     setModelInfo(null);
     setActiveSectionPlaneIndex(null);
     setAbfVisibility(initialAbfVisibility);
+    setExplodeFactor(0);
     setHiddenLayers([]);
     setMeasureMode(false);
     setMeasurementPoints([]);
@@ -284,7 +286,7 @@ export default function HomePage() {
                 <button onClick={() => { inputRef.current?.click(); setOpenMenu(null); }}><Upload size={14} /> Mở file SketchUp <span>⌘O</span></button>
                 <button disabled={installationItems.length === 0} onClick={() => { exportInstallationCsv(); setOpenMenu(null); }}><Download size={14} /> Xuất danh sách lắp đặt <span>CSV</span></button>
                 <div className="header-menu-divider" />
-                <button onClick={() => { setBuffer(null); setFile(null); setStats(initialStats); setActiveLayer("All layers"); setHiddenLayers([]); setInstallationItems([]); setSceneGroups([]); setScenes([]); setActiveSceneIndex(null); setModelInfo(null); setActiveSectionPlaneIndex(null); setAbfVisibility(initialAbfVisibility); setSelectedInstallId(null); setSelectedGroupPath(null); setSelectedEntity(null); setMeasureMode(false); setMeasurementPoints([]); setError(null); setOpenMenu(null); }}><Box size={14} /> Đóng model</button>
+                <button onClick={() => { setBuffer(null); setFile(null); setStats(initialStats); setActiveLayer("All layers"); setHiddenLayers([]); setInstallationItems([]); setSceneGroups([]); setScenes([]); setActiveSceneIndex(null); setModelInfo(null); setActiveSectionPlaneIndex(null); setAbfVisibility(initialAbfVisibility); setExplodeFactor(0); setSelectedInstallId(null); setSelectedGroupPath(null); setSelectedEntity(null); setMeasureMode(false); setMeasurementPoints([]); setError(null); setOpenMenu(null); }}><Box size={14} /> Đóng model</button>
               </div>
             )}
           </div>
@@ -382,6 +384,7 @@ export default function HomePage() {
                   <span><strong>{modelInfo.abf.nestingSheetCount}</strong> khổ ván</span>
                   <span><strong>{modelInfo.abf.featureCounts.edgeBanding}</strong> cạnh dán</span>
                   <span><strong>{modelInfo.abf.featureCounts.fittings + modelInfo.abf.featureCounts.intersections}</strong> phụ kiện</span>
+                  <span><strong>{modelInfo.abf.labelCount}</strong> nhãn tấm</span>
                 </div>
                 <div className="production-toggle-grid">
                   <button className={abfVisibility.nesting ? "selected" : ""} onClick={() => toggleAbfVisibility("nesting")}><Layers3 size={13} /> Nesting</button>
@@ -402,6 +405,23 @@ export default function HomePage() {
                     ))}
                   </div>
                 </>}
+                <div className="production-control">
+                  <label htmlFor="explode-factor"><span>Sơ đồ bung / lắp ráp</span><strong>{explodeFactor === 0 ? "Lắp ráp" : `${Math.round(explodeFactor * 100)}% bung`}</strong></label>
+                  <input id="explode-factor" type="range" min="0" max="1" step="0.05" value={explodeFactor} onChange={(event) => setExplodeFactor(Number(event.target.value))} />
+                </div>
+                <div className="section-subtitle">Thống kê chi tiết</div>
+                <div className="production-part-list">
+                  {modelInfo.abf.parts.slice(0, 40).map((part) => <button key={part.id} className="production-part-row" onClick={() => selectAbfPath(part.path)}><span><strong>#{part.boardIndex} · {part.name.replace(/^__\d+\.?\s*/, "")}</strong><small>{part.material} · {formatDimension(part.sizeMm[0])} × {formatDimension(part.sizeMm[1])} × {formatDimension(part.sizeMm[2])}</small></span><em>{part.edgeBandTypes ? "EB" : "—"}</em></button>)}
+                </div>
+                {modelInfo.abf.parts.length > 40 && <span className="list-overflow">+ {modelInfo.abf.parts.length - 40} tấm khác</span>}
+                <div className="section-subtitle">CAM / mối nối</div>
+                <div className="production-data-list">
+                  {modelInfo.abf.operations.length > 0 ? modelInfo.abf.operations.map((operation) => <div key={`${operation.kind}-${operation.name}`}><span>{operation.kind} · {operation.name}</span><strong>{operation.count}</strong></div>) : <p className="production-empty">File chưa có metadata CAM/mối nối để đọc.</p>}
+                </div>
+                <div className="section-subtitle">Minifix / Lockdowel / phụ kiện</div>
+                <div className="production-data-list">
+                  {modelInfo.abf.connectors.length > 0 ? modelInfo.abf.connectors.map((connector) => <div key={connector.name}><span>{connector.name}</span><strong>{connector.count}</strong></div>) : <p className="production-empty">File hiện tại không chứa metadata định danh Minifix, Lockdowel hoặc phụ kiện liên kết.</p>}
+                </div>
               </div>
             )}
 
@@ -578,6 +598,7 @@ export default function HomePage() {
             activeScene={activeScene}
             activeSectionPlane={activeSectionPlane}
             abfVisibility={abfVisibility}
+            explodeFactor={explodeFactor}
             measureMode={measureMode}
             measurementPoints={measurementPoints}
             viewPreset={viewPreset}
