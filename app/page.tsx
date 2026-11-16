@@ -73,9 +73,76 @@ function formatDimension(value: number) {
   return `${Math.round(value)} mm`;
 }
 
+const MODEL_CACHE_DB = "skp-viewer-cache";
+const MODEL_CACHE_STORE = "models";
+const MODEL_CACHE_KEY = "latest";
+
+type CachedModel = {
+  name: string;
+  type: string;
+  lastModified: number;
+  buffer: ArrayBuffer;
+};
+
+function openModelCache() {
+  if (typeof window === "undefined" || !window.indexedDB) return Promise.resolve<IDBDatabase | null>(null);
+  return new Promise<IDBDatabase | null>((resolve) => {
+    const request = window.indexedDB.open(MODEL_CACHE_DB, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(MODEL_CACHE_STORE)) request.result.createObjectStore(MODEL_CACHE_STORE);
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => resolve(null);
+  });
+}
+
+async function cacheModel(file: File, buffer: ArrayBuffer) {
+  const database = await openModelCache();
+  if (!database) return;
+  await new Promise<void>((resolve) => {
+    const transaction = database.transaction(MODEL_CACHE_STORE, "readwrite");
+    transaction.objectStore(MODEL_CACHE_STORE).put({ name: file.name, type: file.type, lastModified: file.lastModified, buffer }, MODEL_CACHE_KEY);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => resolve();
+    transaction.onabort = () => resolve();
+  });
+  database.close();
+}
+
+async function restoreCachedModel() {
+  const database = await openModelCache();
+  if (!database) return null;
+  return new Promise<File | null>((resolve) => {
+    const request = database.transaction(MODEL_CACHE_STORE, "readonly").objectStore(MODEL_CACHE_STORE).get(MODEL_CACHE_KEY);
+    request.onsuccess = () => {
+      const cached = request.result as CachedModel | undefined;
+      database.close();
+      resolve(cached?.buffer ? new File([cached.buffer], cached.name, { type: cached.type, lastModified: cached.lastModified }) : null);
+    };
+    request.onerror = () => {
+      database.close();
+      resolve(null);
+    };
+  });
+}
+
+async function clearCachedModel() {
+  const database = await openModelCache();
+  if (!database) return;
+  await new Promise<void>((resolve) => {
+    const transaction = database.transaction(MODEL_CACHE_STORE, "readwrite");
+    transaction.objectStore(MODEL_CACHE_STORE).delete(MODEL_CACHE_KEY);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => resolve();
+    transaction.onabort = () => resolve();
+  });
+  database.close();
+}
+
 export default function HomePage() {
   const inputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const hasUserSelectedFile = useRef(false);
   const [file, setFile] = useState<File | null>(null);
   const [buffer, setBuffer] = useState<ArrayBuffer | null>(null);
   const [stats, setStats] = useState<ModelStats>(initialStats);
@@ -110,12 +177,13 @@ export default function HomePage() {
   const [measurementPoints, setMeasurementPoints] = useState<[number, number, number][]>([]);
   const [openMenu, setOpenMenu] = useState<HeaderMenu>(null);
 
-  const readFile = useCallback(async (nextFile: File) => {
+  const readFile = useCallback(async (nextFile: File, persist = true) => {
     if (!nextFile.name.toLowerCase().endsWith(".skp")) {
       setError("Vui lòng chọn file SketchUp có đuôi .skp.");
       return;
     }
 
+    if (persist) hasUserSelectedFile.current = true;
     setError(null);
     setSelectedInstallId(null);
     setSelectedGroupPath(null);
@@ -138,6 +206,7 @@ export default function HomePage() {
       const nextBuffer = await nextFile.arrayBuffer();
       setProgress(30);
       setBuffer(nextBuffer);
+      if (persist) void cacheModel(nextFile, nextBuffer);
       setProgress(100);
     } catch {
       setError("Không thể đọc file này. Hãy thử lại với một file .skp khác.");
@@ -149,14 +218,10 @@ export default function HomePage() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch("/file.skp")
-      .then((response) => (response.ok ? response.blob() : null))
-      .then(async (blob) => {
-        if (!blob || cancelled) return;
-        const demoFile = new File([blob], "file.skp", { type: "application/octet-stream" });
-        await readFile(demoFile);
-      })
-      .catch(() => undefined);
+    void restoreCachedModel().then((cachedFile) => {
+      if (!cachedFile || cancelled || hasUserSelectedFile.current) return;
+      void readFile(cachedFile, false);
+    });
     return () => {
       cancelled = true;
     };
@@ -308,7 +373,7 @@ export default function HomePage() {
                 <button onClick={() => { inputRef.current?.click(); setOpenMenu(null); }}><Upload size={14} /> Mở file SketchUp <span>⌘O</span></button>
                 <button disabled={installationItems.length === 0} onClick={() => { exportInstallationCsv(); setOpenMenu(null); }}><Download size={14} /> Xuất danh sách lắp đặt <span>CSV</span></button>
                 <div className="header-menu-divider" />
-                <button onClick={() => { setBuffer(null); setFile(null); setStats(initialStats); setActiveLayer("All layers"); setHiddenLayers([]); setInstallationItems([]); setSceneGroups([]); setScenes([]); setActiveSceneIndex(null); setModelInfo(null); setActiveSectionPlaneIndex(null); setAbfVisibility(initialAbfVisibility); setExplodeFactor(0); setSelectedInstallId(null); setSelectedGroupPath(null); setSelectedEntity(null); setMeasureMode(false); setMeasurementPoints([]); setError(null); setOpenMenu(null); }}><Box size={14} /> Đóng model</button>
+                <button onClick={() => { void clearCachedModel(); hasUserSelectedFile.current = false; setBuffer(null); setFile(null); setStats(initialStats); setActiveLayer("All layers"); setHiddenLayers([]); setInstallationItems([]); setSceneGroups([]); setScenes([]); setActiveSceneIndex(null); setModelInfo(null); setActiveSectionPlaneIndex(null); setAbfVisibility(initialAbfVisibility); setExplodeFactor(0); setSelectedInstallId(null); setSelectedGroupPath(null); setSelectedEntity(null); setMeasureMode(false); setMeasurementPoints([]); setError(null); setOpenMenu(null); }}><Box size={14} /> Đóng model</button>
               </div>
             )}
           </div>
