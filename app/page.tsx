@@ -178,19 +178,18 @@ export default function HomePage() {
     if (!layers.includes(activeLayer)) setActiveLayer("All layers");
   }, [activeLayer, layers]);
 
-  const selectLayer = useCallback((layer: string) => {
-    setActiveLayer(layer);
-    if (layer !== "All layers") setHiddenLayers((current) => current.filter((hiddenLayer) => normalizeLayerName(hiddenLayer) !== layer));
-  }, []);
-
-  const toggleLayerHidden = useCallback((layer: string) => {
-    if (layer === "All layers") return;
+  const toggleLayerVisibility = useCallback((layer: string) => {
+    if (layer === "All layers") {
+      setActiveLayer("All layers");
+      setHiddenLayers([]);
+      return;
+    }
     const isHidden = hiddenLayers.some((hiddenLayer) => normalizeLayerName(hiddenLayer) === layer);
     setHiddenLayers((current) => isHidden
       ? current.filter((hiddenLayer) => normalizeLayerName(hiddenLayer) !== layer)
       : [...current, layer]);
-    if (!isHidden && activeLayer === layer) setActiveLayer("All layers");
-  }, [activeLayer, hiddenLayers]);
+    setActiveLayer("All layers");
+  }, [hiddenLayers]);
 
   const activeScene = activeSceneIndex === null ? null : scenes[activeSceneIndex] ?? null;
   const activeSectionPlane = activeSectionPlaneIndex === null ? null : modelInfo?.sectionPlanes[activeSectionPlaneIndex] ?? null;
@@ -573,7 +572,7 @@ export default function HomePage() {
               <div className="layer-list">
                 {layers.map((layer, index) => {
                   const isHidden = hiddenLayers.some((hiddenLayer) => normalizeLayerName(hiddenLayer) === layer);
-                  return <button key={layer} className={`layer-row ${activeLayer === layer ? "selected" : ""} ${isHidden ? "hidden" : ""}`} onClick={() => selectLayer(layer)} onContextMenu={(event) => { event.preventDefault(); toggleLayerHidden(layer); }} title={layer === "All layers" ? "Chọn tất cả layers" : "Click để cô lập layer và hiện layer · click phải để ẩn/hiện layer"}>
+                  return <button key={layer} className={`layer-row ${activeLayer === layer ? "selected" : ""} ${isHidden ? "hidden" : ""}`} onClick={() => toggleLayerVisibility(layer)} onContextMenu={(event) => { event.preventDefault(); toggleLayerVisibility(layer); }} title={layer === "All layers" ? "Hiện toàn bộ layers" : "Click để ẩn/hiện layer như SketchUp"}>
                     <span className={`layer-swatch swatch-${index}`} />
                     <span>{layer}</span>
                     {isHidden ? <EyeOff size={14} className="layer-eye" /> : <Eye size={14} className="layer-eye" />}
