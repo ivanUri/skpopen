@@ -61,7 +61,7 @@ button { color: inherit; font: inherit; border: 0; cursor: pointer; }
 .rail-button { width: 33px; height: 33px; display: grid; place-items: center; background: transparent; color: #8a9799; border: 1px solid transparent; border-radius: 6px; }
 .rail-button:hover, .rail-button.active { color: #334b4c; background: #fff; border-color: #d5dedb; box-shadow: 0 2px 6px rgba(44,59,59,.08); }
 .rail-divider { width: 24px; height: 1px; margin: 3px 0; background: #d5ddda; }
-.sidebar { position: sticky; top: 0; order: 3; width: 360px; min-width: 360px; flex: 0 0 360px; height: 100%; min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; background: var(--panel); border-left: 1px solid var(--line); box-shadow: -8px 0 22px rgba(42,55,54,.06); z-index: 80; }
+.sidebar { position: sticky; top: 0; order: 3; width: 380px; min-width: 380px; flex: 0 0 380px; height: 100%; min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; background: var(--panel); border-left: 1px solid var(--line); box-shadow: -8px 0 22px rgba(42,55,54,.06); z-index: 80; }
 .sidebar-section { padding: 19px 17px; border-bottom: 1px solid var(--line); }
 .sidebar-header { position: sticky; top: 0; min-height: 98px; display: flex; justify-content: space-between; gap: 12px; background: rgba(247,248,247,.98); box-shadow: 0 5px 14px rgba(42,55,54,.07); z-index: 10; }
 .eyebrow { margin: 0 0 9px; color: var(--faint); font: 500 9px 'DM Mono', monospace; letter-spacing: .12em; }
@@ -119,6 +119,84 @@ h1 { margin: 0; max-width: 190px; overflow: hidden; text-overflow: ellipsis; whi
 .help-icon { width: 29px; height: 29px; display: grid; place-items: center; border-radius: 7px; background: #e8efed; color: var(--blue); }
 .help-card strong { display: block; margin: 1px 0 5px; color: #526268; font-size: 10px; }
 .help-card p { margin: 0; font-size: 10px; line-height: 1.65; }
+
+/* Inspector readability: clear hierarchy without making the control rail feel dense. */
+.sidebar { scrollbar-color: #c5d1cd transparent; scrollbar-width: thin; }
+.sidebar-section { padding: 21px 19px; }
+.sidebar-header { min-height: 106px; padding-top: 20px; padding-bottom: 17px; }
+.eyebrow { margin-bottom: 10px; font-size: 10px; letter-spacing: .14em; }
+h1 { max-width: 245px; font-size: 16px; line-height: 1.25; }
+.section-title-row { margin-bottom: 13px; font-size: 13px; letter-spacing: .02em; }
+.section-count { font-size: 10px; }
+.section-caption { margin-bottom: 12px; font-size: 10px; line-height: 1.6; }
+.model-meta-caption { margin-bottom: 12px; font-size: 9px; }
+.stats-grid { gap: 9px; }
+.stat-card { min-height: 70px; padding: 11px; }
+.stat-card span { font-size: 10px; }
+.stat-card strong { font-size: 19px; }
+.export-installation { padding: 6px 8px; font-size: 9px; }
+.installation-meta { font-size: 10px; }
+.clear-selection { margin-bottom: 9px; padding: 8px 10px; font-size: 10px; }
+.installation-list { gap: 5px; }
+.installation-row { min-height: 64px; gap: 10px; padding: 9px; }
+.installation-index { width: 29px; height: 29px; flex-basis: 29px; font-size: 11px; }
+.installation-copy { gap: 3px; }
+.installation-copy strong { font-size: 11px; }
+.installation-copy small { font-size: 9px; }
+.empty-installation { padding: 13px 10px; font-size: 10px; }
+.list-overflow { margin-top: 9px; font-size: 10px; }
+.group-list, .scene-list, .layer-list { gap: 4px; }
+.group-row { min-height: 48px; gap: 9px; padding-top: 8px; padding-bottom: 8px; }
+.group-marker { width: 26px; height: 26px; flex-basis: 26px; }
+.group-copy { gap: 3px; }
+.group-copy strong, .scene-copy strong { font-size: 10px; }
+.group-copy small, .scene-copy small { font-size: 9px; }
+.scene-row { min-height: 50px; gap: 10px; padding: 8px; }
+.scene-index { width: 26px; height: 26px; flex-basis: 26px; font-size: 10px; }
+.scene-copy { gap: 3px; }
+.layer-row { padding: 10px 9px; font-size: 12px; }
+.help-card { gap: 12px; }
+.help-card strong { font-size: 11px; }
+.help-card p { font-size: 11px; }
+.style-grid { gap: 7px; }
+.style-option { min-height: 49px; padding: 9px 10px; font-size: 10px; }
+.display-toggles { gap: 7px; margin-top: 9px; }
+.display-toggles button { padding: 8px 9px; font-size: 10px; }
+.entity-title { gap: 4px; margin-bottom: 13px; }
+.entity-title strong { font-size: 13px; }
+.entity-title small { font-size: 10px; }
+.entity-grid { grid-template-columns: 72px minmax(0, 1fr); gap: 9px 10px; padding: 12px; }
+.entity-grid span { font-size: 10px; }
+.entity-grid strong { font-size: 10px; }
+.entity-path { margin-top: 10px; font-size: 9px; }
+.entity-properties { gap: 7px; margin-top: 11px; padding: 11px; }
+.entity-properties > strong { font-size: 10px; }
+.entity-properties > span { font-size: 9px; line-height: 1.4; }
+.section-subtitle { margin-top: 17px; margin-bottom: 8px; font-size: 10px; letter-spacing: .1em; }
+.section-plane-list button { padding: 9px 10px; font-size: 10px; }
+.production-summary { gap: 7px; margin: 11px 0; }
+.production-summary span { gap: 3px; padding: 9px 7px; font-size: 9px; }
+.production-summary strong { font-size: 14px; }
+.production-toggle-grid { gap: 7px; }
+.production-toggle-grid button, .annotation-toggle-grid button { min-height: 38px; gap: 7px; font-size: 10px; }
+.production-sheet-list { gap: 5px; }
+.production-sheet-list button { padding: 9px 10px; }
+.production-sheet-list button > span { gap: 4px; }
+.production-sheet-list strong { font-size: 10px; }
+.production-sheet-list small { font-size: 9px; }
+.production-control { margin-top: 16px; padding: 11px; }
+.production-control label { font-size: 10px; }
+.production-control label strong { font-size: 9px; }
+.production-control input[type='range'] { height: 20px; margin-top: 7px; }
+.production-part-list { gap: 4px; max-height: 280px; }
+.production-part-row { min-height: 47px; gap: 9px; padding: 8px; }
+.production-part-row > span { gap: 3px; }
+.production-part-row strong { font-size: 10px; }
+.production-part-row small { font-size: 9px; }
+.production-part-row em { font-size: 9px; }
+.production-data-list { gap: 4px; }
+.production-data-list > div { padding: 8px 9px; font-size: 9px; line-height: 1.35; }
+.production-empty { padding: 9px; font-size: 9px; line-height: 1.55; }
 
 .style-section { padding-bottom: 16px; }
 .style-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
@@ -268,5 +346,5 @@ h1 { margin: 0; max-width: 190px; overflow: hidden; text-overflow: ellipsis; whi
 }
 
 @media (min-width: 761px) and (max-width: 1100px) {
-  .sidebar { width: 320px; min-width: 320px; flex-basis: 320px; }
+  .sidebar { width: 340px; min-width: 340px; flex-basis: 340px; }
 }
