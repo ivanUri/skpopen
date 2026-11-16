@@ -24,7 +24,7 @@ import {
   Upload,
   ZoomIn,
 } from "lucide-react";
-import SketchupCanvas, { AbfVisibility, InstallationItem, ModelInfo, PickedEntity, Projection, RenderStyle, SceneGroup, ScenePage } from "../components/SketchupCanvas";
+import SketchupCanvas, { AbfVisibility, InstallationItem, ModelInfo, normalizeLayerName, PickedEntity, Projection, RenderStyle, SceneGroup, ScenePage } from "../components/SketchupCanvas";
 
 type ModelStats = {
   version?: string;
@@ -172,11 +172,25 @@ export default function HomePage() {
     [readFile],
   );
 
-  const layers = useMemo(() => ["All layers", ...(stats.layerNames ?? [])], [stats.layerNames]);
+  const layers = useMemo(() => Array.from(new Set(["All layers", ...(stats.layerNames ?? []).map(normalizeLayerName)])), [stats.layerNames]);
 
   useEffect(() => {
     if (!layers.includes(activeLayer)) setActiveLayer("All layers");
   }, [activeLayer, layers]);
+
+  const selectLayer = useCallback((layer: string) => {
+    setActiveLayer(layer);
+    if (layer !== "All layers") setHiddenLayers((current) => current.filter((hiddenLayer) => normalizeLayerName(hiddenLayer) !== layer));
+  }, []);
+
+  const toggleLayerHidden = useCallback((layer: string) => {
+    if (layer === "All layers") return;
+    const isHidden = hiddenLayers.some((hiddenLayer) => normalizeLayerName(hiddenLayer) === layer);
+    setHiddenLayers((current) => isHidden
+      ? current.filter((hiddenLayer) => normalizeLayerName(hiddenLayer) !== layer)
+      : [...current, layer]);
+    if (!isHidden && activeLayer === layer) setActiveLayer("All layers");
+  }, [activeLayer, hiddenLayers]);
 
   const activeScene = activeSceneIndex === null ? null : scenes[activeSceneIndex] ?? null;
   const activeSectionPlane = activeSectionPlaneIndex === null ? null : modelInfo?.sectionPlanes[activeSectionPlaneIndex] ?? null;
@@ -557,13 +571,14 @@ export default function HomePage() {
             <div className="sidebar-section layers-section">
               <div className="section-title-row"><span>Layers</span><Layers3 size={15} /></div>
               <div className="layer-list">
-                {layers.map((layer, index) => (
-                  <button key={layer} className={`layer-row ${activeLayer === layer ? "selected" : ""} ${hiddenLayers.includes(layer) ? "hidden" : ""}`} onClick={() => setActiveLayer(layer)} onContextMenu={(event) => { event.preventDefault(); if (layer !== "All layers") setHiddenLayers((current) => current.includes(layer) ? current.filter((value) => value !== layer) : [...current, layer]); }} title={layer === "All layers" ? "Chọn tất cả layers" : "Click chọn layer · click phải để ẩn/hiện layer"}>
+                {layers.map((layer, index) => {
+                  const isHidden = hiddenLayers.some((hiddenLayer) => normalizeLayerName(hiddenLayer) === layer);
+                  return <button key={layer} className={`layer-row ${activeLayer === layer ? "selected" : ""} ${isHidden ? "hidden" : ""}`} onClick={() => selectLayer(layer)} onContextMenu={(event) => { event.preventDefault(); toggleLayerHidden(layer); }} title={layer === "All layers" ? "Chọn tất cả layers" : "Click để cô lập layer và hiện layer · click phải để ẩn/hiện layer"}>
                     <span className={`layer-swatch swatch-${index}`} />
                     <span>{layer}</span>
-                    {hiddenLayers.includes(layer) ? <EyeOff size={14} className="layer-eye" /> : <Eye size={14} className="layer-eye" />}
-                  </button>
-                ))}
+                    {isHidden ? <EyeOff size={14} className="layer-eye" /> : <Eye size={14} className="layer-eye" />}
+                  </button>;
+                })}
               </div>
             </div>
 

@@ -181,6 +181,11 @@ type Props = {
   onError: (message: string | null) => void;
 };
 
+export function normalizeLayerName(value: unknown) {
+  const name = String(value ?? "").replace(/\0/g, "").trim();
+  return name || "Layer0";
+}
+
 type GltfMaterialDefinition = {
   pbrMetallicRoughness?: {
     baseColorFactor?: number[];
@@ -924,7 +929,7 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
           constructionLines: model.root.constructionLines,
           constructionPoints: model.root.constructionPoints,
           texts: model.root.texts,
-          hiddenLayers: model.layers.filter((layer) => layer.hidden).map((layer) => layer.name),
+          hiddenLayers: model.layers.filter((layer) => layer.hidden).map((layer) => normalizeLayerName(layer.name)),
           abf: buildAbfInfo(parsed, model),
         });
         onScenes(model.pages.map((page) => ({
@@ -940,7 +945,7 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
         onStats({
           definitions: model.definitions.size,
           layers: model.layers?.length ?? 0,
-          layerNames: model.layers?.map((layer) => layer.name) ?? [],
+          layerNames: model.layers?.map((layer) => normalizeLayerName(layer.name)) ?? [],
           materials: model.materials?.length ?? 0,
           primitives: parsed.glbPrimitives?.length ?? 0,
           edges: edgePositions.length / 6,
@@ -983,6 +988,8 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
   useEffect(() => {
     const root = modelRef.current;
     if (!root) return;
+    const normalizedActiveLayer = normalizeLayerName(activeLayer);
+    const hiddenLayerSet = new Set(hiddenLayers.map(normalizeLayerName));
     root.traverse((object) => {
       if (!(object instanceof THREE.Mesh) || !object.userData.variants) return;
       const variants = object.userData.variants as ReturnType<typeof makeMaterials>;
@@ -990,7 +997,8 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
       object.material = variants[materialKey];
       const clippingPlane = activeSectionPlane ? sectionPlaneToThree(activeSectionPlane) : null;
       (object.material as THREE.Material).clippingPlanes = clippingPlane ? [clippingPlane] : [];
-      const layerVisible = !hiddenLayers.includes(String(object.userData.layer || "Layer0")) && (activeLayer === "All layers" || object.userData.layer === activeLayer);
+      const meshLayer = normalizeLayerName(object.userData.layer);
+      const layerVisible = !hiddenLayerSet.has(meshLayer) && (activeLayer === "All layers" || meshLayer === normalizedActiveLayer);
       const installVisible = !selectedInstallId || object.userData.installId === selectedInstallId;
       const meshGroupPath = String(object.userData.groupPath || "ROOT");
       const groupVisible = !selectedGroupPath || meshGroupPath === selectedGroupPath || meshGroupPath.startsWith(`${selectedGroupPath} / `);
@@ -1141,7 +1149,7 @@ function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hid
           constructionLines: model.root.constructionLines,
           constructionPoints: model.root.constructionPoints,
           texts: model.root.texts,
-          hiddenLayers: model.layers.filter((layer) => layer.hidden).map((layer) => layer.name),
+          hiddenLayers: model.layers.filter((layer) => layer.hidden).map((layer) => normalizeLayerName(layer.name)),
           abf: buildAbfInfoFromInstanced(parsed, model),
         });
         onScenes(model.pages.map((page) => ({
@@ -1157,7 +1165,7 @@ function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hid
         onStats({
           definitions: model.definitions.size,
           layers: model.layers?.length ?? 0,
-          layerNames: model.layers?.map((layer) => layer.name) ?? [],
+          layerNames: model.layers?.map((layer) => normalizeLayerName(layer.name)) ?? [],
           materials: model.materials?.length ?? 0,
           primitives: parsed.meshResources.reduce((total, resource) => total + resource.primitives.length, 0),
           edges: edgePositions.length / 6,
@@ -1201,6 +1209,8 @@ function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hid
   useEffect(() => {
     const root = modelRef.current;
     if (!root) return;
+    const normalizedActiveLayer = normalizeLayerName(activeLayer);
+    const hiddenLayerSet = new Set(hiddenLayers.map(normalizeLayerName));
     root.traverse((object) => {
       if (!(object instanceof THREE.Mesh) || !object.userData.variants) return;
       const variants = object.userData.variants as ReturnType<typeof makeMaterials>;
@@ -1208,7 +1218,8 @@ function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hid
       object.material = variants[materialKey];
       const clippingPlane = activeSectionPlane ? sectionPlaneToThree(activeSectionPlane) : null;
       (object.material as THREE.Material).clippingPlanes = clippingPlane ? [clippingPlane] : [];
-      const layerVisible = !hiddenLayers.includes(String(object.userData.layer || "Layer0")) && (activeLayer === "All layers" || object.userData.layer === activeLayer);
+      const meshLayer = normalizeLayerName(object.userData.layer);
+      const layerVisible = !hiddenLayerSet.has(meshLayer) && (activeLayer === "All layers" || meshLayer === normalizedActiveLayer);
       const installVisible = !selectedInstallId || object.userData.installId === selectedInstallId;
       const meshGroupPath = String(object.userData.groupPath || "ROOT");
       const groupVisible = !selectedGroupPath || meshGroupPath === selectedGroupPath || meshGroupPath.startsWith(`${selectedGroupPath} / `);
