@@ -77,7 +77,7 @@ export default function HomePage() {
   const [showGrid, setShowGrid] = useState(true);
   const [showEdges, setShowEdges] = useState(true);
   const [showAxes, setShowAxes] = useState(true);
-  const [showDimensions, setShowDimensions] = useState(true);
+  const [showDimensions, setShowDimensions] = useState(false);
   const [showGuides, setShowGuides] = useState(true);
   const [renderStyle, setRenderStyle] = useState<RenderStyle>("shaded");
   const [projection, setProjection] = useState<Projection>("perspective");
