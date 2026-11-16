@@ -374,37 +374,10 @@ export default function HomePage() {
               </div>
             </div>
 
-            <div className="sidebar-section installation-section">
-              <div className="section-title-row">
-                <span>Installation takeoff</span>
-                <button className="export-installation" title="Xuất CSV danh sách lắp đặt" onClick={exportInstallationCsv} disabled={installationItems.length === 0}><Download size={13} /> CSV</button>
-              </div>
-              <div className="installation-meta"><span>{installationItems.length} loại cấu kiện</span><span>{installationItems.reduce((total, item) => total + item.count, 0)} vị trí</span></div>
-              <p className="section-caption">Chọn một cấu kiện để cô lập và zoom vào vị trí lắp.</p>
-              {selectedInstallId && (
-                <button className="clear-selection" onClick={() => setSelectedInstallId(null)}>Hiện toàn bộ model</button>
-              )}
-              <div className="installation-list">
-                {installationItems.length === 0 && <div className="empty-installation">Chưa tìm thấy component có thể bóc tách.</div>}
-                {installationItems.slice(0, 80).map((item) => (
-                  <button key={item.id} className={`installation-row ${selectedInstallId === item.id ? "selected" : ""}`} onClick={() => { setSelectedInstallId((current) => current === item.id ? null : item.id); setSelectedGroupPath(null); }}>
-                    <span className="installation-index">{item.count}</span>
-                    <span className="installation-copy">
-                      <strong>{item.name}</strong>
-                      <small>{item.definitionName || "Component"} · {item.layer}</small>
-                      <small>{formatDimension(item.sizeMm[0])} × {formatDimension(item.sizeMm[1])} × {formatDimension(item.sizeMm[2])}</small>
-                    </span>
-                    <ChevronRight size={14} />
-                  </button>
-                ))}
-              </div>
-              {installationItems.length > 80 && <span className="list-overflow">+ {installationItems.length - 80} loại khác</span>}
-            </div>
-
             {modelInfo?.abf?.detected && (
               <div className="sidebar-section production-section">
                 <div className="section-title-row"><span>ABF production</span><span className="section-count">{modelInfo.abf.boardCount} tấm</span></div>
-                <p className="section-caption">Dữ liệu sản xuất được đọc từ layer, group và attribute ABF trong file SKP.</p>
+                <p className="section-caption">Đã đọc từ layer, group và attribute ABF trong file SKP. Các lớp phụ mặc định đang tắt.</p>
                 <div className="production-summary">
                   <span><strong>{modelInfo.abf.nestingSheetCount}</strong> khổ ván</span>
                   <span><strong>{modelInfo.abf.featureCounts.edgeBanding}</strong> cạnh dán</span>
@@ -431,6 +404,33 @@ export default function HomePage() {
                 </>}
               </div>
             )}
+
+            <div className="sidebar-section installation-section">
+              <div className="section-title-row">
+                <span>Installation takeoff</span>
+                <button className="export-installation" title="Xuất CSV danh sách lắp đặt" onClick={exportInstallationCsv} disabled={installationItems.length === 0}><Download size={13} /> CSV</button>
+              </div>
+              <div className="installation-meta"><span>{installationItems.length} loại cấu kiện</span><span>{installationItems.reduce((total, item) => total + item.count, 0)} vị trí</span></div>
+              <p className="section-caption">Chọn một cấu kiện để cô lập và zoom vào vị trí lắp.</p>
+              {selectedInstallId && (
+                <button className="clear-selection" onClick={() => setSelectedInstallId(null)}>Hiện toàn bộ model</button>
+              )}
+              <div className="installation-list">
+                {installationItems.length === 0 && <div className="empty-installation">Chưa tìm thấy component có thể bóc tách.</div>}
+                {installationItems.slice(0, 80).map((item) => (
+                  <button key={item.id} className={`installation-row ${selectedInstallId === item.id ? "selected" : ""}`} onClick={() => { setSelectedInstallId((current) => current === item.id ? null : item.id); setSelectedGroupPath(null); }}>
+                    <span className="installation-index">{item.count}</span>
+                    <span className="installation-copy">
+                      <strong>{item.name}</strong>
+                      <small>{item.definitionName || "Component"} · {item.layer}</small>
+                      <small>{formatDimension(item.sizeMm[0])} × {formatDimension(item.sizeMm[1])} × {formatDimension(item.sizeMm[2])}</small>
+                    </span>
+                    <ChevronRight size={14} />
+                  </button>
+                ))}
+              </div>
+              {installationItems.length > 80 && <span className="list-overflow">+ {installationItems.length - 80} loại khác</span>}
+            </div>
 
             <div className="sidebar-section groups-section">
               <div className="section-title-row"><span>Groups / Components</span><span className="section-count">{sceneGroups.length}</span></div>

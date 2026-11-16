@@ -254,7 +254,8 @@ type AbfMetadata = {
 };
 
 function inspectAbfMetadata(metadata: AbfMetadata): AbfEntityInfo | null {
-  const attributes = metadata.attributeDictionaries?.ABF || {};
+  const rawAttributes = Object.entries(metadata.attributeDictionaries || {}).find(([name]) => name.toLowerCase() === "abf")?.[1] || {};
+  const attributes = Object.fromEntries(Object.entries(rawAttributes).map(([key, value]) => [key.toLowerCase(), String(value)]));
   const text = `${metadata.name || ""} ${metadata.layer || ""} ${metadata.path || ""}`.toLowerCase();
   const hasAbfData = Object.keys(attributes).length > 0 || text.includes("abf");
   if (!hasAbfData) return null;
@@ -334,7 +335,7 @@ function buildAbfInfo(parsed: SkpScene, model: SkpModel): AbfInfo | null {
     }
 
     if (abf.inNesting) {
-      const segments = metadata.path.split(" / ");
+      const segments = (metadata.path || "ROOT").split(" / ");
       const sheetName = segments.find((segment) => segment.toLowerCase().startsWith("__") && segment.toLowerCase().includes("sheet-"));
       if (sheetName) {
         const sheetPath = segments.slice(0, segments.indexOf(sheetName) + 1).join(" / ");
