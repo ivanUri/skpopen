@@ -5,7 +5,7 @@ import { Canvas, useThree } from "@react-three/fiber";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { isDrawableEdge, parseSkpWithInstancedScene, parseSkpWithScene } from "skp-core-custom";
-import type { ConstructionLine, ConstructionPoint, Definition, Dimension, Edge, InstancedMeshResource, InstancedNode, InstancedScene, SectionPlane, SkpModel, SkpScene, TextEntity } from "skp-core-custom";
+import type { ConstructionLine, ConstructionPoint, Definition, Dimension, Edge, InstanceNode, InstancedMeshResource, InstancedNode, InstancedScene, SectionPlane, SkpModel, SkpScene, TextEntity } from "skp-core-custom";
 
 export type RenderStyle = "shaded" | "hidden-line" | "monochrome" | "wireframe" | "xray";
 export type Projection = "perspective" | "orthographic";
@@ -578,6 +578,18 @@ function collectInstallationItems(parsed: SkpScene): InstallationItem[] {
 }
 
 function collectSceneGroups(parsed: SkpScene): SceneGroup[] {
+  const nodeMeta = new Map<string, { name: string; definitionName: string; layer: string; positionMm: [number, number, number] }>();
+  const nodePaths = new Set<string>();
+  const indexNodes = (node: InstanceNode, parentPath: string) => {
+    const path = node.name === "ROOT" ? "ROOT" : `${parentPath} / ${node.name}`;
+    if (path !== "ROOT") {
+      nodePaths.add(path);
+      nodeMeta.set(path, { name: node.name || "Group", definitionName: node.definitionName || "", layer: node.layer || "Layer0", positionMm: node.positionMm });
+    }
+    node.children.forEach((child) => indexNodes(child, path));
+  };
+  indexNodes(parsed.sceneHierarchy, "ROOT");
+
   const grouped = new Map<string, {
     name: string;
     definitionName: string;
@@ -591,10 +603,11 @@ function collectSceneGroups(parsed: SkpScene): SceneGroup[] {
 
   for (const primitive of parsed.glbPrimitives) {
     const metadata = parsed.meshIndex[primitive.geomName];
-    if (!metadata || metadata.path === "ROOT") continue;
+    if (!metadata || metadata.path === "ROOT" || isAbfInternalPath(metadata.path)) continue;
     const segments = metadata.path.split(" / ");
     for (let index = 0; index < segments.length; index += 1) {
       const path = segments.slice(0, index + 1).join(" / ");
+      if (!nodePaths.has(path) || isAbfInternalPath(path)) continue;
       const existing = grouped.get(path) ?? {
         name: segments[index] || "Group",
         definitionName: metadata.definitionName,
@@ -605,12 +618,6 @@ function collectSceneGroups(parsed: SkpScene): SceneGroup[] {
         min: [Infinity, Infinity, Infinity] as Point,
         max: [-Infinity, -Infinity, -Infinity] as Point,
       };
-      if (metadata.path === path) {
-        existing.name = metadata.name || existing.name;
-        existing.definitionName = metadata.definitionName || existing.definitionName;
-        existing.layer = metadata.layer || existing.layer;
-        existing.positionMm = metadata.positionMm;
-      }
       existing.paths.add(metadata.path);
       for (let vertex = 0; vertex < primitive.positions.length; vertex += 3) {
         existing.min[0] = Math.min(existing.min[0], primitive.positions[vertex]);
@@ -628,20 +635,24 @@ function collectSceneGroups(parsed: SkpScene): SceneGroup[] {
     .map(([path, group]) => ({
       id: path,
       path,
-      name: group.name,
-      definitionName: group.definitionName,
-      layer: group.layer,
-      depth: group.depth,
-      count: group.paths.size,
+      name: nodeMeta.get(path)?.name || group.name,
+      definitionName: nodeMeta.get(path)?.definitionName || group.definitionName,
+      layer: nodeMeta.get(path)?.layer || group.layer,
+      depth: path.split(" / ").length - 1,
+      count: 1,
       sizeMm: [
         Math.round((group.max[0] - group.min[0]) * 1000),
         Math.round((group.max[1] - group.min[1]) * 1000),
         Math.round((group.max[2] - group.min[2]) * 1000),
       ] as [number, number, number],
-      positionMm: group.positionMm,
+      positionMm: nodeMeta.get(path)?.positionMm || group.positionMm,
     }))
-    .filter((group) => group.count > 0)
+    .filter((group) => group.count > 0 && nodePaths.has(group.path))
     .sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function isAbfInternalPath(path: string) {
+  return path.split(" / ").some((segment) => segment.startsWith("_ABF") || segment.startsWith("__ABF_"));
 }
 
 function instancedNodeLabel(node: InstancedNode) {
@@ -707,15 +718,21 @@ function collectInstancedInstallationItems(scene: InstancedScene): InstallationI
 
 function collectInstancedGroups(scene: InstancedScene): SceneGroup[] {
   const resources = new Map(scene.meshResources.map((resource) => [resource.id, resource]));
+  const nodeMeta = new Map<string, { name: string; definitionName: string; layer: string; positionMm: [number, number, number] }>();
+  const nodePaths = new Set<string>();
   const grouped = new Map<string, { name: string; definitionName: string; layer: string; depth: number; paths: Set<string>; min: THREE.Vector3; max: THREE.Vector3; positionMm: [number, number, number] }>();
   walkInstancedScene(scene, (node, path, world) => {
-    if (path === "ROOT" || !node.meshResourceId) return;
+    if (path === "ROOT") return;
+    nodePaths.add(path);
+    nodeMeta.set(path, { name: node.name || "Group", definitionName: node.definitionName || "", layer: node.layer || "Layer0", positionMm: node.positionMm });
+    if (!node.meshResourceId || isAbfInternalPath(path)) return;
     const resource = resources.get(node.meshResourceId);
     if (!resource) return;
     const box = instancedWorldBox(resource, world);
     const segments = path.split(" / ");
     for (let index = 0; index < segments.length; index += 1) {
       const groupPath = segments.slice(0, index + 1).join(" / ");
+      if (!nodePaths.has(groupPath) || isAbfInternalPath(groupPath)) continue;
       const existing = grouped.get(groupPath) ?? {
         name: segments[index],
         definitionName: node.definitionName || resource.definitionName,
@@ -740,18 +757,19 @@ function collectInstancedGroups(scene: InstancedScene): SceneGroup[] {
   });
   return [...grouped.entries()].map(([path, group]) => {
     const size = group.max.clone().sub(group.min);
+    const metadata = nodeMeta.get(path);
     return {
       id: path,
       path,
-      name: group.name,
-      definitionName: group.definitionName,
-      layer: group.layer,
-      depth: group.depth,
-      count: group.paths.size,
+      name: metadata?.name || group.name,
+      definitionName: metadata?.definitionName || group.definitionName,
+      layer: metadata?.layer || group.layer,
+      depth: path.split(" / ").length - 1,
+      count: 1,
       sizeMm: [Math.round(size.x * 1000), Math.round(size.y * 1000), Math.round(size.z * 1000)] as [number, number, number],
-      positionMm: group.positionMm,
+      positionMm: metadata?.positionMm || group.positionMm,
     };
-  }).filter((group) => group.count > 0).sort((a, b) => a.path.localeCompare(b.path));
+  }).filter((group) => group.count > 0 && nodePaths.has(group.path)).sort((a, b) => a.path.localeCompare(b.path));
 }
 
 function collectSketchupEdges(model: SkpModel) {
