@@ -780,9 +780,17 @@ function collectInstancedGroups(scene: InstancedScene): SceneGroup[] {
   }).filter((group) => group.count > 0 && nodePaths.has(group.path)).sort((a, b) => a.path.localeCompare(b.path));
 }
 
-function collectSketchupEdges(model: SkpModel) {
-  const positions: number[] = [];
-  const visit = (definition: Definition, matrix: Matrix, stack: Set<number>) => {
+type SceneHierarchyNode = {
+  layer?: string;
+  children?: SceneHierarchyNode[];
+};
+
+function collectSketchupEdges(model: SkpModel, sceneHierarchy: SceneHierarchyNode) {
+  const positionsByLayer = new Map<string, number[]>();
+  const visit = (definition: Definition, matrix: Matrix, stack: Set<number>, inheritedLayer: string, sceneNode?: SceneHierarchyNode) => {
+    const layer = normalizeLayerName(sceneNode?.layer || inheritedLayer);
+    const positions = positionsByLayer.get(layer) ?? [];
+    positionsByLayer.set(layer, positions);
     const vertices = new Map(definition.vertices.map((vertex) => [vertex.id, [vertex.x, vertex.y, vertex.z] as Point]));
     definition.edges.forEach((edge: Edge) => {
       if (!isDrawableEdge(edge)) return;
@@ -793,17 +801,19 @@ function collectSketchupEdges(model: SkpModel) {
       const b = toThreePoint(transformPoint(matrix, end));
       positions.push(a[0], a[1], a[2], b[0], b[1], b[2]);
     });
-    definition.instances.forEach((instance) => {
+    definition.instances.forEach((instance, index) => {
       if (instance.hidden || stack.has(instance.refIdx)) return;
       const child = model.definitions.get(instance.refIdx);
       if (!child) return;
       const nextStack = new Set(stack);
       nextStack.add(instance.refIdx);
-      visit(child, multiplyMatrices(matrix, instance.matrix), nextStack);
+      const childNode = sceneNode?.children?.[index];
+      const childLayer = normalizeLayerName(childNode?.layer || instance.layer || layer);
+      visit(child, multiplyMatrices(matrix, instance.matrix), nextStack, childLayer, childNode);
     });
   };
-  visit(model.root, IDENTITY, new Set([model.root.id]));
-  return new Float32Array(positions);
+  visit(model.root, IDENTITY, new Set([model.root.id]), "Layer0", sceneHierarchy);
+  return new Map([...positionsByLayer.entries()].map(([layer, positions]) => [layer, new Float32Array(positions)]));
 }
 
 function materialColor(definition: GltfMaterialDefinition | undefined) {
@@ -904,14 +914,19 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
           root.add(mesh);
         }
 
-        const edgePositions = collectSketchupEdges(model);
-        const edgeGeometry = new THREE.BufferGeometry();
-        edgeGeometry.setAttribute("position", new THREE.BufferAttribute(edgePositions, 3));
+        const edgeLayers = collectSketchupEdges(model, parsed.sceneHierarchy);
         const edgeMaterial = new THREE.LineBasicMaterial({ color: "#4d5859", transparent: true, opacity: 0.78 });
-        const edges = new THREE.LineSegments(edgeGeometry, edgeMaterial);
-        edges.name = "SKP_VISIBLE_EDGES";
-        edges.userData = { edgeMaterial };
-        root.add(edges);
+        const edges = new Map<string, THREE.LineSegments>();
+        let edgeCount = 0;
+        edgeLayers.forEach((positions, layer) => {
+          const edgeGeometry = new THREE.BufferGeometry();
+          edgeGeometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+          const edgeObject = new THREE.LineSegments(edgeGeometry, edgeMaterial);
+          edgeObject.name = `SKP_VISIBLE_EDGES_${layer}`;
+          root.add(edgeObject);
+          edges.set(layer, edgeObject);
+          edgeCount += positions.length / 6;
+        });
         root.userData = { materialVariants, edgeMaterial, edges };
 
         if (disposed) return;
@@ -948,7 +963,7 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
           layerNames: model.layers?.map((layer) => normalizeLayerName(layer.name)) ?? [],
           materials: model.materials?.length ?? 0,
           primitives: parsed.glbPrimitives?.length ?? 0,
-          edges: edgePositions.length / 6,
+          edges: edgeCount,
           scenes: model.pages?.length ?? 0,
           dimensions: model.dimensions.length,
           sectionPlanes: model.root.sectionPlanes.length,
@@ -1004,12 +1019,19 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
       const groupVisible = !selectedGroupPath || meshGroupPath === selectedGroupPath || meshGroupPath.startsWith(`${selectedGroupPath} / `);
       object.visible = layerVisible && installVisible && groupVisible && abfIsVisible(object.userData.abf as AbfEntityInfo | null, abfVisibility);
     });
-    const edges = root.userData.edges as THREE.LineSegments | undefined;
+    const edges = root.userData.edges as Map<string, THREE.LineSegments> | undefined;
     if (edges) {
-      edges.visible = showEdges && renderStyle !== "wireframe" && activeLayer === "All layers" && !selectedInstallId && !selectedGroupPath;
+      edges.forEach((edgeObject, layer) => {
+        const edgeLayer = normalizeLayerName(layer);
+        const layerVisible = !hiddenLayerSet.has(edgeLayer) && (activeLayer === "All layers" || edgeLayer === normalizedActiveLayer);
+        edgeObject.visible = showEdges && renderStyle !== "wireframe" && layerVisible && !selectedInstallId && !selectedGroupPath;
+      });
+      const edgeMaterial = root.userData.edgeMaterial as THREE.LineBasicMaterial | undefined;
       const clippingPlane = activeSectionPlane ? sectionPlaneToThree(activeSectionPlane) : null;
-      (edges.material as THREE.LineBasicMaterial).clippingPlanes = clippingPlane ? [clippingPlane] : [];
-      (edges.material as THREE.LineBasicMaterial).opacity = renderStyle === "hidden-line" ? 0.95 : renderStyle === "xray" ? 0.62 : 0.78;
+      if (edgeMaterial) {
+        edgeMaterial.clippingPlanes = clippingPlane ? [clippingPlane] : [];
+        edgeMaterial.opacity = renderStyle === "hidden-line" ? 0.95 : renderStyle === "xray" ? 0.62 : 0.78;
+      }
     }
   }, [abfVisibility, activeLayer, activeSectionPlane, hiddenLayers, renderStyle, selectedGroupPath, selectedInstallId, showEdges]);
 
@@ -1125,13 +1147,19 @@ function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hid
         };
         await addNode(parsed.sceneHierarchy, root, "ROOT");
 
-        const edgePositions = collectSketchupEdges(model);
-        const edgeGeometry = new THREE.BufferGeometry();
-        edgeGeometry.setAttribute("position", new THREE.BufferAttribute(edgePositions, 3));
+        const edgeLayers = collectSketchupEdges(model, parsed.sceneHierarchy);
         const edgeMaterial = new THREE.LineBasicMaterial({ color: "#4d5859", transparent: true, opacity: 0.78 });
-        const edges = new THREE.LineSegments(edgeGeometry, edgeMaterial);
-        edges.name = "SKP_VISIBLE_EDGES";
-        root.add(edges);
+        const edges = new Map<string, THREE.LineSegments>();
+        let edgeCount = 0;
+        edgeLayers.forEach((positions, layer) => {
+          const edgeGeometry = new THREE.BufferGeometry();
+          edgeGeometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+          const edgeObject = new THREE.LineSegments(edgeGeometry, edgeMaterial);
+          edgeObject.name = `SKP_VISIBLE_EDGES_${layer}`;
+          root.add(edgeObject);
+          edges.set(layer, edgeObject);
+          edgeCount += positions.length / 6;
+        });
         root.userData = { materialVariants, edgeMaterial, edges, resourceGeometries };
 
         if (disposed) return;
@@ -1168,7 +1196,7 @@ function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hid
           layerNames: model.layers?.map((layer) => normalizeLayerName(layer.name)) ?? [],
           materials: model.materials?.length ?? 0,
           primitives: parsed.meshResources.reduce((total, resource) => total + resource.primitives.length, 0),
-          edges: edgePositions.length / 6,
+          edges: edgeCount,
           scenes: model.pages?.length ?? 0,
           dimensions: model.dimensions.length,
           sectionPlanes: model.root.sectionPlanes.length,
@@ -1225,12 +1253,19 @@ function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hid
       const groupVisible = !selectedGroupPath || meshGroupPath === selectedGroupPath || meshGroupPath.startsWith(`${selectedGroupPath} / `);
       object.visible = layerVisible && installVisible && groupVisible && abfIsVisible(object.userData.abf as AbfEntityInfo | null, abfVisibility);
     });
-    const edges = root.userData.edges as THREE.LineSegments | undefined;
+    const edges = root.userData.edges as Map<string, THREE.LineSegments> | undefined;
     if (edges) {
-      edges.visible = showEdges && renderStyle !== "wireframe" && activeLayer === "All layers" && !selectedInstallId && !selectedGroupPath;
+      edges.forEach((edgeObject, layer) => {
+        const edgeLayer = normalizeLayerName(layer);
+        const layerVisible = !hiddenLayerSet.has(edgeLayer) && (activeLayer === "All layers" || edgeLayer === normalizedActiveLayer);
+        edgeObject.visible = showEdges && renderStyle !== "wireframe" && layerVisible && !selectedInstallId && !selectedGroupPath;
+      });
+      const edgeMaterial = root.userData.edgeMaterial as THREE.LineBasicMaterial | undefined;
       const clippingPlane = activeSectionPlane ? sectionPlaneToThree(activeSectionPlane) : null;
-      (edges.material as THREE.LineBasicMaterial).clippingPlanes = clippingPlane ? [clippingPlane] : [];
-      (edges.material as THREE.LineBasicMaterial).opacity = renderStyle === "hidden-line" ? 0.95 : renderStyle === "xray" ? 0.62 : 0.78;
+      if (edgeMaterial) {
+        edgeMaterial.clippingPlanes = clippingPlane ? [clippingPlane] : [];
+        edgeMaterial.opacity = renderStyle === "hidden-line" ? 0.95 : renderStyle === "xray" ? 0.62 : 0.78;
+      }
     }
   }, [abfVisibility, activeLayer, activeSectionPlane, hiddenLayers, renderStyle, selectedGroupPath, selectedInstallId, showEdges]);
 
