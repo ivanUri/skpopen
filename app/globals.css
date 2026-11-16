@@ -164,6 +164,19 @@ h1 { margin: 0; max-width: 190px; overflow: hidden; text-overflow: ellipsis; whi
 .annotation-toggle-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
 .annotation-toggle-grid button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-height: 32px; border: 1px solid transparent; border-radius: 5px; background: #edf1ef; color: #718083; font-size: 9px; }
 .annotation-toggle-grid button:hover, .annotation-toggle-grid button.selected { border-color: #b8cac5; background: #e0ebe7; color: #365657; }
+.production-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; margin: 9px 0; }
+.production-summary span { display: flex; flex-direction: column; gap: 2px; padding: 7px 6px; border: 1px solid #dde5e2; border-radius: 5px; color: #899696; font: 8px 'DM Mono', monospace; text-align: center; }
+.production-summary strong { color: #365657; font-size: 12px; }
+.production-toggle-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+.production-toggle-grid button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-height: 32px; border: 1px solid transparent; border-radius: 5px; background: #edf1ef; color: #718083; font-size: 9px; }
+.production-toggle-grid button:hover, .production-toggle-grid button.selected { border-color: #b8cac5; background: #e0ebe7; color: #365657; }
+.production-sheet-list { display: flex; flex-direction: column; gap: 4px; }
+.production-sheet-list button { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; padding: 7px 8px; border: 1px solid transparent; border-radius: 5px; background: #f6f8f7; color: #718083; text-align: left; }
+.production-sheet-list button:hover, .production-sheet-list button.selected { border-color: #b8cac5; background: #e7f0ed; color: #365657; }
+.production-sheet-list button > span { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.production-sheet-list strong { overflow: hidden; color: #526a6a; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.production-sheet-list small { color: #8a9898; font: 8px 'DM Mono', monospace; }
+.entity-abf-properties { border-color: #c8ddd5; background: #f0f7f4; }
 .section-subtitle { margin: 14px 0 7px; color: #899696; font: 8px 'DM Mono', monospace; letter-spacing: .08em; text-transform: uppercase; }
 .section-plane-list { display: flex; flex-direction: column; gap: 3px; }
 .section-plane-list button { width: 100%; padding: 7px 8px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: #718083; text-align: left; font-size: 9px; }

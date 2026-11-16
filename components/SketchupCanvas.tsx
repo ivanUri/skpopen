@@ -54,6 +54,57 @@ export type PickedEntity = {
   positionMm: [number, number, number];
   properties: Record<string, string>;
   attributeDictionaries: Record<string, Record<string, string>>;
+  abf: AbfEntityInfo | null;
+};
+
+export type AbfRole = "label" | "cuttingLines" | "edgeBanding" | "fittings" | "intersections" | "none";
+
+export type AbfVisibility = {
+  nesting: boolean;
+  labels: boolean;
+  cuttingLines: boolean;
+  edgeBanding: boolean;
+  fittings: boolean;
+  intersections: boolean;
+};
+
+export type AbfEntityInfo = {
+  role: AbfRole;
+  inNesting: boolean;
+  boardIndex: string | null;
+  edgeBandTypes: string | null;
+  settingName: string | null;
+  attributes: Record<string, string>;
+};
+
+export type AbfPart = {
+  id: string;
+  boardIndex: string;
+  name: string;
+  layer: string;
+  material: string;
+  sizeMm: [number, number, number];
+  edgeBandTypes: string | null;
+  labelRotation: string | null;
+  path: string;
+};
+
+export type AbfNestingSheet = {
+  id: string;
+  name: string;
+  path: string;
+  thicknessMm: number | null;
+  partCount: number;
+};
+
+export type AbfInfo = {
+  detected: boolean;
+  boardCount: number;
+  nestingSheetCount: number;
+  layers: string[];
+  featureCounts: Record<Exclude<AbfRole, "none">, number>;
+  parts: AbfPart[];
+  nestingSheets: AbfNestingSheet[];
 };
 
 export type ModelInfo = {
@@ -65,6 +116,7 @@ export type ModelInfo = {
   constructionPoints: ConstructionPoint[];
   texts: TextEntity[];
   hiddenLayers: string[];
+  abf: AbfInfo | null;
 };
 
 type ModelStats = {
@@ -99,6 +151,7 @@ type Props = {
   selectedGroupPath: string | null;
   activeScene: ScenePage | null;
   activeSectionPlane: SectionPlane | null;
+  abfVisibility: AbfVisibility;
   measureMode: boolean;
   measurementPoints: Point[];
   viewPreset: "iso" | "front" | "top";
@@ -190,6 +243,199 @@ function sectionPlaneToThree(section: SectionPlane) {
 
 function installationId(metadata: { name?: string; definitionName?: string; layer?: string }) {
   return [metadata.name || "Component", metadata.definitionName || "", metadata.layer || "Layer0"].join("::");
+}
+
+type AbfMetadata = {
+  name?: string;
+  layer?: string;
+  path?: string;
+  properties?: Record<string, string>;
+  attributeDictionaries?: Record<string, Record<string, string>>;
+};
+
+function inspectAbfMetadata(metadata: AbfMetadata): AbfEntityInfo | null {
+  const attributes = metadata.attributeDictionaries?.ABF || {};
+  const text = `${metadata.name || ""} ${metadata.layer || ""} ${metadata.path || ""}`.toLowerCase();
+  const hasAbfData = Object.keys(attributes).length > 0 || text.includes("abf");
+  if (!hasAbfData) return null;
+
+  let role: AbfRole = "none";
+  if (Object.prototype.hasOwnProperty.call(attributes, "is-intersect") || text.includes("intersect")) role = "intersections";
+  else if (text.includes("label")) role = "label";
+  else if (text.includes("cuttingline") || text.includes("cutting-lines")) role = "cuttingLines";
+  else if (text.includes("edgeband") || text.includes("edge-band")) role = "edgeBanding";
+  else if (text.includes("minifix") || text.includes("hinge") || text.includes("screw") || text.includes("drill") || text.includes("mortise") || text.includes("tenon") || text.includes("abf-d")) role = "fittings";
+
+  return {
+    role,
+    inNesting: text.includes("__abf_nesting"),
+    boardIndex: attributes["board-index"] || null,
+    edgeBandTypes: attributes["edge-band-types"] || null,
+    settingName: attributes["setting-name"] || null,
+    attributes,
+  };
+}
+
+function primitiveBounds(positions: Float32Array) {
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  for (let index = 0; index < positions.length; index += 3) {
+    min[0] = Math.min(min[0], positions[index]);
+    min[1] = Math.min(min[1], positions[index + 1]);
+    min[2] = Math.min(min[2], positions[index + 2]);
+    max[0] = Math.max(max[0], positions[index]);
+    max[1] = Math.max(max[1], positions[index + 1]);
+    max[2] = Math.max(max[2], positions[index + 2]);
+  }
+  return [
+    Math.round(Math.max(0, max[0] - min[0]) * 1000),
+    Math.round(Math.max(0, max[1] - min[1]) * 1000),
+    Math.round(Math.max(0, max[2] - min[2]) * 1000),
+  ] as [number, number, number];
+}
+
+function buildAbfInfo(parsed: SkpScene, model: SkpModel): AbfInfo | null {
+  const layers = new Set<string>();
+  const parts = new Map<string, AbfPart>();
+  const sheets = new Map<string, AbfNestingSheet>();
+  const featureCounts: AbfInfo["featureCounts"] = {
+    label: 0,
+    cuttingLines: 0,
+    edgeBanding: 0,
+    fittings: 0,
+    intersections: 0,
+  };
+
+  for (const primitive of parsed.glbPrimitives) {
+    const metadata = parsed.meshIndex[primitive.geomName];
+    if (!metadata) continue;
+    const abf = inspectAbfMetadata(metadata);
+    if (!abf) continue;
+    if (metadata.layer?.toLowerCase().includes("abf")) layers.add(metadata.layer);
+    if (abf.role !== "none") featureCounts[abf.role] += 1;
+
+    if (abf.boardIndex) {
+      const id = abf.boardIndex;
+      const material = model.materials[primitive.materialIndex]?.name || `Material #${primitive.materialIndex}`;
+      const existing = parts.get(id);
+      if (!existing) {
+        parts.set(id, {
+          id,
+          boardIndex: id,
+          name: metadata.name || `Part ${id}`,
+          layer: metadata.layer || "Layer0",
+          material,
+          sizeMm: primitiveBounds(primitive.positions),
+          edgeBandTypes: abf.edgeBandTypes,
+          labelRotation: abf.attributes["label-rotation"] || null,
+          path: metadata.path,
+        });
+      }
+    }
+
+    if (abf.inNesting) {
+      const segments = metadata.path.split(" / ");
+      const sheetName = segments.find((segment) => segment.toLowerCase().startsWith("__") && segment.toLowerCase().includes("sheet-"));
+      if (sheetName) {
+        const sheetPath = segments.slice(0, segments.indexOf(sheetName) + 1).join(" / ");
+        const thicknessMatch = sheetName.match(/(\d+(?:\.\d+)?)mm/i);
+        const sheet = sheets.get(sheetPath) ?? {
+          id: sheetPath,
+          name: sheetName.replace(/^__/, ""),
+          path: sheetPath,
+          thicknessMm: thicknessMatch ? Number(thicknessMatch[1]) : null,
+          partCount: 0,
+        };
+        if (segments.length > segments.indexOf(sheetName) + 1 && !metadata.name?.toLowerCase().includes("abf")) sheet.partCount += 1;
+        sheets.set(sheetPath, sheet);
+      }
+    }
+  }
+
+  const detected = layers.size > 0 || parts.size > 0 || sheets.size > 0;
+  if (!detected) return null;
+  return {
+    detected,
+    boardCount: parts.size,
+    nestingSheetCount: sheets.size,
+    layers: [...layers].sort(),
+    featureCounts,
+    parts: [...parts.values()].sort((a, b) => Number(a.boardIndex) - Number(b.boardIndex)),
+    nestingSheets: [...sheets.values()].sort((a, b) => a.name.localeCompare(b.name)),
+  };
+}
+
+function buildAbfInfoFromInstanced(parsed: InstancedScene, model: SkpModel): AbfInfo | null {
+  const resources = new Map(parsed.meshResources.map((resource) => [resource.id, resource]));
+  const layers = new Set<string>();
+  const parts = new Map<string, AbfPart>();
+  const sheets = new Map<string, AbfNestingSheet>();
+  const featureCounts: AbfInfo["featureCounts"] = { label: 0, cuttingLines: 0, edgeBanding: 0, fittings: 0, intersections: 0 };
+  walkInstancedScene(parsed, (node, path) => {
+    if (!node.meshResourceId) return;
+    const resource = resources.get(node.meshResourceId);
+    if (!resource) return;
+    const metadata: AbfMetadata = {
+      name: node.name,
+      layer: node.layer,
+      path,
+      properties: node.properties,
+      attributeDictionaries: node.attributeDictionaries,
+    };
+    const abf = inspectAbfMetadata(metadata);
+    if (!abf) return;
+    if (node.layer?.toLowerCase().includes("abf")) layers.add(node.layer);
+    if (abf.role !== "none") featureCounts[abf.role] += 1;
+    const primitive = resource.primitives[0];
+    if (abf.boardIndex && primitive) {
+      const material = model.materials[primitive.materialIndex]?.name || `Material #${primitive.materialIndex}`;
+      if (!parts.has(abf.boardIndex)) {
+        parts.set(abf.boardIndex, {
+          id: abf.boardIndex,
+          boardIndex: abf.boardIndex,
+          name: node.name || `Part ${abf.boardIndex}`,
+          layer: node.layer || "Layer0",
+          material,
+          sizeMm: primitiveBounds(primitive.positions),
+          edgeBandTypes: abf.edgeBandTypes,
+          labelRotation: abf.attributes["label-rotation"] || null,
+          path,
+        });
+      }
+    }
+    if (abf.inNesting) {
+      const segments = path.split(" / ");
+      const sheetName = segments.find((segment) => segment.toLowerCase().startsWith("__") && segment.toLowerCase().includes("sheet-"));
+      if (sheetName) {
+        const sheetPath = segments.slice(0, segments.indexOf(sheetName) + 1).join(" / ");
+        const thicknessMatch = sheetName.match(/(\d+(?:\.\d+)?)mm/i);
+        const sheet = sheets.get(sheetPath) ?? { id: sheetPath, name: sheetName.replace(/^__/, ""), path: sheetPath, thicknessMm: thicknessMatch ? Number(thicknessMatch[1]) : null, partCount: 0 };
+        if (segments.length > segments.indexOf(sheetName) + 1 && !node.name?.toLowerCase().includes("abf")) sheet.partCount += 1;
+        sheets.set(sheetPath, sheet);
+      }
+    }
+  });
+  if (layers.size === 0 && parts.size === 0 && sheets.size === 0) return null;
+  return {
+    detected: true,
+    boardCount: parts.size,
+    nestingSheetCount: sheets.size,
+    layers: [...layers].sort(),
+    featureCounts,
+    parts: [...parts.values()].sort((a, b) => Number(a.boardIndex) - Number(b.boardIndex)),
+    nestingSheets: [...sheets.values()].sort((a, b) => a.name.localeCompare(b.name)),
+  };
+}
+
+function abfIsVisible(entity: AbfEntityInfo | null, visibility: AbfVisibility) {
+  if (!entity) return true;
+  if (entity.inNesting && !visibility.nesting) return false;
+  if (entity.role === "label") return visibility.labels;
+  if (entity.role === "cuttingLines") return visibility.cuttingLines;
+  if (entity.role === "edgeBanding") return visibility.edgeBanding;
+  if (entity.role === "fittings") return visibility.fittings;
+  if (entity.role === "intersections") return visibility.intersections;
+  return true;
 }
 
 function collectInstallationItems(parsed: SkpScene): InstallationItem[] {
@@ -463,7 +709,7 @@ function makeMaterials(definition: GltfMaterialDefinition | undefined, texture?:
   };
 }
 
-function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeSectionPlane, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "showDimensions" | "showGuides" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "onEntitySelect" | "onMeasurePoint" | "onModelInfo"> & { activeSectionPlane: SectionPlane | null; onModelInfo: (info: ModelInfo) => void; onReady: (root: THREE.Object3D) => void }) {
+function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeSectionPlane, abfVisibility, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "showDimensions" | "showGuides" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "onEntitySelect" | "onMeasurePoint" | "onModelInfo"> & { activeSectionPlane: SectionPlane | null; onModelInfo: (info: ModelInfo) => void; onReady: (root: THREE.Object3D) => void }) {
   const { scene } = useThree();
   const modelRef = useRef<THREE.Group | null>(null);
 
@@ -535,6 +781,7 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
             positionMm: metadata?.positionMm || [0, 0, 0],
             properties: metadata?.properties || {},
             attributeDictionaries: metadata?.attributeDictionaries || {},
+            abf: inspectAbfMetadata(metadata),
             displayName: metadata?.name || primitive.geomName,
             materialIndex: primitive.materialIndex,
             variants,
@@ -567,6 +814,7 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
           constructionPoints: model.root.constructionPoints,
           texts: model.root.texts,
           hiddenLayers: model.layers.filter((layer) => layer.hidden).map((layer) => layer.name),
+          abf: buildAbfInfo(parsed, model),
         });
         onScenes(model.pages.map((page) => ({
           name: page.name,
@@ -631,7 +879,7 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
       const installVisible = !selectedInstallId || object.userData.installId === selectedInstallId;
       const meshGroupPath = String(object.userData.groupPath || "ROOT");
       const groupVisible = !selectedGroupPath || meshGroupPath === selectedGroupPath || meshGroupPath.startsWith(`${selectedGroupPath} / `);
-      object.visible = layerVisible && installVisible && groupVisible;
+      object.visible = layerVisible && installVisible && groupVisible && abfIsVisible(object.userData.abf as AbfEntityInfo | null, abfVisibility);
     });
     const edges = root.userData.edges as THREE.LineSegments | undefined;
     if (edges) {
@@ -640,12 +888,12 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
       (edges.material as THREE.LineBasicMaterial).clippingPlanes = clippingPlane ? [clippingPlane] : [];
       (edges.material as THREE.LineBasicMaterial).opacity = renderStyle === "hidden-line" ? 0.95 : renderStyle === "xray" ? 0.62 : 0.78;
     }
-  }, [activeLayer, activeSectionPlane, hiddenLayers, renderStyle, selectedGroupPath, selectedInstallId, showEdges]);
+  }, [abfVisibility, activeLayer, activeSectionPlane, hiddenLayers, renderStyle, selectedGroupPath, selectedInstallId, showEdges]);
 
   return null;
 }
 
-function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeSectionPlane, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "showDimensions" | "showGuides" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "onEntitySelect" | "onMeasurePoint" | "onModelInfo"> & { activeSectionPlane: SectionPlane | null; onModelInfo: (info: ModelInfo) => void; onReady: (root: THREE.Object3D) => void }) {
+function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeSectionPlane, abfVisibility, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "showDimensions" | "showGuides" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "onEntitySelect" | "onMeasurePoint" | "onModelInfo"> & { activeSectionPlane: SectionPlane | null; onModelInfo: (info: ModelInfo) => void; onReady: (root: THREE.Object3D) => void }) {
   const { scene } = useThree();
   const modelRef = useRef<THREE.Group | null>(null);
 
@@ -741,6 +989,7 @@ function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hid
                   positionMm: node.positionMm,
                   properties: node.properties || {},
                   attributeDictionaries: node.attributeDictionaries || {},
+                  abf: inspectAbfMetadata({ name: node.name, layer: node.layer, path, properties: node.properties, attributeDictionaries: node.attributeDictionaries }),
                   displayName: node.name || resource.definitionName || resource.id,
                   materialIndex: primitive.materialIndex,
                   variants: await getMaterialVariants(primitive.materialIndex),
@@ -777,6 +1026,7 @@ function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hid
           constructionPoints: model.root.constructionPoints,
           texts: model.root.texts,
           hiddenLayers: model.layers.filter((layer) => layer.hidden).map((layer) => layer.name),
+          abf: buildAbfInfoFromInstanced(parsed, model),
         });
         onScenes(model.pages.map((page) => ({
           name: page.name,
@@ -842,7 +1092,7 @@ function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hid
       const installVisible = !selectedInstallId || object.userData.installId === selectedInstallId;
       const meshGroupPath = String(object.userData.groupPath || "ROOT");
       const groupVisible = !selectedGroupPath || meshGroupPath === selectedGroupPath || meshGroupPath.startsWith(`${selectedGroupPath} / `);
-      object.visible = layerVisible && installVisible && groupVisible;
+      object.visible = layerVisible && installVisible && groupVisible && abfIsVisible(object.userData.abf as AbfEntityInfo | null, abfVisibility);
     });
     const edges = root.userData.edges as THREE.LineSegments | undefined;
     if (edges) {
@@ -851,7 +1101,7 @@ function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hid
       (edges.material as THREE.LineBasicMaterial).clippingPlanes = clippingPlane ? [clippingPlane] : [];
       (edges.material as THREE.LineBasicMaterial).opacity = renderStyle === "hidden-line" ? 0.95 : renderStyle === "xray" ? 0.62 : 0.78;
     }
-  }, [activeLayer, activeSectionPlane, hiddenLayers, renderStyle, selectedGroupPath, selectedInstallId, showEdges]);
+  }, [abfVisibility, activeLayer, activeSectionPlane, hiddenLayers, renderStyle, selectedGroupPath, selectedInstallId, showEdges]);
 
   return null;
 }
@@ -903,6 +1153,7 @@ function ModelPicker({ model, measureMode, onEntitySelect, onMeasurePoint }: { m
         positionMm: (data.positionMm || [0, 0, 0]) as [number, number, number],
         properties: (data.properties || {}) as Record<string, string>,
         attributeDictionaries: (data.attributeDictionaries || {}) as Record<string, Record<string, string>>,
+        abf: (data.abf || null) as AbfEntityInfo | null,
       });
     };
     element.addEventListener("pointerdown", handleDown);
@@ -1047,7 +1298,7 @@ function FitCamera({ model, preset, projection, fov, activeScene, selectedInstal
   return <OrbitControls ref={controls} makeDefault enableDamping dampingFactor={0.06} minDistance={0.03} maxDistance={10000} screenSpacePanning />;
 }
 
-export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, showDimensions, showGuides, renderStyle, projection, fov, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeScene, activeSectionPlane, measureMode, measurementPoints, viewPreset, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onEntitySelect, onMeasurePoint, onProgress, onError }: Props) {
+export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, showDimensions, showGuides, renderStyle, projection, fov, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeScene, activeSectionPlane, abfVisibility, measureMode, measurementPoints, viewPreset, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onEntitySelect, onMeasurePoint, onProgress, onError }: Props) {
   const [model, setModel] = useState<THREE.Object3D | null>(null);
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
   const useInstancedScene = Boolean(buffer && buffer.byteLength >= 8 * 1024 * 1024);
@@ -1072,7 +1323,7 @@ export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, 
       <directionalLight position={[5, 9, 6]} intensity={0.42} color="#fffdf6" />
       {showGrid && <gridHelper args={[100, 100, "#aeb9b5", "#cbd2cf"]} position={[0, -0.015, 0]} />}
       {showAxes && <axesHelper args={[2.6]} />}
-      {useInstancedScene ? <InstancedModelLoader buffer={buffer} renderStyle={renderStyle} showEdges={showEdges} activeLayer={activeLayer} hiddenLayers={hiddenLayers} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} activeSectionPlane={activeSectionPlane} onStats={onStats} onInstallationItems={onInstallationItems} onGroups={onGroups} onScenes={onScenes} onModelInfo={handleModelInfo} onProgress={onProgress} onError={onError} onReady={onReady} /> : <ModelLoader buffer={buffer} renderStyle={renderStyle} showEdges={showEdges} activeLayer={activeLayer} hiddenLayers={hiddenLayers} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} activeSectionPlane={activeSectionPlane} onStats={onStats} onInstallationItems={onInstallationItems} onGroups={onGroups} onScenes={onScenes} onModelInfo={handleModelInfo} onProgress={onProgress} onError={onError} onReady={onReady} />}
+      {useInstancedScene ? <InstancedModelLoader buffer={buffer} renderStyle={renderStyle} showEdges={showEdges} activeLayer={activeLayer} hiddenLayers={hiddenLayers} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} activeSectionPlane={activeSectionPlane} abfVisibility={abfVisibility} onStats={onStats} onInstallationItems={onInstallationItems} onGroups={onGroups} onScenes={onScenes} onModelInfo={handleModelInfo} onProgress={onProgress} onError={onError} onReady={onReady} /> : <ModelLoader buffer={buffer} renderStyle={renderStyle} showEdges={showEdges} activeLayer={activeLayer} hiddenLayers={hiddenLayers} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} activeSectionPlane={activeSectionPlane} abfVisibility={abfVisibility} onStats={onStats} onInstallationItems={onInstallationItems} onGroups={onGroups} onScenes={onScenes} onModelInfo={handleModelInfo} onProgress={onProgress} onError={onError} onReady={onReady} />}
       <ModelPicker model={model} measureMode={measureMode} onEntitySelect={onEntitySelect} onMeasurePoint={onMeasurePoint} />
       <MeasurementOverlay points={measurementPoints} />
       <ModelAnnotations info={modelInfo} showDimensions={showDimensions} showGuides={showGuides} activeSectionPlane={activeSectionPlane} />

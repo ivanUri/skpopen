@@ -24,7 +24,7 @@ import {
   Upload,
   ZoomIn,
 } from "lucide-react";
-import SketchupCanvas, { InstallationItem, ModelInfo, PickedEntity, Projection, RenderStyle, SceneGroup, ScenePage } from "../components/SketchupCanvas";
+import SketchupCanvas, { AbfVisibility, InstallationItem, ModelInfo, PickedEntity, Projection, RenderStyle, SceneGroup, ScenePage } from "../components/SketchupCanvas";
 
 type ModelStats = {
   version?: string;
@@ -43,6 +43,15 @@ type ModelStats = {
 };
 
 const initialStats: ModelStats = { definitions: 0, layers: 0, materials: 0, primitives: 0, edges: 0, scenes: 0, dimensions: 0, sectionPlanes: 0, guides: 0 };
+
+const initialAbfVisibility: AbfVisibility = {
+  nesting: false,
+  labels: false,
+  cuttingLines: false,
+  edgeBanding: false,
+  fittings: false,
+  intersections: false,
+};
 
 const renderStyles: { value: RenderStyle; label: string }[] = [
   { value: "shaded", label: "Shaded" },
@@ -92,6 +101,7 @@ export default function HomePage() {
   const [activeSceneIndex, setActiveSceneIndex] = useState<number | null>(null);
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
   const [activeSectionPlaneIndex, setActiveSectionPlaneIndex] = useState<number | null>(null);
+  const [abfVisibility, setAbfVisibility] = useState<AbfVisibility>(initialAbfVisibility);
   const [selectedInstallId, setSelectedInstallId] = useState<string | null>(null);
   const [selectedGroupPath, setSelectedGroupPath] = useState<string | null>(null);
   const [selectedEntity, setSelectedEntity] = useState<PickedEntity | null>(null);
@@ -115,6 +125,7 @@ export default function HomePage() {
     setActiveSceneIndex(null);
     setModelInfo(null);
     setActiveSectionPlaneIndex(null);
+    setAbfVisibility(initialAbfVisibility);
     setHiddenLayers([]);
     setMeasureMode(false);
     setMeasurementPoints([]);
@@ -172,6 +183,18 @@ export default function HomePage() {
     setModelInfo(info);
     setHiddenLayers(info.hiddenLayers);
     setActiveSectionPlaneIndex(info.sectionPlanes.length > 0 ? 0 : null);
+  }, []);
+
+  const toggleAbfVisibility = useCallback((key: keyof AbfVisibility) => {
+    setAbfVisibility((current) => ({ ...current, [key]: !current[key] }));
+  }, []);
+
+  const selectAbfPath = useCallback((path: string) => {
+    setAbfVisibility((current) => ({ ...current, nesting: true }));
+    setActiveLayer("All layers");
+    setSelectedGroupPath(path);
+    setSelectedInstallId(null);
+    setSelectedEntity(null);
   }, []);
 
   const selectScene = useCallback((index: number) => {
@@ -261,7 +284,7 @@ export default function HomePage() {
                 <button onClick={() => { inputRef.current?.click(); setOpenMenu(null); }}><Upload size={14} /> Mở file SketchUp <span>⌘O</span></button>
                 <button disabled={installationItems.length === 0} onClick={() => { exportInstallationCsv(); setOpenMenu(null); }}><Download size={14} /> Xuất danh sách lắp đặt <span>CSV</span></button>
                 <div className="header-menu-divider" />
-                <button onClick={() => { setBuffer(null); setFile(null); setStats(initialStats); setActiveLayer("All layers"); setHiddenLayers([]); setInstallationItems([]); setSceneGroups([]); setScenes([]); setActiveSceneIndex(null); setModelInfo(null); setActiveSectionPlaneIndex(null); setSelectedInstallId(null); setSelectedGroupPath(null); setSelectedEntity(null); setMeasureMode(false); setMeasurementPoints([]); setError(null); setOpenMenu(null); }}><Box size={14} /> Đóng model</button>
+                <button onClick={() => { setBuffer(null); setFile(null); setStats(initialStats); setActiveLayer("All layers"); setHiddenLayers([]); setInstallationItems([]); setSceneGroups([]); setScenes([]); setActiveSceneIndex(null); setModelInfo(null); setActiveSectionPlaneIndex(null); setAbfVisibility(initialAbfVisibility); setSelectedInstallId(null); setSelectedGroupPath(null); setSelectedEntity(null); setMeasureMode(false); setMeasurementPoints([]); setError(null); setOpenMenu(null); }}><Box size={14} /> Đóng model</button>
               </div>
             )}
           </div>
@@ -378,6 +401,37 @@ export default function HomePage() {
               {installationItems.length > 80 && <span className="list-overflow">+ {installationItems.length - 80} loại khác</span>}
             </div>
 
+            {modelInfo?.abf?.detected && (
+              <div className="sidebar-section production-section">
+                <div className="section-title-row"><span>ABF production</span><span className="section-count">{modelInfo.abf.boardCount} tấm</span></div>
+                <p className="section-caption">Dữ liệu sản xuất được đọc từ layer, group và attribute ABF trong file SKP.</p>
+                <div className="production-summary">
+                  <span><strong>{modelInfo.abf.nestingSheetCount}</strong> khổ ván</span>
+                  <span><strong>{modelInfo.abf.featureCounts.edgeBanding}</strong> cạnh dán</span>
+                  <span><strong>{modelInfo.abf.featureCounts.fittings + modelInfo.abf.featureCounts.intersections}</strong> phụ kiện</span>
+                </div>
+                <div className="production-toggle-grid">
+                  <button className={abfVisibility.nesting ? "selected" : ""} onClick={() => toggleAbfVisibility("nesting")}><Layers3 size={13} /> Nesting</button>
+                  <button className={abfVisibility.labels ? "selected" : ""} onClick={() => toggleAbfVisibility("labels")}><Eye size={13} /> Labels</button>
+                  <button className={abfVisibility.cuttingLines ? "selected" : ""} onClick={() => toggleAbfVisibility("cuttingLines")}><Scan size={13} /> Cutting lines</button>
+                  <button className={abfVisibility.edgeBanding ? "selected" : ""} onClick={() => toggleAbfVisibility("edgeBanding")}><Box size={13} /> Edge banding</button>
+                  <button className={abfVisibility.fittings ? "selected" : ""} onClick={() => toggleAbfVisibility("fittings")}><Settings2 size={13} /> Fittings</button>
+                  <button className={abfVisibility.intersections ? "selected" : ""} onClick={() => toggleAbfVisibility("intersections")}><Scan size={13} /> Intersections</button>
+                </div>
+                {modelInfo.abf.nestingSheets.length > 0 && <>
+                  <div className="section-subtitle">Nesting sheets</div>
+                  <div className="production-sheet-list">
+                    {modelInfo.abf.nestingSheets.slice(0, 12).map((sheet) => (
+                      <button key={sheet.id} className={selectedGroupPath === sheet.path ? "selected" : ""} onClick={() => selectAbfPath(sheet.path)}>
+                        <span><strong>{sheet.name}</strong><small>{sheet.thicknessMm ? `${sheet.thicknessMm} mm` : "Sheet"} · {sheet.partCount} chi tiết</small></span>
+                        <ChevronRight size={13} />
+                      </button>
+                    ))}
+                  </div>
+                </>}
+              </div>
+            )}
+
             <div className="sidebar-section groups-section">
               <div className="section-title-row"><span>Groups / Components</span><span className="section-count">{sceneGroups.length}</span></div>
               <p className="section-caption">Cây nhóm lấy trực tiếp từ cấu trúc file SketchUp. Chọn nhóm để cô lập và đánh dấu toàn bộ phần con.</p>
@@ -448,6 +502,7 @@ export default function HomePage() {
                   <span>Position</span><strong>{Math.round(selectedEntity.positionMm[0])}, {Math.round(selectedEntity.positionMm[1])}, {Math.round(selectedEntity.positionMm[2])} mm</strong>
                 </div>
                 {Object.entries(selectedEntity.properties).length > 0 && <div className="entity-properties"><strong>Dynamic attributes</strong>{Object.entries(selectedEntity.properties).slice(0, 8).map(([key, value]) => <span key={key}><em>{key}</em>{value}</span>)}</div>}
+                {selectedEntity.abf && <div className="entity-properties entity-abf-properties"><strong>ABF production</strong><span><em>Role</em>{selectedEntity.abf.role}</span><span><em>In nesting</em>{selectedEntity.abf.inNesting ? "Yes" : "No"}</span>{selectedEntity.abf.boardIndex && <span><em>Board index</em>{selectedEntity.abf.boardIndex}</span>}{selectedEntity.abf.edgeBandTypes && <span><em>Edge band</em>{selectedEntity.abf.edgeBandTypes}</span>}{selectedEntity.abf.settingName && <span><em>Operation</em>{selectedEntity.abf.settingName}</span>}</div>}
                 {Object.entries(selectedEntity.attributeDictionaries).slice(0, 4).map(([dictionary, values]) => <div className="entity-properties" key={dictionary}><strong>{dictionary}</strong>{Object.entries(values).slice(0, 8).map(([key, value]) => <span key={key}><em>{key}</em>{value}</span>)}</div>)}
                 <small className="entity-path">{selectedEntity.groupPath}</small>
               </div>
@@ -522,6 +577,7 @@ export default function HomePage() {
             selectedGroupPath={selectedGroupPath}
             activeScene={activeScene}
             activeSectionPlane={activeSectionPlane}
+            abfVisibility={abfVisibility}
             measureMode={measureMode}
             measurementPoints={measurementPoints}
             viewPreset={viewPreset}
