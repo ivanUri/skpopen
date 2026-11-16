@@ -46,6 +46,7 @@ export type ScenePage = {
 };
 
 export type PickedEntity = {
+  objectId: string;
   name: string;
   definitionName: string;
   layer: string;
@@ -164,6 +165,7 @@ type Props = {
   hiddenLayers: string[];
   selectedInstallId: string | null;
   selectedGroupPath: string | null;
+  selectedEntity: PickedEntity | null;
   activeScene: ScenePage | null;
   activeSectionPlane: SectionPlane | null;
   abfVisibility: AbfVisibility;
@@ -176,7 +178,7 @@ type Props = {
   onGroups: (groups: SceneGroup[]) => void;
   onScenes: (scenes: ScenePage[]) => void;
   onModelInfo: (info: ModelInfo) => void;
-  onEntitySelect: (entity: PickedEntity | null) => void;
+  onEntitySelect: (entity: PickedEntity | null, isolate?: boolean) => void;
   onMeasurePoint: (point: Point) => void;
   onProgress: (value: number) => void;
   onError: (message: string | null) => void;
@@ -856,7 +858,7 @@ function makeMaterials(definition: GltfMaterialDefinition | undefined, texture?:
   };
 }
 
-function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeSectionPlane, abfVisibility, explodeFactor, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "showDimensions" | "showGuides" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "onEntitySelect" | "onMeasurePoint" | "onModelInfo"> & { activeSectionPlane: SectionPlane | null; onModelInfo: (info: ModelInfo) => void; onReady: (root: THREE.Object3D) => void }) {
+function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeSectionPlane, abfVisibility, explodeFactor, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "showDimensions" | "showGuides" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "selectedEntity" | "onEntitySelect" | "onMeasurePoint" | "onModelInfo"> & { activeSectionPlane: SectionPlane | null; onModelInfo: (info: ModelInfo) => void; onReady: (root: THREE.Object3D) => void }) {
   const { scene } = useThree();
   const modelRef = useRef<THREE.Group | null>(null);
 
@@ -1065,7 +1067,7 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
   return null;
 }
 
-function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeSectionPlane, abfVisibility, explodeFactor, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "showDimensions" | "showGuides" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "onEntitySelect" | "onMeasurePoint" | "onModelInfo"> & { activeSectionPlane: SectionPlane | null; onModelInfo: (info: ModelInfo) => void; onReady: (root: THREE.Object3D) => void }) {
+function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeSectionPlane, abfVisibility, explodeFactor, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "showDimensions" | "showGuides" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "selectedEntity" | "onEntitySelect" | "onMeasurePoint" | "onModelInfo"> & { activeSectionPlane: SectionPlane | null; onModelInfo: (info: ModelInfo) => void; onReady: (root: THREE.Object3D) => void }) {
   const { scene } = useThree();
   const modelRef = useRef<THREE.Group | null>(null);
 
@@ -1459,10 +1461,31 @@ function MeasureSnapPreview({ candidate }: { candidate: SnapCandidate | null }) 
   </>;
 }
 
-function ModelPicker({ model, measureMode, explodeFactor, onEntitySelect, onMeasurePoint }: { model: THREE.Object3D | null; measureMode: boolean; explodeFactor: number; onEntitySelect: (entity: PickedEntity | null) => void; onMeasurePoint: (point: Point) => void }) {
+function entityFromObject(object: THREE.Mesh): PickedEntity {
+  const box = new THREE.Box3().setFromObject(object);
+  const size = box.getSize(new THREE.Vector3());
+  const data = object.userData;
+  return {
+    objectId: object.uuid,
+    name: String(data.displayName || object.name || "Object"),
+    definitionName: String(data.definitionName || ""),
+    layer: String(data.layer || "Layer0"),
+    groupPath: String(data.groupPath || "ROOT"),
+    installId: String(data.installId || ""),
+    sizeMm: [Math.round(size.x * 1000), Math.round(size.y * 1000), Math.round(size.z * 1000)],
+    positionMm: (data.positionMm || [0, 0, 0]) as Point,
+    properties: (data.properties || {}) as Record<string, string>,
+    attributeDictionaries: (data.attributeDictionaries || {}) as Record<string, Record<string, string>>,
+    abf: (data.abf || null) as AbfEntityInfo | null,
+  };
+}
+
+function ModelPicker({ model, measureMode, explodeFactor, onEntitySelect, onMeasurePoint }: { model: THREE.Object3D | null; measureMode: boolean; explodeFactor: number; onEntitySelect: (entity: PickedEntity | null, isolate?: boolean) => void; onMeasurePoint: (point: Point) => void }) {
   const { camera, gl } = useThree();
   const raycaster = useRef(new THREE.Raycaster());
   const pointerDown = useRef<{ x: number; y: number } | null>(null);
+  const pendingSelection = useRef<number | null>(null);
+  const lastSelection = useRef<{ time: number; x: number; y: number; objectId: string; entity: PickedEntity } | null>(null);
   const [preview, setPreview] = useState<SnapCandidate | null>(null);
   const [snapIndex, setSnapIndex] = useState<SnapIndex>(() => buildSnapIndex(model));
 
@@ -1524,22 +1547,24 @@ function ModelPicker({ model, measureMode, explodeFactor, onEntitySelect, onMeas
         onMeasurePoint([candidate.point.x, candidate.point.y, candidate.point.z]);
         return;
       }
-      const object = hit.object;
-      const box = new THREE.Box3().setFromObject(object);
-      const size = box.getSize(new THREE.Vector3());
-      const data = object.userData;
-      onEntitySelect({
-        name: String(data.displayName || object.name || "Object"),
-        definitionName: String(data.definitionName || ""),
-        layer: String(data.layer || "Layer0"),
-        groupPath: String(data.groupPath || "ROOT"),
-        installId: String(data.installId || ""),
-        sizeMm: [Math.round(size.x * 1000), Math.round(size.y * 1000), Math.round(size.z * 1000)],
-        positionMm: (data.positionMm || [0, 0, 0]) as [number, number, number],
-        properties: (data.properties || {}) as Record<string, string>,
-        attributeDictionaries: (data.attributeDictionaries || {}) as Record<string, Record<string, string>>,
-        abf: (data.abf || null) as AbfEntityInfo | null,
-      });
+      const entity = entityFromObject(hit.object);
+      const now = performance.now();
+      const previous = lastSelection.current;
+      const isDoubleClick = Boolean(previous && previous.objectId === entity.objectId && now - previous.time < 320 && Math.hypot(event.clientX - previous.x, event.clientY - previous.y) < 10);
+      if (isDoubleClick) {
+        if (pendingSelection.current !== null) window.clearTimeout(pendingSelection.current);
+        pendingSelection.current = null;
+        lastSelection.current = null;
+        onEntitySelect(entity, true);
+      } else {
+        lastSelection.current = { time: now, x: event.clientX, y: event.clientY, objectId: entity.objectId, entity };
+        if (pendingSelection.current !== null) window.clearTimeout(pendingSelection.current);
+        pendingSelection.current = window.setTimeout(() => {
+          pendingSelection.current = null;
+          lastSelection.current = null;
+          onEntitySelect(entity, false);
+        }, 260);
+      }
     };
     element.addEventListener("pointermove", handleMove);
     element.addEventListener("pointerleave", handleLeave);
@@ -1547,6 +1572,7 @@ function ModelPicker({ model, measureMode, explodeFactor, onEntitySelect, onMeas
     element.addEventListener("pointerup", handleUp);
     return () => {
       if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      if (pendingSelection.current !== null) window.clearTimeout(pendingSelection.current);
       element.removeEventListener("pointermove", handleMove);
       element.removeEventListener("pointerleave", handleLeave);
       element.removeEventListener("pointerdown", handleDown);
@@ -1555,6 +1581,37 @@ function ModelPicker({ model, measureMode, explodeFactor, onEntitySelect, onMeas
   }, [camera, gl, measureMode, model, onEntitySelect, onMeasurePoint, snapIndex]);
 
   return <MeasureSnapPreview candidate={preview} />;
+}
+
+function SelectedObjectOutline({ model, selectedEntity, explodeFactor }: { model: THREE.Object3D | null; selectedEntity: PickedEntity | null; explodeFactor: number }) {
+  const selectedObject = useMemo<THREE.Mesh | null>(() => {
+    if (!model || !selectedEntity?.objectId) return null;
+    model.updateMatrixWorld(true);
+    let result: THREE.Mesh | null = null;
+    model.traverse((object) => {
+      if (!result && object instanceof THREE.Mesh && object.uuid === selectedEntity.objectId) result = object;
+    });
+    return result;
+  }, [explodeFactor, model, selectedEntity?.objectId]);
+  const outline = useMemo(() => {
+    if (!selectedObject) return null;
+    const line = new THREE.LineSegments(
+      new THREE.EdgesGeometry(selectedObject.geometry, 20),
+      new THREE.LineBasicMaterial({ color: "#e2763b", depthTest: false, depthWrite: false }),
+    );
+    line.name = "SKP_SELECTED_OBJECT_OUTLINE";
+    line.renderOrder = 1001;
+    line.matrixAutoUpdate = false;
+    line.matrix.copy(selectedObject.matrixWorld);
+    line.matrixWorld.copy(selectedObject.matrixWorld);
+    return line;
+  }, [selectedObject]);
+  useEffect(() => () => {
+    if (!outline) return;
+    outline.geometry.dispose();
+    (outline.material as THREE.Material).dispose();
+  }, [outline]);
+  return outline ? <primitive object={outline} /> : null;
 }
 
 function MeasurementOverlay({ points }: { points: Point[] }) {
@@ -1751,7 +1808,7 @@ function FitCamera({ model, preset, projection, fov, activeLayer, hiddenLayers, 
   return <OrbitControls ref={controls} makeDefault enableDamping dampingFactor={0.06} minDistance={0.03} maxDistance={10000} screenSpacePanning />;
 }
 
-export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, showDimensions, showGuides, renderStyle, projection, fov, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeScene, activeSectionPlane, abfVisibility, explodeFactor, measureMode, measurementPoints, viewPreset, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onEntitySelect, onMeasurePoint, onProgress, onError }: Props) {
+export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, showDimensions, showGuides, renderStyle, projection, fov, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, selectedEntity, activeScene, activeSectionPlane, abfVisibility, explodeFactor, measureMode, measurementPoints, viewPreset, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onEntitySelect, onMeasurePoint, onProgress, onError }: Props) {
   const [model, setModel] = useState<THREE.Object3D | null>(null);
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
   const useInstancedScene = Boolean(buffer && buffer.byteLength >= 8 * 1024 * 1024);
@@ -1778,6 +1835,7 @@ export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, 
       {showAxes && <axesHelper args={[2.6]} />}
       {useInstancedScene ? <InstancedModelLoader buffer={buffer} renderStyle={renderStyle} showEdges={showEdges} activeLayer={activeLayer} hiddenLayers={hiddenLayers} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} activeSectionPlane={activeSectionPlane} abfVisibility={abfVisibility} explodeFactor={explodeFactor} onStats={onStats} onInstallationItems={onInstallationItems} onGroups={onGroups} onScenes={onScenes} onModelInfo={handleModelInfo} onProgress={onProgress} onError={onError} onReady={onReady} /> : <ModelLoader buffer={buffer} renderStyle={renderStyle} showEdges={showEdges} activeLayer={activeLayer} hiddenLayers={hiddenLayers} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} activeSectionPlane={activeSectionPlane} abfVisibility={abfVisibility} explodeFactor={explodeFactor} onStats={onStats} onInstallationItems={onInstallationItems} onGroups={onGroups} onScenes={onScenes} onModelInfo={handleModelInfo} onProgress={onProgress} onError={onError} onReady={onReady} />}
       <ModelPicker model={model} measureMode={measureMode} explodeFactor={explodeFactor} onEntitySelect={onEntitySelect} onMeasurePoint={onMeasurePoint} />
+      <SelectedObjectOutline model={model} selectedEntity={selectedEntity} explodeFactor={explodeFactor} />
       <MeasurementOverlay points={measurementPoints} />
       <AbfLabelsOverlay model={model} visible={abfVisibility.labels} showNesting={abfVisibility.nesting} />
       <ModelAnnotations info={modelInfo} showDimensions={showDimensions} showGuides={showGuides} activeSectionPlane={activeSectionPlane} />

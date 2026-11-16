@@ -308,15 +308,17 @@ export default function HomePage() {
     setViewPreset(preset);
   }, [modelInfo?.hiddenLayers]);
 
-  const handleEntitySelect = useCallback((entity: PickedEntity | null) => {
+  const handleEntitySelect = useCallback((entity: PickedEntity | null, isolate = false) => {
     setSelectedEntity(entity);
     if (!entity) {
       setSelectedInstallId(null);
       setSelectedGroupPath(null);
       return;
     }
-    setSelectedInstallId(entity.installId || null);
-    setSelectedGroupPath(entity.groupPath === "ROOT" ? null : entity.groupPath);
+    if (isolate) {
+      setSelectedInstallId(entity.installId || null);
+      setSelectedGroupPath(entity.groupPath === "ROOT" ? null : entity.groupPath);
+    }
     setMeasureMode(false);
   }, []);
 
@@ -695,6 +697,7 @@ export default function HomePage() {
             hiddenLayers={hiddenLayers}
             selectedInstallId={selectedInstallId}
             selectedGroupPath={selectedGroupPath}
+            selectedEntity={selectedEntity}
             activeScene={activeScene}
             activeSectionPlane={activeSectionPlane}
             abfVisibility={abfVisibility}
