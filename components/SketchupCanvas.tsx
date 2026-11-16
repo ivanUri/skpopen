@@ -4,6 +4,7 @@ import { Html, Line, OrthographicCamera, OrbitControls, PerspectiveCamera } from
 import { Canvas, useThree } from "@react-three/fiber";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
+import { acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from "three-mesh-bvh";
 import { isDrawableEdge, parseSkpWithInstancedScene, parseSkpWithScene } from "skp-core-custom";
 import type { ConstructionLine, ConstructionPoint, Definition, Dimension, Edge, InstanceNode, InstancedMeshResource, InstancedNode, InstancedScene, SectionPlane, SkpModel, SkpScene, TextEntity } from "skp-core-custom";
 
@@ -199,6 +200,27 @@ type Point = [number, number, number];
 
 const IDENTITY: Matrix = [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1];
 const INCH_TO_METRE = 0.0254;
+const BVH_TRIANGLE_THRESHOLD = 2000;
+
+type BvhGeometry = THREE.BufferGeometry & {
+  boundsTree?: unknown;
+  computeBoundsTree?: (options?: { maxLeafTris?: number }) => void;
+  disposeBoundsTree?: () => void;
+};
+
+let bvhInstalled = false;
+
+function prepareGeometryForRaycast(geometry: THREE.BufferGeometry) {
+  const triangleCount = geometry.index ? geometry.index.count / 3 : geometry.attributes.position.count / 3;
+  if (triangleCount < BVH_TRIANGLE_THRESHOLD) return;
+  if (!bvhInstalled) {
+    (THREE.BufferGeometry.prototype as BvhGeometry).computeBoundsTree = computeBoundsTree;
+    (THREE.BufferGeometry.prototype as BvhGeometry).disposeBoundsTree = disposeBoundsTree;
+    THREE.Mesh.prototype.raycast = acceleratedRaycast;
+    bvhInstalled = true;
+  }
+  (geometry as BvhGeometry).computeBoundsTree?.({ maxLeafTris: 12 });
+}
 
 function multiplyMatrices(a: Matrix, b: Matrix): Matrix {
   const aa = a.length === 16 ? a : [...a.slice(0, 12), 1];
@@ -885,6 +907,7 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
           if (primitive.uvs?.length) geometry.setAttribute("uv", new THREE.BufferAttribute(primitive.uvs, 2));
           geometry.setIndex(new THREE.BufferAttribute(primitive.indices, 1));
           geometry.computeBoundingSphere();
+          prepareGeometryForRaycast(geometry);
 
           let variants = materialVariants.get(primitive.materialIndex);
           if (!variants) {
@@ -923,6 +946,7 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
           edgeGeometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
           const edgeObject = new THREE.LineSegments(edgeGeometry, edgeMaterial);
           edgeObject.name = `SKP_VISIBLE_EDGES_${layer}`;
+          edgeObject.userData = { isSkpEdge: true, layer };
           root.add(edgeObject);
           edges.set(layer, edgeObject);
           edgeCount += positions.length / 6;
@@ -985,7 +1009,10 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
       if (modelRef.current) {
         scene.remove(modelRef.current);
         modelRef.current.traverse((object) => {
-          if (object instanceof THREE.Mesh || object instanceof THREE.LineSegments) object.geometry.dispose();
+          if (object instanceof THREE.Mesh || object instanceof THREE.LineSegments) {
+            (object.geometry as BvhGeometry).disposeBoundsTree?.();
+            object.geometry.dispose();
+          }
         });
         const variants = modelRef.current.userData.materialVariants as Map<number, ReturnType<typeof makeMaterials>> | undefined;
         variants?.forEach((items) => Object.values(items).forEach((material) => material.dispose()));
@@ -1102,6 +1129,7 @@ function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hid
             if (primitive.uvs?.length) geometry.setAttribute("uv", new THREE.BufferAttribute(primitive.uvs, 2));
             geometry.setIndex(new THREE.BufferAttribute(primitive.indices, 1));
             geometry.computeBoundingSphere();
+            prepareGeometryForRaycast(geometry);
             return geometry;
           });
           resourceGeometries.set(resource.id, geometries);
@@ -1156,6 +1184,7 @@ function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hid
           edgeGeometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
           const edgeObject = new THREE.LineSegments(edgeGeometry, edgeMaterial);
           edgeObject.name = `SKP_VISIBLE_EDGES_${layer}`;
+          edgeObject.userData = { isSkpEdge: true, layer };
           root.add(edgeObject);
           edges.set(layer, edgeObject);
           edgeCount += positions.length / 6;
@@ -1222,7 +1251,10 @@ function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hid
         variants?.forEach((items) => Object.values(items).forEach((material) => material.dispose()));
         (modelRef.current.userData.edgeMaterial as THREE.Material | undefined)?.dispose();
         modelRef.current.traverse((object) => {
-          if (object instanceof THREE.LineSegments) object.geometry.dispose();
+          if (object instanceof THREE.Mesh || object instanceof THREE.LineSegments) {
+            (object.geometry as BvhGeometry).disposeBoundsTree?.();
+            object.geometry.dispose();
+          }
         });
         modelRef.current = null;
       }
@@ -1272,13 +1304,181 @@ function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hid
   return null;
 }
 
-function ModelPicker({ model, measureMode, onEntitySelect, onMeasurePoint }: { model: THREE.Object3D | null; measureMode: boolean; onEntitySelect: (entity: PickedEntity | null) => void; onMeasurePoint: (point: Point) => void }) {
+type SnapKind = "CORNER" | "EDGE" | "FACE";
+
+type SnapVertex = {
+  point: THREE.Vector3;
+  sources: THREE.Object3D[];
+};
+
+type SnapEdge = {
+  start: THREE.Vector3;
+  end: THREE.Vector3;
+  source: THREE.Object3D;
+};
+
+type SnapIndex = {
+  vertices: SnapVertex[];
+  edges: SnapEdge[];
+};
+
+type SnapCandidate = {
+  kind: SnapKind;
+  point: THREE.Vector3;
+  distancePx: number;
+  source: THREE.Object3D;
+};
+
+const SNAP_VERTEX_RADIUS_PX = 16;
+const SNAP_EDGE_RADIUS_PX = 20;
+
+function buildSnapIndex(model: THREE.Object3D | null): SnapIndex {
+  if (!model) return { vertices: [], edges: [] };
+  model.updateMatrixWorld(true);
+  const vertices: SnapVertex[] = [];
+  const edges: SnapEdge[] = [];
+  const verticesByKey = new Map<string, SnapVertex>();
+  const localPoint = new THREE.Vector3();
+  const worldPoint = new THREE.Vector3();
+
+  const keyForPoint = (point: THREE.Vector3) => `${Math.round(point.x * 100000)},${Math.round(point.y * 100000)},${Math.round(point.z * 100000)}`;
+  model.traverse((object) => {
+    if (object instanceof THREE.Mesh && object.userData.isSkpMesh) {
+      const position = object.geometry.getAttribute("position");
+      if (!position) return;
+      for (let index = 0; index < position.count; index += 1) {
+        localPoint.fromBufferAttribute(position, index);
+        worldPoint.copy(localPoint).applyMatrix4(object.matrixWorld);
+        if (!Number.isFinite(worldPoint.x) || !Number.isFinite(worldPoint.y) || !Number.isFinite(worldPoint.z)) continue;
+        const key = keyForPoint(worldPoint);
+        const existing = verticesByKey.get(key);
+        if (existing) existing.sources.push(object);
+        else {
+          const vertex = { point: worldPoint.clone(), sources: [object] };
+          verticesByKey.set(key, vertex);
+          vertices.push(vertex);
+        }
+      }
+    }
+    if (object instanceof THREE.LineSegments && object.userData.isSkpEdge) {
+      const position = object.geometry.getAttribute("position");
+      if (!position) return;
+      for (let index = 0; index + 1 < position.count; index += 2) {
+        const start = new THREE.Vector3().fromBufferAttribute(position, index).applyMatrix4(object.matrixWorld);
+        const end = new THREE.Vector3().fromBufferAttribute(position, index + 1).applyMatrix4(object.matrixWorld);
+        if (start.distanceToSquared(end) > 1e-12) edges.push({ start, end, source: object });
+      }
+    }
+  });
+  return { vertices, edges };
+}
+
+function isSceneObjectVisible(object: THREE.Object3D) {
+  let current: THREE.Object3D | null = object;
+  while (current) {
+    if (!current.visible) return false;
+    current = current.parent;
+  }
+  return true;
+}
+
+function projectToViewport(point: THREE.Vector3, camera: THREE.Camera, rect: DOMRect) {
+  const projected = point.clone().project(camera);
+  if (projected.z < -1 || projected.z > 1) return null;
+  return {
+    x: rect.left + ((projected.x + 1) / 2) * rect.width,
+    y: rect.top + ((1 - projected.y) / 2) * rect.height,
+    depth: projected.z,
+  };
+}
+
+function chooseSnapCandidate(index: SnapIndex, hit: THREE.Intersection, event: PointerEvent, camera: THREE.Camera, rect: DOMRect): SnapCandidate {
+  const pointerDepth = hit.point.clone().project(camera).z;
+  let closestVertex: SnapCandidate | null = null;
+  let closestVertexScore = Infinity;
+  for (const vertex of index.vertices) {
+    const source = vertex.sources.find(isSceneObjectVisible);
+    if (!source) continue;
+    const screen = projectToViewport(vertex.point, camera, rect);
+    if (!screen) continue;
+    const distancePx = Math.hypot(screen.x - event.clientX, screen.y - event.clientY);
+    if (distancePx > SNAP_VERTEX_RADIUS_PX) continue;
+    const score = distancePx + Math.max(0, screen.depth - pointerDepth) * 18;
+    if (score < closestVertexScore) {
+      closestVertexScore = score;
+      closestVertex = { kind: "CORNER", point: vertex.point.clone(), distancePx, source };
+    }
+  }
+  if (closestVertex) return closestVertex;
+
+  let closestEdge: SnapCandidate | null = null;
+  let closestEdgeScore = Infinity;
+  for (const edge of index.edges) {
+    if (!isSceneObjectVisible(edge.source)) continue;
+    const start = projectToViewport(edge.start, camera, rect);
+    const end = projectToViewport(edge.end, camera, rect);
+    if (!start || !end) continue;
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const lengthSquared = dx * dx + dy * dy;
+    const t = lengthSquared === 0 ? 0 : Math.max(0, Math.min(1, ((event.clientX - start.x) * dx + (event.clientY - start.y) * dy) / lengthSquared));
+    const screenX = start.x + dx * t;
+    const screenY = start.y + dy * t;
+    const distancePx = Math.hypot(screenX - event.clientX, screenY - event.clientY);
+    if (distancePx > SNAP_EDGE_RADIUS_PX) continue;
+    const point = edge.start.clone().lerp(edge.end, t);
+    const projected = projectToViewport(point, camera, rect);
+    if (!projected) continue;
+    const score = distancePx + Math.max(0, projected.depth - pointerDepth) * 18;
+    if (score < closestEdgeScore) {
+      closestEdgeScore = score;
+      closestEdge = { kind: "EDGE", point, distancePx, source: edge.source };
+    }
+  }
+  if (closestEdge) return closestEdge;
+  return { kind: "FACE", point: hit.point.clone(), distancePx: 0, source: hit.object };
+}
+
+function formatSnapPoint(point: THREE.Vector3) {
+  return `${Math.round(point.x * 1000)} × ${Math.round(point.y * 1000)} × ${Math.round(point.z * 1000)} mm`;
+}
+
+function MeasureSnapPreview({ candidate }: { candidate: SnapCandidate | null }) {
+  if (!candidate) return null;
+  return <>
+    <mesh position={candidate.point} renderOrder={1000}>
+      <sphereGeometry args={[0.045, 16, 16]} />
+      <meshBasicMaterial color={candidate.kind === "CORNER" ? "#e06d37" : "#4d8fa3"} depthTest={false} depthWrite={false} />
+    </mesh>
+    <Html position={candidate.point} center style={{ pointerEvents: "none" }}>
+      <div className={`measure-snap-preview measure-snap-${candidate.kind.toLowerCase()}`}>
+        <span className="measure-snap-lens"><i /></span>
+        <span className="measure-snap-copy"><strong>{candidate.kind}</strong><small>{formatSnapPoint(candidate.point)}</small></span>
+      </div>
+    </Html>
+  </>;
+}
+
+function ModelPicker({ model, measureMode, explodeFactor, onEntitySelect, onMeasurePoint }: { model: THREE.Object3D | null; measureMode: boolean; explodeFactor: number; onEntitySelect: (entity: PickedEntity | null) => void; onMeasurePoint: (point: Point) => void }) {
   const { camera, gl } = useThree();
   const raycaster = useRef(new THREE.Raycaster());
   const pointerDown = useRef<{ x: number; y: number } | null>(null);
+  const [preview, setPreview] = useState<SnapCandidate | null>(null);
+  const [snapIndex, setSnapIndex] = useState<SnapIndex>(() => buildSnapIndex(model));
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => setSnapIndex(buildSnapIndex(model)));
+    return () => window.cancelAnimationFrame(frame);
+  }, [explodeFactor, model]);
+
+  useEffect(() => {
+    raycaster.current.firstHitOnly = true;
+  }, []);
 
   useEffect(() => {
     const element = gl.domElement;
+    let animationFrame = 0;
+    let pendingMove: PointerEvent | null = null;
     const getHit = (event: PointerEvent) => {
       if (!model) return null;
       const rect = element.getBoundingClientRect();
@@ -1287,8 +1487,25 @@ function ModelPicker({ model, measureMode, onEntitySelect, onMeasurePoint }: { m
         -((event.clientY - rect.top) / rect.height) * 2 + 1,
       );
       raycaster.current.setFromCamera(pointer, camera);
-      return raycaster.current.intersectObjects(model.children, true).find((hit) => hit.object instanceof THREE.Mesh && hit.object.visible);
+      return raycaster.current.intersectObjects(model.children, true).find((hit) => hit.object instanceof THREE.Mesh && isSceneObjectVisible(hit.object));
     };
+    const updatePreview = () => {
+      animationFrame = 0;
+      if (!measureMode || !model || !pendingMove) {
+        setPreview(null);
+        return;
+      }
+      const event = pendingMove;
+      pendingMove = null;
+      const hit = getHit(event);
+      setPreview(hit ? chooseSnapCandidate(snapIndex, hit, event, camera, element.getBoundingClientRect()) : null);
+    };
+    const handleMove = (event: PointerEvent) => {
+      if (!measureMode) return;
+      pendingMove = event;
+      if (!animationFrame) animationFrame = window.requestAnimationFrame(updatePreview);
+    };
+    const handleLeave = () => setPreview(null);
     const handleDown = (event: PointerEvent) => {
       if (event.button === 0) pointerDown.current = { x: event.clientX, y: event.clientY };
     };
@@ -1302,7 +1519,9 @@ function ModelPicker({ model, measureMode, onEntitySelect, onMeasurePoint }: { m
         return;
       }
       if (measureMode) {
-        onMeasurePoint([hit.point.x, hit.point.y, hit.point.z]);
+        const candidate = chooseSnapCandidate(snapIndex, hit, event, camera, element.getBoundingClientRect());
+        setPreview(candidate);
+        onMeasurePoint([candidate.point.x, candidate.point.y, candidate.point.z]);
         return;
       }
       const object = hit.object;
@@ -1322,24 +1541,32 @@ function ModelPicker({ model, measureMode, onEntitySelect, onMeasurePoint }: { m
         abf: (data.abf || null) as AbfEntityInfo | null,
       });
     };
+    element.addEventListener("pointermove", handleMove);
+    element.addEventListener("pointerleave", handleLeave);
     element.addEventListener("pointerdown", handleDown);
     element.addEventListener("pointerup", handleUp);
     return () => {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      element.removeEventListener("pointermove", handleMove);
+      element.removeEventListener("pointerleave", handleLeave);
       element.removeEventListener("pointerdown", handleDown);
       element.removeEventListener("pointerup", handleUp);
     };
-  }, [camera, gl, measureMode, model, onEntitySelect, onMeasurePoint]);
+  }, [camera, gl, measureMode, model, onEntitySelect, onMeasurePoint, snapIndex]);
 
-  return null;
+  return <MeasureSnapPreview candidate={preview} />;
 }
 
 function MeasurementOverlay({ points }: { points: Point[] }) {
   return <>
     {points.map((point, index) => (
-      <mesh key={`${point.join("-")}-${index}`} position={point}>
-        <sphereGeometry args={[0.025, 12, 12]} />
-        <meshBasicMaterial color="#d47b48" />
-      </mesh>
+      <group key={`${point.join("-")}-${index}`} position={point}>
+        <mesh renderOrder={1000}>
+          <sphereGeometry args={[0.025, 12, 12]} />
+          <meshBasicMaterial color="#d47b48" depthTest={false} depthWrite={false} />
+        </mesh>
+        <Html center style={{ pointerEvents: "none" }}><span className="measure-point-label">{index === 0 ? "A" : "B"}</span></Html>
+      </group>
     ))}
     {points.length === 2 && <Line points={points} color="#d47b48" lineWidth={3} dashed={false} />}
   </>;
@@ -1515,7 +1742,7 @@ export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, 
       {showGrid && <gridHelper args={[100, 100, "#aeb9b5", "#cbd2cf"]} position={[0, -0.015, 0]} />}
       {showAxes && <axesHelper args={[2.6]} />}
       {useInstancedScene ? <InstancedModelLoader buffer={buffer} renderStyle={renderStyle} showEdges={showEdges} activeLayer={activeLayer} hiddenLayers={hiddenLayers} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} activeSectionPlane={activeSectionPlane} abfVisibility={abfVisibility} explodeFactor={explodeFactor} onStats={onStats} onInstallationItems={onInstallationItems} onGroups={onGroups} onScenes={onScenes} onModelInfo={handleModelInfo} onProgress={onProgress} onError={onError} onReady={onReady} /> : <ModelLoader buffer={buffer} renderStyle={renderStyle} showEdges={showEdges} activeLayer={activeLayer} hiddenLayers={hiddenLayers} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} activeSectionPlane={activeSectionPlane} abfVisibility={abfVisibility} explodeFactor={explodeFactor} onStats={onStats} onInstallationItems={onInstallationItems} onGroups={onGroups} onScenes={onScenes} onModelInfo={handleModelInfo} onProgress={onProgress} onError={onError} onReady={onReady} />}
-      <ModelPicker model={model} measureMode={measureMode} onEntitySelect={onEntitySelect} onMeasurePoint={onMeasurePoint} />
+      <ModelPicker model={model} measureMode={measureMode} explodeFactor={explodeFactor} onEntitySelect={onEntitySelect} onMeasurePoint={onMeasurePoint} />
       <MeasurementOverlay points={measurementPoints} />
       <AbfLabelsOverlay model={model} visible={abfVisibility.labels} showNesting={abfVisibility.nesting} />
       <ModelAnnotations info={modelInfo} showDimensions={showDimensions} showGuides={showGuides} activeSectionPlane={activeSectionPlane} />

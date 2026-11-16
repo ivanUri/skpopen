@@ -421,11 +421,11 @@ export default function HomePage() {
         </div>
         <div className="topbar-actions">
           <button className="icon-button ghost" title="Cài đặt hiển thị" aria-label="Cài đặt hiển thị" onClick={() => setOpenMenu("view")}><Settings2 size={17} /></button>
-          <button className="upload-button" onClick={() => inputRef.current?.click()}>
+          <label className="upload-button" htmlFor="skp-file-input">
             <Upload size={16} />
             Mở file
-          </button>
-          <input ref={inputRef} hidden type="file" accept=".skp" onChange={(event) => {
+          </label>
+          <input id="skp-file-input" ref={inputRef} className="file-input" type="file" accept="*/*" onChange={(event) => {
             const selected = event.target.files?.[0];
             if (selected) void readFile(selected);
             event.target.value = "";
@@ -708,7 +708,7 @@ export default function HomePage() {
               <div className="empty-icon"><FileUp size={22} /></div>
               <h2>Thả file SketchUp vào đây</h2>
               <p>Xem mô hình 3D ngay trên trình duyệt, không cần upload lên server.</p>
-              <button className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} /> Chọn file .skp</button>
+              <label className="primary-button" htmlFor="skp-file-input"><Upload size={16} /> Chọn file .skp</label>
               <span className="drop-hint">hoặc kéo & thả file vào vùng xem</span>
             </div>
           )}

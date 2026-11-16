@@ -53,7 +53,8 @@ button { color: inherit; font: inherit; border: 0; cursor: pointer; }
 .icon-button, .compact-button, .tool-button, .reopen-sidebar { display: grid; place-items: center; border: 1px solid transparent; background: transparent; color: var(--muted); border-radius: 6px; transition: .2s ease; }
 .icon-button { width: 34px; height: 34px; }
 .icon-button:hover, .compact-button:hover, .tool-button:hover, .reopen-sidebar:hover { background: var(--panel-2); color: var(--text); border-color: var(--line); }
-.upload-button, .primary-button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; background: #334b4c; color: #fff; border-radius: 6px; padding: 8px 12px; font-size: 11px; font-weight: 700; transition: .2s ease; }
+.file-input { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; opacity: 0; }
+.upload-button, .primary-button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; background: #334b4c; color: #fff; border-radius: 6px; padding: 8px 12px; font-size: 11px; font-weight: 700; transition: .2s ease; cursor: pointer; user-select: none; }
 .upload-button:hover, .primary-button:hover { background: #ffffff; transform: translateY(-1px); }
 
 .workspace { display: flex; flex: 1 1 auto; width: 100%; min-width: 0; min-height: 0; overflow: hidden; }
@@ -214,7 +215,7 @@ h1 { max-width: 245px; font-size: 16px; line-height: 1.25; }
 .viewer-stage { order: 2; position: relative; flex: 1 1 0; width: 0; min-width: 0; overflow: hidden; isolation: isolate; background: #e4e8e6; }
 .viewer-stage::before { content: ''; position: absolute; inset: 0; pointer-events: none; background: linear-gradient(180deg, rgba(255,255,255,.12), transparent 34%); z-index: 1; }
 .viewer-stage.dragging { outline: 2px solid #8ca9ff; outline-offset: -2px; }
-.three-canvas { position: absolute !important; inset: 0; z-index: 0; }
+.three-canvas { position: absolute !important; inset: 0; z-index: 0; touch-action: none; }
 .viewport-label { position: absolute; z-index: 20; left: 18px; top: 17px; display: flex; gap: 8px; align-items: center; color: #718083; font: 500 9px 'DM Mono', monospace; letter-spacing: .11em; }
 .live-dot { width: 6px; height: 6px; background: var(--green); border-radius: 50%; }
 .group-selection-chip { position: absolute; z-index: 20; left: 18px; top: 42px; display: flex; align-items: center; gap: 6px; max-width: min(360px, calc(100% - 36px)); padding: 7px 9px; border: 1px solid #b8cac5; border-radius: 6px; color: #365657; background: rgba(239,247,243,.94); box-shadow: 0 5px 16px rgba(54,70,69,.1); }
@@ -226,6 +227,26 @@ h1 { max-width: 245px; font-size: 16px; line-height: 1.25; }
 .selected-board-screen-card strong { overflow: hidden; color: #2f5552; font: 700 10px 'Manrope', sans-serif; text-overflow: ellipsis; white-space: nowrap; }
 .selected-board-screen-card span:not(.selected-board-screen-kicker) { overflow: hidden; color: #627676; font: 8px 'DM Mono', monospace; text-overflow: ellipsis; white-space: nowrap; }
 .model-dimension-label { display: block; padding: 3px 5px; border: 1px solid #e3b18d; border-radius: 4px; color: #774b30; background: rgba(255,246,238,.96); box-shadow: 0 3px 10px rgba(100,67,48,.14); font: 500 9px 'DM Mono', monospace; white-space: nowrap; }
+.measure-snap-preview { display: flex; align-items: center; gap: 7px; transform: translate(16px, -18px); pointer-events: none; }
+.measure-snap-lens { position: relative; display: grid; place-items: center; width: 34px; height: 34px; border: 2px solid #e06d37; border-radius: 50%; background: rgba(255,248,242,.88); box-shadow: 0 3px 12px rgba(95,57,36,.24); }
+.measure-snap-lens::before, .measure-snap-lens::after { content: ''; position: absolute; background: rgba(224,109,55,.76); }
+.measure-snap-lens::before { width: 1px; height: 22px; }
+.measure-snap-lens::after { width: 22px; height: 1px; }
+.measure-snap-lens i { position: relative; z-index: 1; width: 5px; height: 5px; border: 1px solid #fff; border-radius: 50%; background: #e06d37; }
+.measure-snap-copy { display: flex; flex-direction: column; gap: 2px; padding: 5px 7px; border: 1px solid #e5c0a9; border-radius: 5px; background: rgba(255,248,242,.96); box-shadow: 0 4px 14px rgba(95,57,36,.16); white-space: nowrap; }
+.measure-snap-copy strong { color: #8d4c2e; font: 700 8px 'DM Mono', monospace; letter-spacing: .08em; }
+.measure-snap-copy small { color: #896e60; font: 8px 'DM Mono', monospace; }
+.measure-snap-edge .measure-snap-lens { border-color: #4d8fa3; }
+.measure-snap-edge .measure-snap-lens::before, .measure-snap-edge .measure-snap-lens::after { background: rgba(77,143,163,.76); }
+.measure-snap-edge .measure-snap-lens i { background: #4d8fa3; }
+.measure-snap-edge .measure-snap-copy { border-color: #a8cbd3; background: rgba(242,251,253,.96); }
+.measure-snap-edge .measure-snap-copy strong { color: #367284; }
+.measure-snap-face .measure-snap-lens { border-color: #8d9a98; }
+.measure-snap-face .measure-snap-lens::before, .measure-snap-face .measure-snap-lens::after { background: rgba(93,109,107,.7); }
+.measure-snap-face .measure-snap-lens i { background: #718582; }
+.measure-snap-face .measure-snap-copy { border-color: #c2cfcc; background: rgba(248,251,250,.96); }
+.measure-snap-face .measure-snap-copy strong { color: #5a716e; }
+.measure-point-label { display: block; min-width: 16px; padding: 2px 4px; border: 1px solid #d47b48; border-radius: 4px; color: #774b30; background: rgba(255,246,238,.96); box-shadow: 0 2px 8px rgba(100,67,48,.16); font: 700 8px 'DM Mono', monospace; text-align: center; }
 .measure-mode-chip { position: absolute; z-index: 20; left: 18px; top: 78px; display: flex; align-items: center; gap: 7px; max-width: min(390px, calc(100% - 36px)); padding: 7px 8px 7px 9px; border: 1px solid #e3b18d; border-radius: 6px; color: #774b30; background: rgba(255,246,238,.96); box-shadow: 0 5px 16px rgba(100,67,48,.12); }
 .measure-mode-chip > svg { flex: 0 0 auto; color: var(--accent); }
 .measure-mode-chip span { color: #a56b44; font: 8px 'DM Mono', monospace; letter-spacing: .08em; }

@@ -17,7 +17,8 @@
     "skp-core-custom": "file:packages/my-skp-core/packages/typescript",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "three": "^0.180.0"
+    "three": "^0.180.0",
+    "three-mesh-bvh": "^0.8.3"
   },
   "devDependencies": {
     "@types/node": "^22.10.1",
