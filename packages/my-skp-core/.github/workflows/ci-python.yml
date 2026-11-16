@@ -1,0 +1,95 @@
+name: Python CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            python:
+              - 'packages/python/**'
+
+  test:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.10', '3.11', '3.12']
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/python[dev,textures,fragments]
+
+      - name: Run tests
+        run: |
+          cd packages/python
+          python -m pytest tests/ -v
+
+  lint:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        # Pinned: an unpinned `ruff` picks up whatever new default rules the
+        # latest release ships with, so this step can start failing on
+        # previously-clean, unchanged code the moment a new ruff version
+        # comes out - unrelated to anything in the PR being checked.
+        run: pip install ruff==0.15.13
+
+      - name: Lint
+        run: ruff check packages/python/src/ packages/python/tests/
+
+  # Single stable check name for branch protection to require, regardless of
+  # whether packages/python/** changed. A workflow with a `paths:` trigger
+  # filter simply never runs for PRs outside that path, which would leave a
+  # required check permanently "Expected" and block the merge forever - so
+  # the path filter moved from the trigger (which can suppress a run
+  # entirely) to this job-level check (which reports a real, if trivial,
+  # pass/fail every time).
+  required:
+    name: Python CI required
+    needs: [changes, test, lint]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check outcome
+        run: |
+          if [ "${{ needs.changes.outputs.python }}" != "true" ]; then
+            echo "packages/python/** unchanged - nothing to verify"
+            exit 0
+          fi
+          if [ "${{ needs.test.result }}" != "success" ] || [ "${{ needs.lint.result }}" != "success" ]; then
+            echo "Python CI failed"
+            exit 1
+          fi
+          echo "Python CI passed"

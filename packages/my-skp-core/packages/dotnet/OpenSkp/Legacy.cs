@@ -1,0 +1,2815 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+
+namespace OpenSkp
+{
+    /// <summary>
+    /// Legacy (classic MFC) SketchUp .skp parser - SketchUp 2013-2020 era.
+    ///
+    /// Pre-2021 .skp files are not VFF/ZIP containers: after the same UTF-16
+    /// header records, the body is one uncompressed MFC CArchive object
+    /// stream with a single global 1-based store map. This module walks that
+    /// stream and adapts the result to the same raw-parse shape the VFF path
+    /// produces (Core.cs), so Parser.cs handles both eras transparently.
+    ///
+    /// Ported line-for-line from openskp/legacy.py (via the already-verified
+    /// TypeScript port at packages/typescript/src/legacy.ts). See that
+    /// module's docstring for the full list of format details that differ
+    /// from the public 2017 format notes.
+    /// </summary>
+    internal sealed class LegacyParseError : Exception
+    {
+        public LegacyParseError(string message) : base(message) { }
+    }
+
+    internal static class LegacyBytes
+    {
+        public static readonly byte[] StrMarker = { 0xFF, 0xFE, 0xFF };
+
+        public static bool BytesEqual(byte[] a, int aOff, byte[] b)
+        {
+            if (aOff + b.Length > a.Length) return false;
+            for (int i = 0; i < b.Length; i++)
+            {
+                if (a[aOff + i] != b[i]) return false;
+            }
+            return true;
+        }
+
+        public static int FindBytes(byte[] data, byte[] needle, int start = 0, int end = -1)
+        {
+            if (end < 0) end = data.Length;
+            int limit = end - needle.Length;
+            for (int i = Math.Max(start, 0); i <= limit; i++)
+            {
+                bool ok = true;
+                for (int j = 0; j < needle.Length; j++)
+                {
+                    if (data[i + j] != needle[j]) { ok = false; break; }
+                }
+                if (ok) return i;
+            }
+            return -1;
+        }
+
+        /// <summary>Search for a byte pattern where null entries are wildcards.</summary>
+        public static int FindPattern(byte[] data, int?[] pattern, int start = 0, int end = -1)
+        {
+            if (end < 0) end = data.Length;
+            int limit = end - pattern.Length;
+            for (int i = Math.Max(start, 0); i <= limit; i++)
+            {
+                bool ok = true;
+                for (int j = 0; j < pattern.Length; j++)
+                {
+                    int? want = pattern[j];
+                    if (want.HasValue && data[i + j] != want.Value) { ok = false; break; }
+                }
+                if (ok) return i;
+            }
+            return -1;
+        }
+
+        /// <summary>True when the bytes at <paramref name="p"/> are an MFC class-ref
+        /// to class <paramref name="slot"/>. Mirrors both encodings Archive.ReadObject
+        /// decodes: the short 16-bit form (0x8000|slot) and, for slots past 0x7FFF,
+        /// the big-tag escape (0x7FFF followed by a u32 of 0x80000000|slot).</summary>
+        public static bool IsClassRef(byte[] data, int p, int slot)
+        {
+            if (slot <= 0x7FFF)
+            {
+                return p + 2 <= data.Length && Tlv.ReadU16(data, p) == (0x8000 | slot);
+            }
+            return p + 6 <= data.Length
+                && Tlv.ReadU16(data, p) == 0x7FFF
+                && Tlv.ReadU32(data, p + 2) == (0x80000000u | (uint)slot);
+        }
+
+        /// <summary>True when the u16 at <paramref name="at"/> can legally
+        /// start an object read: a null, an escape, a class definition, a
+        /// class-ref to a KNOWN class, or an object back-ref within the
+        /// allocated range.</summary>
+        public static bool PlausibleListTag(Archive ar, byte[] data, int at)
+        {
+            if (at + 2 > data.Length) return false;
+            ushort t = Tlv.ReadU16(data, at);
+            if (t == 0x0000 || t == 0x7FFF || t == 0xFFFF) return true;
+            if ((t & 0x8000) != 0)
+            {
+                return ar.Slots.TryGetValue(t & 0x7FFF, out var ent) && ent.Kind == "class";
+            }
+            return t < ar.NextSlot;
+        }
+
+        public static int[] AsciiCodes(string s) => s.Select(c => (int)c).ToArray();
+
+        public static bool MatchesAscii(byte[] data, int offset, string str)
+        {
+            if (offset + str.Length > data.Length) return false;
+            for (int i = 0; i < str.Length; i++)
+            {
+                if (data[offset + i] != (byte)str[i]) return false;
+            }
+            return true;
+        }
+
+        public static string ToHex(byte[] data)
+        {
+            return Tlv.ToHexUpper(data);
+        }
+
+        /// <summary>
+        /// SketchUp 2020 (v20) writes an extra, undocumented record ahead of
+        /// some counts that v17 does not have, which leaves the reader a few
+        /// bytes early and makes it read garbage as the count. The filler is
+        /// an empty UTF-16 string record followed by zero padding:
+        ///
+        ///   &lt;ff fe ff&gt; &lt;u8 0&gt;        empty string
+        ///   &lt;zero padding&gt;           runs up to the real count
+        ///
+        /// Rather than hard-code an offset (the number of bytes before the
+        /// marker differs per call site), locate the marker in the short
+        /// window ahead, then take the first non-zero u32 that follows the
+        /// padding. Only the EMPTY-string form counts as filler: a real
+        /// string here would mean genuine data, and moving the cursor past
+        /// it would corrupt the parse.
+        ///
+        /// This only ever runs after a count came back implausible (or
+        /// zero), so files that were already parsing (v17, and the VFF
+        /// path) never reach it.
+        ///
+        /// <paramref name="countPos"/> is the offset the count was read FROM
+        /// (i.e. r.Pos - 4). Returns the corrected count, or null when this
+        /// is not the v20 layout.
+        /// </summary>
+        /// <summary>Widest zero padding seen between the v20 filler's empty
+        /// string and the count that follows it (9 and 13 bytes occur in
+        /// real files; the ceiling leaves room without letting the probe
+        /// wander into unrelated records).</summary>
+        private const int MaxV20FillerPad = 29;
+
+        /// <summary>
+        /// Locates the count that follows a v20 filler record, given the
+        /// offset the bad count was read from. Pure byte logic, exposed for
+        /// tests; see <see cref="RetryCountAfterV20Filler"/> for how it is
+        /// used.
+        /// </summary>
+        public static (uint Count, int Next)? FindCountAfterV20Filler(byte[] data, int countPos, uint limit, Archive? ar = null)
+        {
+            int markerAt = -1;
+            for (int i = countPos; i < countPos + 12 && i + 4 <= data.Length; i++)
+            {
+                if (data[i] == 0xFF && data[i + 1] == 0xFE && data[i + 2] == 0xFF)
+                {
+                    markerAt = i;
+                    break;
+                }
+            }
+            if (markerAt < 0) return null;
+            if (data[markerAt + 3] != 0) return null; // non-empty string: real data
+
+            // The count sits past a run of zero padding whose length varies
+            // per call site (9 and 13 bytes both occur in real files), but
+            // always lands at markerAt + 4 + pad with pad % 4 == 1. Step
+            // through those candidate offsets and take the first plausible
+            // u32 that is ALSO followed by a legitimate list tag (when an
+            // Archive is available to check against) - a numerically
+            // plausible count is not enough by itself once the filler can
+            // also swallow the field ahead of it (see ReadDefinition's
+            // decl-position retry), which raises the odds of a false match.
+            //
+            // Deliberately NOT "scan forward to the first non-zero byte": a
+            // count that is an exact multiple of 256 has a 0x00 low byte,
+            // which such a scan cannot tell apart from padding, so it would
+            // skip into the count and misalign every later read. Probing
+            // whole u32s at 4-byte strides never inspects an individual
+            // byte, so those counts round-trip correctly.
+            for (int pad = 1; pad <= MaxV20FillerPad; pad += 4)
+            {
+                int at = markerAt + 4 + pad;
+                if (at + 4 > data.Length) break;
+                uint count = Tlv.ReadU32(data, at);
+                if (count == 0 || count > limit) continue;
+                if (ar != null && !PlausibleListTag(ar, data, at + 4)) continue;
+                return (count, at + 4);
+            }
+            return null;
+        }
+
+        public static uint? RetryCountAfterV20Filler(LR r, int countPos, uint limit, Archive? ar = null)
+        {
+            var hit = FindCountAfterV20Filler(r.Data, countPos, limit, ar);
+            if (hit == null) return null;
+            r.Pos = hit.Value.Next;
+            return hit.Value.Count;
+        }
+
+        /// <summary>
+        /// The SketchUp 2020 layout of a model with NO component definitions AND no root entities.
+        /// <see cref="FindCountAfterV20Filler"/> cannot see it: behind the filler (an empty string record, then 13
+        /// bytes of padding) the only count is the ROOT entity count, and it is 0, which that search skips as
+        /// "no count". Returns the offset of that root count (so the caller can put the cursor there and read the
+        /// zero), or null when the bytes are not that layout: the empty string record has to sit within 12 bytes of
+        /// <paramref name="countPos"/>, and the 13 padding bytes and the count behind it have to be all zero.
+        /// </summary>
+        public static int? FindEmptyRootAfterV20Filler(byte[] data, int countPos)
+        {
+            int markerAt = -1;
+            for (int i = countPos; i < countPos + 12 && i + 4 <= data.Length; i++)
+            {
+                if (data[i] == 0xFF && data[i + 1] == 0xFE && data[i + 2] == 0xFF) { markerAt = i; break; }
+            }
+            if (markerAt < 0 || data[markerAt + 3] != 0) return null; // none, or a non-empty string: real data
+            int rootCountAt = markerAt + 4 + 13;
+            if (rootCountAt + 4 > data.Length) return null;
+            for (int i = markerAt + 3; i < rootCountAt + 4; i++) if (data[i] != 0) return null;
+            return rootCountAt;
+        }
+    }
+
+    /// <summary>Byte cursor, matching Python's _R / TS's R.</summary>
+    internal sealed class LR
+    {
+        public byte[] Data;
+        public int Pos;
+
+        public LR(byte[] data, int pos = 0)
+        {
+            Data = data;
+            Pos = pos;
+        }
+
+        public byte U8()
+        {
+            byte v = Data[Pos];
+            Pos += 1;
+            return v;
+        }
+
+        public ushort U16()
+        {
+            ushort v = Tlv.ReadU16(Data, Pos);
+            Pos += 2;
+            return v;
+        }
+
+        public uint U32()
+        {
+            uint v = Tlv.ReadU32(Data, Pos);
+            Pos += 4;
+            return v;
+        }
+
+        public int I32()
+        {
+            int v = Tlv.ReadI32(Data, Pos);
+            Pos += 4;
+            return v;
+        }
+
+        public double F64()
+        {
+            double v = Tlv.ReadF64(Data, Pos);
+            Pos += 8;
+            return v;
+        }
+
+        public double[] F64s(int n)
+        {
+            var outArr = new double[n];
+            for (int i = 0; i < n; i++) outArr[i] = F64();
+            return outArr;
+        }
+
+        public byte[] Raw(int n)
+        {
+            var v = new byte[n];
+            Array.Copy(Data, Pos, v, 0, n);
+            Pos += n;
+            return v;
+        }
+
+        public byte[] Peek(int n)
+        {
+            int len = Math.Min(n, Data.Length - Pos);
+            var v = new byte[len];
+            Array.Copy(Data, Pos, v, 0, len);
+            return v;
+        }
+
+        public ushort PeekU16() => Tlv.ReadU16(Data, Pos);
+
+        public string Utf16()
+        {
+            if (!LegacyBytes.BytesEqual(Data, Pos, LegacyBytes.StrMarker))
+            {
+                throw new LegacyParseError($"expected a string record {Ctx()}");
+            }
+            Pos += 3;
+            long n = U8();
+            if (n == 0xFF)
+            {
+                n = U16();
+                if (n == 0xFFFF)
+                {
+                    n = U32();
+                }
+            }
+            var bytes = Raw((int)(2 * n));
+            return Encoding.Unicode.GetString(bytes);
+        }
+
+        public string Ctx(int back = 16, int fwd = 32)
+        {
+            int p = Pos;
+            int bstart = Math.Max(0, p - back);
+            var before = new byte[p - bstart];
+            Array.Copy(Data, bstart, before, 0, before.Length);
+            int flen = Math.Min(fwd, Data.Length - p);
+            var after = new byte[Math.Max(flen, 0)];
+            if (flen > 0) Array.Copy(Data, p, after, 0, flen);
+            return $"@0x{p:x}: ...{LegacyBytes.ToHex(before)} | {LegacyBytes.ToHex(after)}...";
+        }
+    }
+
+    internal sealed class SlotEntry
+    {
+        public string Kind = ""; // "class" or "obj"
+        public string? Name;
+        public object? Value; // int? schema for "class"; reader result for "obj"
+    }
+
+    internal delegate object? LegacyReader(Archive ar, LR r);
+
+    /// <summary>MFC CArchive store-map bookkeeping and object-graph walk,
+    /// matching Python's _Archive / TS's Archive.</summary>
+    internal sealed class Archive
+    {
+        public byte[] Data;
+        public int Ver;
+        public bool HasPid;
+        public LR R;
+        public Dictionary<int, SlotEntry> Slots = new Dictionary<int, SlotEntry>();
+        public Dictionary<string, int> ClassSlot = new Dictionary<string, int>();
+        public Dictionary<string, int> ClassSchema = new Dictionary<string, int>();
+        public string? CurrentClass;
+        public int? CurrentObjSlot;
+        public int NextSlot;
+        public int WalkBase;
+        public Dictionary<string, LegacyReader> Readers = new Dictionary<string, LegacyReader>();
+        public int? CurrentLoop;
+        public bool InEntityList;
+        // Burned store-map indices (see ReadEdgeUse): the writer maps an
+        // annotation's connection points into the store map WITHOUT writing
+        // bytes, so file back-references beyond each burn run ahead of the
+        // walker's numbering. Registrations always stay at WALKER indices -
+        // no captured slot ever goes stale - and Backref translates file
+        // references through the burn bands instead. Burns holds
+        // (fileBandStart, width) per event; CumDelta their total;
+        // AnnotWatermark the walker slot right after the last annotation
+        // record - the only place a band can start.
+        public List<(int Start, int Width)> Burns = new List<(int, int)>();
+        public int CumDelta;
+        public int? AnnotWatermark;
+        public List<int> BurnStack = new List<int>();  // per-entity-list burned-item credits
+        // per-entity-list instances an annotation's path wrote in full (see
+        // PathRef) that the list has not listed yet, in order
+        public List<List<int>> InlineStack = new List<List<int>>();
+        // Cached CConstructionLine trailer width, self-calibrated on the
+        // first guide line of the file (see ReadConstructionLine).
+        public int? ClineTail;
+
+        public Archive(byte[] data, int ver)
+        {
+            Data = data;
+            Ver = ver;
+            HasPid = ver >= 17;
+            R = new LR(data);
+        }
+
+        public int Alloc(SlotEntry entry)
+        {
+            int s = NextSlot;
+            Slots[s] = entry;
+            NextSlot += 1;
+            return s;
+        }
+
+        public (int? Slot, string? Name, object? Value) ReadObject(LR r, string? expect = null)
+        {
+            ushort tag = r.U16();
+            if (tag == 0)
+            {
+                return (null, null, null);
+            }
+            if (tag == 0x7FFF)
+            {
+                uint big = r.U32();
+                if ((big & 0x80000000) != 0)
+                {
+                    return NewOfClass(r, (int)(big & 0x7FFFFFFF), expect);
+                }
+                return Backref((int)big, r);
+            }
+            if (tag == 0xFFFF)
+            {
+                ushort schema = r.U16();
+                ushort namelen = r.U16();
+                if (namelen > 40)
+                {
+                    throw new LegacyParseError($"implausible class name length {r.Ctx()}");
+                }
+                var nameBytes = r.Raw(namelen);
+                string name = Encoding.ASCII.GetString(nameBytes);
+                Alloc(new SlotEntry { Kind = "class", Name = name, Value = (int)schema });
+                ClassSlot[name] = NextSlot - 1;
+                ClassSchema[name] = schema;
+                return NewObj(r, name);
+            }
+            if ((tag & 0x8000) != 0)
+            {
+                return NewOfClass(r, tag & 0x7FFF, expect);
+            }
+            return Backref(tag, r);
+        }
+
+        private (int, string, object?) NewOfClass(LR r, int cslot, string? expect)
+        {
+            if (!Slots.TryGetValue(cslot, out var ent))
+            {
+                if (expect == null)
+                {
+                    throw new LegacyParseError($"class-ref to unknown slot {cslot} {r.Ctx()}");
+                }
+                ent = new SlotEntry { Kind = "class", Name = expect, Value = null };
+                Slots[cslot] = ent;
+                ClassSlot[expect] = cslot;
+            }
+            if (ent.Kind != "class")
+            {
+                throw new LegacyParseError($"class-ref to non-class slot {cslot} ({ent.Name}) {r.Ctx()}");
+            }
+            return NewObj(r, ent.Name!);
+        }
+
+        private (int, string, object?) NewObj(LR r, string name)
+        {
+            InEntityList = false;
+            int slot = Alloc(new SlotEntry { Kind = "obj", Name = name, Value = null });
+            if (!Readers.TryGetValue(name, out var reader))
+            {
+                throw new LegacyParseError($"no reader for class {name} {r.Ctx()}");
+            }
+            string? prevClass = CurrentClass;
+            int? prevSlot = CurrentObjSlot;
+            CurrentClass = name;
+            CurrentObjSlot = slot;
+            object? value;
+            try
+            {
+                value = reader(this, r);
+            }
+            finally
+            {
+                CurrentClass = prevClass;
+                CurrentObjSlot = prevSlot;
+            }
+            Slots[slot] = new SlotEntry { Kind = "obj", Name = name, Value = value };
+            if (name == "CDimensionLinear" || name == "CText")
+            {
+                AnnotWatermark = NextSlot;
+            }
+            return (slot, name, value);
+        }
+
+        // 0xffff CLayer, a class-ref to a CLayer already in ClassSlot, or —
+        // when unmatchedClassRef — any short 0x8000 class-ref. The last form
+        // is only for the throwaway slot-base probe, which numbers from
+        // 1<<20 so the file's 0x8000|real_slot will not match ClassSlot.
+        public bool ClayerRecordAt(int at, bool unmatchedClassRef = false)
+        {
+            if (at + 2 > Data.Length) return false;
+            ushort tag = Tlv.ReadU16(Data, at);
+            if (tag == 0xFFFF && at + 12 <= Data.Length && Tlv.ReadU16(Data, at + 4) == 6
+                && Data[at + 6] == (byte)'C' && Data[at + 7] == (byte)'L'
+                && Data[at + 8] == (byte)'a' && Data[at + 9] == (byte)'y'
+                && Data[at + 10] == (byte)'e' && Data[at + 11] == (byte)'r')
+            {
+                return true;
+            }
+            if (ClassSlot.TryGetValue("CLayer", out int layCs) && LegacyBytes.IsClassRef(Data, at, layCs))
+            {
+                return true;
+            }
+            return unmatchedClassRef && (tag & 0x8000) != 0 && tag != 0xFFFF;
+        }
+
+        // Colour CLayer ends in a 21-byte tail. Some v18 zero-material files
+        // (custom tag listed first, then Layer0) write 12 zero bytes + u32
+        // after that, then another CLayer. Skip those 16 bytes only when they
+        // precede a CLayer; leave a definition-list back-ref alone.
+        public void SkipClayerColourExt()
+        {
+            const int pad = 12;
+            const int ext = 16;
+            if (R.Pos + ext + 2 > Data.Length) return;
+            for (int i = 0; i < pad; i++)
+            {
+                if (Data[R.Pos + i] != 0) return;
+            }
+            if (ClayerRecordAt(R.Pos + ext, true)) R.Pos += ext;
+        }
+
+        // v18 template Layer0 after a custom tag: <parent u16><active u16><dc u32>.
+        // Consume parent only when both u16s are already CLayer objects. A lone
+        // back-ref then a definition count (usual layout) stays put.
+        public void SkipClayerParentRef(int? selfSlot)
+        {
+            if (R.Pos + 4 > Data.Length || selfSlot == null) return;
+            ushort a = Tlv.ReadU16(Data, R.Pos);
+            ushort b = Tlv.ReadU16(Data, R.Pos + 2);
+            if (a == 0 || (a & 0x8000) != 0 || a == 0x7FFF || a == selfSlot.Value) return;
+            if (b == 0 || (b & 0x8000) != 0 || b == 0x7FFF) return;
+            if (!Slots.TryGetValue(a, out var ea) || !Slots.TryGetValue(b, out var eb)) return;
+            if (ea.Kind == "class" || eb.Kind == "class") return;
+            if (ea.Name != "CLayer" || eb.Name != "CLayer") return;
+            R.Pos += 2;
+        }
+
+        // Extra CLayer records past declared layer_count (v18: count=1 custom
+        // tag, then Layer0). Skip null separators; stop at the definition-list
+        // anchor. unmatchedClassRef only on the throwaway probe.
+        public void CollectTrailingLayers(List<int>? slotsOut, List<(int Slot, object? Value)>? layersOut,
+            bool unmatchedClassRef = false)
+        {
+            while (R.Pos + 2 <= Data.Length)
+            {
+                ushort tag = R.PeekU16();
+                if (tag == 0)
+                {
+                    R.Pos += 2;
+                    continue;
+                }
+                if (!ClayerRecordAt(R.Pos, unmatchedClassRef)) break;
+                var (s, _, v) = ReadObject(R, "CLayer");
+                if (v != null)
+                {
+                    if (slotsOut != null && s.HasValue) slotsOut.Add(s.Value);
+                    if (layersOut != null && s.HasValue) layersOut.Add((s.Value, v));
+                }
+            }
+        }
+
+        /// <summary>Map a FILE store-map index to the walker's numbering
+        /// through the burn bands. Returns null when the reference points
+        /// INTO a band (a phantom, never-serialized connection point).</summary>
+        private int? TranslateRef(int slot)
+        {
+            int offset = 0;
+            foreach (var (start, width) in Burns)
+            {
+                if (slot < start) break;
+                if (slot < start + width) return null;
+                offset += width;
+            }
+            return slot - offset;
+        }
+
+        /// <summary>The walker slot of the back-reference at the cursor,
+        /// without moving it; null when the next tag is anything
+        /// else.</summary>
+        public int? PeekBackref(LR r)
+        {
+            if (r.Pos + 2 > r.Data.Length) return null;
+            int tag = r.Data[r.Pos] | (r.Data[r.Pos + 1] << 8);
+            int slot;
+            if (tag == 0x7FFF)
+            {
+                if (r.Pos + 6 > r.Data.Length) return null;
+                uint big = Tlv.ReadU32(r.Data, r.Pos + 2);
+                if ((big & 0x80000000) != 0) return null;
+                slot = (int)big;
+            }
+            else if (tag == 0 || (tag & 0x8000) != 0)
+            {
+                return null;
+            }
+            else
+            {
+                slot = tag;
+            }
+            if (Burns.Count > 0 && slot >= Burns[0].Start)
+            {
+                return TranslateRef(slot);
+            }
+            return slot;
+        }
+
+        private (int?, string?, object?) Backref(int slot, LR r)
+        {
+            if (Burns.Count > 0 && slot >= Burns[0].Start)
+            {
+                var walker = TranslateRef(slot);
+                if (walker == null)
+                {
+                    // a phantom (burned) connection-point index - annotation
+                    // metadata only; nothing was ever serialized for it
+                    return (slot, "reserved", null);
+                }
+                slot = walker.Value;
+            }
+            if (!Slots.TryGetValue(slot, out var ent))
+            {
+                if (slot < WalkBase)
+                {
+                    return (slot, "premodel", null);
+                }
+                throw new LegacyParseError($"back-ref to unwalked slot {slot} {r.Ctx()}");
+            }
+            if (ent.Kind == "class")
+            {
+                throw new LegacyParseError($"back-ref to class slot {slot} {r.Ctx()}");
+            }
+            return (slot, ent.Name, ent.Value);
+        }
+    }
+
+    // ── shared record blocks ─────────────────────────────────────────────
+
+    internal sealed class DrawBase
+    {
+        public int Mat;
+        public int Hidden;
+        public int Soft;
+        public int Smooth;
+        public int Layer;
+    }
+
+    internal sealed class PreambleResult
+    {
+        public object? Attrs;
+        public int Pid;
+        public int? AttrsSlot;
+    }
+
+    internal sealed class VertexRec { public double[] Xyz = new double[3]; }
+    internal sealed class EdgeRec { public DrawBase Db = new DrawBase(); public int? Curve; public object? CurveValue; public int? V1; public int? V2; }
+    internal sealed class CurveRec { public uint N; }
+    /// <summary>A CArcCurve: the points center + cos(t) * XAxis + sin(t) * YAxis for t from
+    /// StartAngle to EndAngle.</summary>
+    internal sealed class ArcCurveRec
+    {
+        public ArcFrame Frame = new ArcFrame();
+    }
+    internal sealed class EdgeUseRec { public int? Edge; public int Sense; }
+    internal sealed class LoopRec { public List<EdgeUseRec> Uses = new List<EdgeUseRec>(); }
+    internal sealed class FaceRec
+    {
+        public DrawBase Db = new DrawBase();
+        public double[] Plane = new double[4];
+        public List<LoopRec> Loops = new List<LoopRec>();
+        public int BackMat;
+        public AttrsRec? Attrs;
+    }
+    internal sealed class AttrsRec { public List<(string? Name, object? Value)> Children = new List<(string?, object?)>(); }
+    internal sealed class DictRec { public string Name = ""; public Dictionary<string, object?> Entries = new Dictionary<string, object?>(); }
+    internal sealed class LayerRec { public string Name = ""; public int Hidden; public byte[] Rgba = new byte[4]; }
+    internal sealed class TextureBlockRec
+    {
+        public byte[] Rgba = new byte[4];
+        public double Opacity;
+        public int UseOpacity;
+        public int? TexDib;
+        public byte[]? TexData;
+        public double TexW;
+        public double TexH;
+        public string TexFile = "";
+        public bool Colorized;
+        public int ColorizeType;
+    }
+    internal sealed class MaterialRec
+    {
+        public string Name = "";
+        public byte[] Rgba = { 128, 128, 128, 255 };
+        public double Opacity;
+        public int UseOpacity;
+        public int? TexDib;
+        public byte[]? TexData;
+        public double TexW;
+        public double TexH;
+        public string TexFile = "";
+        public bool Colorized;
+        public int ColorizeType;
+        public bool HasTexture;
+    }
+    internal sealed class DibRec { public uint Subtype; public byte[] Data = Array.Empty<byte>(); }
+    internal sealed class FtcRec
+    {
+        public double[] Front = new double[9];
+        public double[] Back = new double[9];
+        public List<double[]> FrontPins = new List<double[]>();
+        public List<double[]> BackPins = new List<double[]>();
+        public bool FrontProjected;
+        public bool BackProjected;
+    }
+    internal sealed class CameraRec { }
+    internal sealed class ThumbnailRec { public int? Dib; }
+    internal sealed class ImageRec { public DrawBase Db = new DrawBase(); public int? Def; public double[] Xform = new double[12]; public string Guid = ""; }
+    internal sealed class RelationshipRec { }
+    internal sealed class ConstructionLineRec
+    {
+        public (double X, double Y, double Z) Point;
+        public (double X, double Y, double Z) Direction = (1.0, 0.0, 0.0);
+        public (double X, double Y, double Z)? Start;
+        public (double X, double Y, double Z)? End;
+    }
+    internal sealed class ConstructionPointRec { public DrawBase Db = new DrawBase(); public double[] Pos = new double[3]; }
+    internal sealed class SectionPlaneRec { public DrawBase Db = new DrawBase(); public double[] Plane = new double[4]; public string Name = ""; public string Label = ""; }
+    internal sealed class FontRec { }
+    internal sealed class DimLinearRec { public DrawBase Db = new DrawBase(); public string Text = ""; }
+    internal sealed class TextRec { public DrawBase Db = new DrawBase(); public string Text = ""; }
+    internal sealed class DefinitionRec
+    {
+        public string Name = "";
+        public string Guid = "";
+        public List<(int Slot, string? Name, object? Value)> Ents = new List<(int, string?, object?)>();
+        public bool FacesCamera;
+        public bool ShadowsFaceSun;
+        public bool IsGroup;
+    }
+    internal sealed class InstanceRec
+    {
+        public DrawBase Db = new DrawBase();
+        public int? Def;
+        public double[] Xf = new double[13];
+        public string Name = "";
+        public string Guid = "";
+        public AttrsRec? Attrs;
+    }
+
+    internal static class LegacyReaders
+    {
+        // SketchUp 3 (header "{3.0.x}") predates several fields every later
+        // file carries. The differences are gated on `ar.Ver < FirstV4` and
+        // were calibrated byte-by-byte on one real SketchUp-written V3 file
+        // (a synthetic model saved down through SketchUp's own version
+        // export) - not on a corpus - so they are exactly what that file
+        // proves and no more (openskp#284, #407; matches Python's legacy.py
+        // `_FIRST_V4`). SketchUp 4 and 5 have layout differences of their own
+        // (openskp#284): see FirstDibObject, FirstNamedInstance and the
+        // version checks in Drawbase, ReadCamera, ReadThumbnail,
+        // ReadDimLinear and ReadDefinition.
+        public const int FirstV4 = 4;
+
+        /// <summary>The texture image became a first-class CDib object
+        /// (store-map slot, entity preamble) in SketchUp 6. SketchUp 3, 4 and
+        /// 5 write it as a bare inline subtype/length/bytes record straight
+        /// after the material's flag word.</summary>
+        public const int FirstDibObject = 6;
+
+        /// <summary>First version whose instances and groups carry a name
+        /// string (SketchUp 3 and 4 files have none; where the name is
+        /// optional the reader checks for one).</summary>
+        public const int FirstNamedInstance = 5;
+
+        /// <summary><see cref="Preamble"/> for the entity types that carry NO
+        /// attribute-container pointer in a SketchUp 3 file: vertex, loop,
+        /// edge-use, material, layer. (Edge, face, definition, instance and
+        /// thumbnail still open with one.)</summary>
+        public static PreambleResult EarlyPreamble(Archive ar, LR r)
+        {
+            if (ar.Ver < FirstV4) return new PreambleResult();
+            return Preamble(ar, r);
+        }
+
+        public static PreambleResult Preamble(Archive ar, LR r)
+        {
+            var (attrsSlot, _, attrs) = ar.ReadObject(r, "CAttributeContainer");
+            int pid = 0;
+            if (ar.HasPid)
+            {
+                byte mask = r.U8();
+                for (int bit = 0; bit < 8; bit++)
+                {
+                    if ((mask & (1 << bit)) != 0)
+                    {
+                        pid |= r.U8() << (8 * bit);
+                    }
+                }
+            }
+            return new PreambleResult { Attrs = attrs, Pid = pid, AttrsSlot = attrsSlot };
+        }
+
+        public static DrawBase Drawbase(Archive ar, LR r)
+        {
+            // SketchUp 3's draw block is 5 bytes, and they were identical
+            // for every entity in the calibration file - painted and
+            // unpainted faces, edges, groups - so nothing in them is
+            // decodable from what we have. Material comes from the face's
+            // own pointer instead (see ReadFace); report the rest as unset
+            // rather than the meaningless 0x0100 / "hidden" the 8-byte
+            // layout would read out of them.
+            // 5 bytes in V3, 7 in V4, 8 from V5.
+            var b = r.Raw(ar.Ver < FirstV4 ? 5 : ar.Ver < 5 ? 7 : 8);
+            // The layer field is normally a u16 id, but an entity can carry
+            // the layer BY OBJECT instead (seen on real 2018 instances): a
+            // full inline CLayer record on first use, an escaped back-ref
+            // to it on later siblings. Layer ids never have the 0x8000 bit
+            // and never equal 0x7FFF, so both object forms are unambiguous.
+            // (A 2-byte back-ref would collide with the id space - not seen
+            // in any file; by-object layers have only appeared in
+            // >32k-object archives where refs escape anyway.)
+            bool haveLayCls = ar.ClassSlot.TryGetValue("CLayer", out int layCls);
+            ushort tag = r.PeekU16();
+            int layer;
+            if (haveLayCls && tag == (0x8000 | layCls))
+            {
+                ar.ReadObject(r, "CLayer");
+                layer = 0;                   // by-object layer: keep the default id
+            }
+            else if (tag == 0x7FFF)
+            {
+                r.U16();
+                uint big = r.U32();
+                if ((big & 0x80000000) != 0)
+                {
+                    throw new LegacyParseError($"drawbase layer: unexpected class {r.Ctx()}");
+                }
+                layer = 0;                   // by-object layer (back-ref)
+            }
+            else
+            {
+                layer = r.U16();
+            }
+            if (ar.Ver < FirstV4)
+            {
+                return new DrawBase { Layer = layer };
+            }
+            return new DrawBase
+            {
+                Mat = Tlv.ReadU16(b, 0),
+                Hidden = b[2],
+                Soft = b[5],
+                Smooth = b[6],
+                Layer = layer,
+            };
+        }
+
+        public static object ReadVertex(Archive ar, LR r)
+        {
+            EarlyPreamble(ar, r);
+            return new VertexRec { Xyz = r.F64s(3) };
+        }
+
+        public static object ReadEdge(Archive ar, LR r)
+        {
+            Preamble(ar, r);
+            var db = Drawbase(ar, r);
+            var (s1, _, _) = ar.ReadObject(r, "CVertex");
+            var (s2, _, _) = ar.ReadObject(r, "CVertex");
+            var (cs, cn, cv) = ar.ReadObject(r);
+            if (cn != null && cn != "CCurve" && cn != "CArcCurve")
+            {
+                throw new LegacyParseError($"edge curve pointer resolved to {cn} {r.Ctx()}");
+            }
+            // cv is the curve itself on the edge that first points at it (a back-ref to a
+            // curve already read carries none)
+            return new EdgeRec { Db = db, Curve = cs, CurveValue = cv, V1 = s1, V2 = s2 };
+        }
+
+        public static object ReadCurve(Archive ar, LR r)
+        {
+            Preamble(ar, r);
+            r.U8();
+            uint n = r.U32();
+            return new CurveRec { N = n };
+        }
+
+        public static object ReadArcCurve(Archive ar, LR r)
+        {
+            Preamble(ar, r);
+            r.Raw(5);
+            // center[3], normal[3], x_axis[3], start_angle, end_angle, y_axis[3]
+            var v = r.F64s(14);
+            return new ArcCurveRec
+            {
+                Frame = new ArcFrame
+                {
+                    Center = (v[0], v[1], v[2]),
+                    Normal = (v[3], v[4], v[5]),
+                    XAxis = (v[6], v[7], v[8]),
+                    StartAngle = v[9],
+                    EndAngle = v[10],
+                    YAxis = (v[11], v[12], v[13]),
+                },
+            };
+        }
+
+        /// <summary>Record that the writer burned <paramref name="delta"/>
+        /// store-map indices without serializing any bytes for them.
+        ///
+        /// SketchUp maps an annotation's connection-point objects into the
+        /// MFC store map (CArchive::MapObject) when a dimension or leader
+        /// text is attached to geometry - each mapping consumes an index,
+        /// but nothing is written to the stream, so the file's later
+        /// back-references run ahead of a byte-exact walk. The band starts
+        /// right after the last annotation record (in FILE numbering);
+        /// registrations never move - Backref translates file references
+        /// through the recorded bands instead, so no slot value captured
+        /// anywhere can go stale.</summary>
+        private static void RegisterBurn(Archive ar, int delta)
+        {
+            ar.Burns.Add((ar.AnnotWatermark!.Value + ar.CumDelta, delta));
+            ar.CumDelta += delta;
+            ar.AnnotWatermark = null;
+            // each burn event corresponds to ONE phantom top-level entity
+            // that the entity list's declared count includes but the
+            // stream never carries - credit it so the list doesn't run
+            // past its real end
+            if (ar.BurnStack.Count > 0)
+            {
+                ar.BurnStack[ar.BurnStack.Count - 1] += 1;
+            }
+        }
+
+        public static object ReadEdgeUse(Archive ar, LR r)
+        {
+            EarlyPreamble(ar, r);
+            var (es, _, _) = ar.ReadObject(r, "CEdge");
+            byte sense = r.U8();
+            // parent-loop back-ref: the alignment oracle. Read as a RAW
+            // file index - after annotations the claimed index can sit
+            // AHEAD of the walker's numbering (burned MapObject indices,
+            // see RegisterBurn), which is a correction signal, not a
+            // mis-parse.
+            int p0 = r.Pos;
+            ushort tag = r.U16();
+            int? ps;
+            if (tag == 0x7FFF)
+            {
+                uint big = r.U32();
+                if ((big & 0x80000000) != 0)
+                {
+                    throw new LegacyParseError($"edge-use parent is a new object {r.Ctx()}");
+                }
+                ps = (int)big;
+            }
+            else if (tag == 0xFFFF || (tag & 0x8000) != 0)
+            {
+                throw new LegacyParseError($"edge-use parent is a new object {r.Ctx()}");
+            }
+            else
+            {
+                ps = tag != 0 ? (int?)tag : null;
+            }
+            int? expected = ar.CurrentLoop != null ? ar.CurrentLoop + ar.CumDelta : (int?)null;
+            if (ps != expected)
+            {
+                int delta = (ps.HasValue && expected.HasValue) ? ps.Value - expected.Value : 0;
+                if (delta > 0 && delta <= 4096 && ar.AnnotWatermark != null)
+                {
+                    RegisterBurn(ar, delta);
+                }
+                else
+                {
+                    r.Pos = p0;
+                    throw new LegacyParseError($"edge-use parent slot {ps} != current loop {expected} {r.Ctx()}");
+                }
+            }
+            return new EdgeUseRec { Edge = es, Sense = sense };
+        }
+
+        public static object ReadLoop(Archive ar, LR r)
+        {
+            int mySlot = ar.NextSlot - 1;
+            var prev = ar.CurrentLoop;
+            ar.CurrentLoop = mySlot;
+            EarlyPreamble(ar, r);
+            r.Raw(2);
+            var uses = new List<EdgeUseRec>();
+            while (true)
+            {
+                if (r.PeekU16() == 0)
+                {
+                    r.Pos += 2;
+                    break;
+                }
+                var (_, _, v) = ar.ReadObject(r, "CEdgeUse");
+                uses.Add((EdgeUseRec)v!);
+            }
+            ar.CurrentLoop = prev;
+            return new LoopRec { Uses = uses };
+        }
+
+        public static object ReadFace(Archive ar, LR r)
+        {
+            var pre = Preamble(ar, r);
+            var db = Drawbase(ar, r);
+            var attrs = pre.Attrs as AttrsRec;
+            if (ar.Ver < FirstV4 && pre.Attrs is MaterialRec && pre.AttrsSlot != null)
+            {
+                // SketchUp 3: the pointer that opens a face is its FRONT
+                // MATERIAL (null for an unpainted face), not an attribute
+                // container.
+                db.Mat = pre.AttrsSlot.Value;
+                attrs = null;
+            }
+            var plane = r.F64s(4);
+            uint nloops = r.U32();
+            if (nloops > 10000)
+            {
+                throw new LegacyParseError($"implausible loop count {nloops} {r.Ctx()}");
+            }
+            var loops = new List<LoopRec>();
+            for (int i = 0; i < nloops; i++)
+            {
+                var (_, _, v) = ar.ReadObject(r, "CLoop");
+                loops.Add((LoopRec)v!);
+            }
+            ushort backMat = r.U16();
+            return new FaceRec { Db = db, Plane = plane, Loops = loops, BackMat = backMat, Attrs = attrs };
+        }
+
+        public static object ReadAttrContainer(Archive ar, LR r)
+        {
+            Preamble(ar, r);
+            var children = new List<(string?, object?)>();
+            while (true)
+            {
+                if (r.PeekU16() == 0)
+                {
+                    r.Pos += 2;
+                    break;
+                }
+                var (_, n, v) = ar.ReadObject(r, "CAttributeNamed");
+                children.Add((n, v));
+            }
+            return new AttrsRec { Children = children };
+        }
+
+        private static object? ReadTyped(LR r, int t)
+        {
+            if (t == 0x00) return null;
+            if (t == 0x04) return r.I32();
+            if (t == 0x06) return r.F64();
+            if (t == 0x07) return r.U8();
+            if (t == 0x09) return r.U32();
+            if (t == 0x0a) return r.Utf16();
+            if (t == 0x0c) return r.F64();           // Length (a double, inches)
+            if (t == 0x0b)
+            {
+                uint n = r.U32();
+                if (n > 100000)
+                {
+                    throw new LegacyParseError($"implausible attr array count {r.Ctx()}");
+                }
+                var arr = new List<object?>();
+                for (int i = 0; i < n; i++) arr.Add(ReadTyped(r, r.U8()));
+                return arr;
+            }
+            if (t == 0x11) return r.F64s(3);         // 3D point (Geom::Point3d)
+            if (t == 0x12) return r.F64s(3);         // 3D vector (Geom::Vector3d)
+            throw new LegacyParseError($"unknown attribute value type 0x{t:x} {r.Ctx()}");
+        }
+
+        public static object ReadAttrNamed(Archive ar, LR r)
+        {
+            Preamble(ar, r);
+            r.Raw(4);
+            string dictname = r.Utf16();
+            var entries = new Dictionary<string, object?>();
+            while (true)
+            {
+                string key = r.Utf16();
+                if (key == "") break;
+                entries[key] = ReadTyped(r, r.U8());
+            }
+            // CAttributeNamed's own trailing u32 is a v7+ addition: a real
+            // SketchUp 6 file ends the record at the empty-key terminator
+            // with nothing after it. Reading it unconditionally eats 4 bytes
+            // belonging to the next sibling's own tag, which surfaces many
+            // reads later as an unrelated "back-ref to unwalked slot"
+            // (openskp#284 / #385). The class's own schema is never observed
+            // (it is learned from the unwalked pre-model region), so the
+            // file's version is the only signal available.
+            if (ar.Ver >= 7) r.U32();
+            return new DictRec { Name = dictname, Entries = entries };
+        }
+
+        public static object ReadLayer(Archive ar, LR r)
+        {
+            EarlyPreamble(ar, r);
+            string name = r.Utf16();
+            var mid = new List<byte>();
+            while (mid.Count < 8 && !LegacyBytes.BytesEqual(r.Peek(3), 0, LegacyBytes.StrMarker))
+            {
+                mid.Add(r.Raw(1)[0]);
+            }
+            r.Utf16();                       // internal name ("Layer_<name>")
+            ushort flags = r.U16();
+            if ((flags & 0x00FF) != 0)
+            {
+                // Colour-by-layer with a TEXTURED material: instead of the
+                // flat RGBA, the layer embeds the same texture block a
+                // CMaterial carries (SketchUp Pro assigns full materials to
+                // layers). Low byte of the flag word set = textured; a
+                // plain colour layer has 0 there (its high byte carries an
+                // unrelated flag, so the word as a whole is non-zero
+                // either way).
+                var tex = TextureBlock(ar, r);
+                r.Raw(4);                    // trailing u32
+                return new LayerRec { Name = name, Hidden = mid.Count > 0 ? mid[0] : 0, Rgba = tex.Rgba };
+            }
+            var rgba = r.Raw(4);
+            r.Utf16();
+            r.Raw(ar.Ver < FirstV4 ? 17 : 21);   // SketchUp 3's tail is 4 bytes shorter
+            ar.SkipClayerColourExt();
+            ar.SkipClayerParentRef(ar.CurrentObjSlot);
+            return new LayerRec { Name = name, Hidden = mid.Count > 0 ? mid[0] : 0, Rgba = rgba };
+        }
+
+        /// <summary>The textured-material payload: an embedded CDib plus
+        /// applied size, source file name, average colour, and opacity.
+        /// Shared verbatim between a CMaterial with a texture and a
+        /// colour-by-layer CLayer that carries a textured material.
+        ///
+        /// The texture is an entity in its own right, so right after the
+        /// u8 "has texture" flag it opens with the standard entity
+        /// preamble: an attribute-container ref (null unless an extension
+        /// stored a dictionary on the Texture itself, as render plugins
+        /// do) and, from v17 on, the persistent-id mask. Callers read the
+        /// flag as a u16, so step back over its high byte - the first byte
+        /// of that preamble.
+        ///
+        /// SketchUp 3 has neither: the image follows the flag directly as a
+        /// bare subtype/length/bytes record - no preamble, no object tag, and
+        /// so no store-map slot (<c>TexDib</c> is null; the bytes ride along
+        /// as <c>TexData</c> instead).</summary>
+        public static TextureBlockRec TextureBlock(Archive ar, LR r)
+        {
+            int? s;
+            byte[]? inlineData = null;
+            if (ar.Ver < FirstDibObject)
+            {
+                s = null;
+                inlineData = ((DibRec)ReadDib(ar, r)).Data;
+            }
+            else
+            {
+                r.Pos -= 1;
+                Preamble(ar, r);
+                var (slot, _, dib) = ar.ReadObject(r, "CDib");
+                if (!(dib is DibRec))
+                {
+                    throw new LegacyParseError($"texture object is not a dib {r.Ctx()}");
+                }
+                s = slot;
+            }
+            // optional u32 between the dib and the 2 x f64 applied size
+            int marker = LegacyBytes.FindBytes(r.Data, LegacyBytes.StrMarker, r.Pos, r.Pos + 28);
+            if (marker - r.Pos == 20)
+            {
+                r.U32();
+            }
+            else if (marker - r.Pos != 16)
+            {
+                throw new LegacyParseError($"texture size block misaligned {r.Ctx()}");
+            }
+            double w = r.F64();
+            double h = r.F64();
+            string fname = r.Utf16();
+            var avg = r.Raw(9);              // image average RGBA + 00 + the material's paint RGBA
+            r.Utf16();
+            var blob = r.Raw(8);             // u32 material type (1 textured, 2 colorized) + u32 colorize mode
+            double opacity = r.F64();
+            byte useOp = r.U8();
+            // Checked against materials written by SketchUp's own library:
+            // the first blob u32 is SUMaterialGetType (2 = a colorized
+            // texture, which keeps the ORIGINAL image and stores the tint as
+            // the paint colour) and the second is SUMaterialGetColorizeType
+            // (0 shift, 1 tint). The alpha byte of the image average says
+            // nothing about either - it is 0xFF on plain textures too.
+            bool colorized = blob[0] == 2;
+            return new TextureBlockRec
+            {
+                Rgba = new byte[] { avg[5], avg[6], avg[7], 255 },
+                Opacity = opacity,
+                UseOpacity = useOp,
+                TexDib = s,
+                TexData = inlineData,
+                TexW = w,
+                TexH = h,
+                TexFile = fname,
+                Colorized = colorized,
+                ColorizeType = blob[4] == 1 ? 1 : 0,
+            };
+        }
+
+        public static object ReadMaterial(Archive ar, LR r)
+        {
+            EarlyPreamble(ar, r);
+            string name = r.Utf16();
+            ushort texflag = r.U16();
+            var outRec = new MaterialRec { Name = name };
+            if (texflag == 0)
+            {
+                var rgba = r.Raw(4);
+                r.Utf16();
+                r.Raw(8);
+                double opacity = r.F64();
+                byte useOp = r.U8();
+                outRec.Rgba = rgba;
+                outRec.Opacity = opacity;
+                outRec.UseOpacity = useOp;
+            }
+            else
+            {
+                var tex = TextureBlock(ar, r);
+                outRec.Rgba = tex.Rgba;
+                outRec.Opacity = tex.Opacity;
+                outRec.UseOpacity = tex.UseOpacity;
+                outRec.TexDib = tex.TexDib;
+                outRec.TexData = tex.TexData;
+                outRec.TexW = tex.TexW;
+                outRec.TexH = tex.TexH;
+                outRec.TexFile = tex.TexFile;
+                outRec.Colorized = tex.Colorized;
+                outRec.ColorizeType = tex.ColorizeType;
+                outRec.HasTexture = true;
+            }
+            return outRec;
+        }
+
+        public static object ReadDib(Archive ar, LR r)
+        {
+            uint subtype = r.U32();
+            uint length = r.U32();
+            if (length > r.Data.Length)
+            {
+                throw new LegacyParseError($"implausible dib length {length} {r.Ctx()}");
+            }
+            var data = r.Raw((int)length);
+            return new DibRec { Subtype = subtype, Data = data };
+        }
+
+        public static object ReadFtc(Archive ar, LR r)
+        {
+            Preamble(ar, r);
+            r.U32();
+            var ks = r.F64s(24);
+            uint frontPinsCount = r.U32();
+            var frontPins = new List<double[]>();
+            for (int i = 0; i < frontPinsCount; i++) frontPins.Add(r.F64s(4));
+            uint backPinsCount = r.U32();
+            var backPins = new List<double[]>();
+            for (int i = 0; i < backPinsCount; i++) backPins.Add(r.F64s(4));
+            uint fflags = r.U32();
+            uint bflags = r.U32();
+            return new FtcRec
+            {
+                Front = ks.Take(9).ToArray(),
+                Back = ks.Skip(12).Take(9).ToArray(),
+                FrontPins = frontPins,
+                BackPins = backPins,
+                FrontProjected = (fflags & 2) != 0,
+                BackProjected = (bflags & 2) != 0,
+            };
+        }
+
+        public static object ReadCamera(Archive ar, LR r)
+        {
+            r.Raw(137);
+            r.U16();
+            r.Utf16();
+            r.Raw(ar.Ver >= 6 ? 33 : 10);
+            return new CameraRec();
+        }
+
+        public static object ReadThumbnail(Archive ar, LR r)
+        {
+            Preamble(ar, r);
+            if (ar.Ver < FirstV4)
+            {
+                // SketchUp 3: a fixed 129-byte camera block, no name, no image.
+                r.Raw(129);
+                return new ThumbnailRec { Dib = null };
+            }
+            ar.ReadObject(r, "CCamera");
+            if (ar.Ver < 6)
+            {
+                // SketchUp 4 and 5 end the thumbnail with its camera: no
+                // trailing image pointer (not even a null one).
+                return new ThumbnailRec { Dib = null };
+            }
+            var (dibSlot, _, _) = ar.ReadObject(r, "CDib");
+            return new ThumbnailRec { Dib = dibSlot };
+        }
+
+        /// <summary>CImage: an Image entity - instance-shaped: a back-ref
+        /// to the (already walked) CComponentDefinition holding the
+        /// image's face and texture, a 3x4 placement, a constant 1.0, the
+        /// source path string (empty in every sample), and a 16-byte GUID.
+        /// It appears as a normal entity-list item inside the definition
+        /// that owns the image (typically a face-me/photo definition),
+        /// whose own tail the ordinary definition reader then consumes.
+        /// Calibrated byte-exact on two real files - an 80 MB v18 and a
+        /// 661 MB v17 - both previously rejected outright with "no reader
+        /// for class CImage".</summary>
+        public static object ReadImage(Archive ar, LR r)
+        {
+            Preamble(ar, r);
+            var db = Drawbase(ar, r);
+            var (ds, _, _) = ar.ReadObject(r);          // the image's definition
+            var xform = r.F64s(12);
+            r.F64();                                     // constant 1.0
+            r.Utf16();                                    // source path
+            var guid = r.Raw(16);
+            return new ImageRec { Db = db, Def = ds, Xform = xform, Guid = LegacyBytes.ToHex(guid) };
+        }
+
+        /// <summary>A reference-to-entity tag: dimension connection points
+        /// and text leader attachments. Unlike ReadObject's back-ref path,
+        /// this tolerates a slot the walk has not reached yet - SketchUp
+        /// serializes a label/dimension BEFORE the entity it anchors to
+        /// when both live in the same entity list, so the reference can
+        /// legitimately point forward. Returns the slot number, or null
+        /// for a null reference.</summary>
+        internal static int? EntityRef(Archive? ar, LR r)
+        {
+            ushort tag = r.U16();
+            if (tag == 0) return null;
+            if (tag == 0x7FFF)
+            {
+                uint big = r.U32();
+                if ((big & 0x80000000) != 0)
+                {
+                    throw new LegacyParseError($"entity ref is a new object {r.Ctx()}");
+                }
+                return (int)big;
+            }
+            if (tag == 0xFFFF || (tag & 0x8000) != 0)
+            {
+                throw new LegacyParseError($"entity ref is a new object {r.Ctx()}");
+            }
+            return tag;
+        }
+
+        public static object ReadRelationship(Archive ar, LR r)
+        {
+            // two object pointers (small maps: two u16 back-refs - which
+            // read like the "u32" of the public notes; big maps escalate
+            // them to big-tags). They bind an annotation to the entity it
+            // labels, and the annotation side is routinely serialized
+            // BEFORE the geometry side - so these can point forward, past
+            // the walk cursor; EntityRef tolerates that where ReadObject's
+            // back-ref path (rightly) does not.
+            Preamble(ar, r);
+            EntityRef(ar, r);
+            EntityRef(ar, r);
+            return new RelationshipRec();
+        }
+
+        /// <summary>True when the u16 at <paramref name="at"/> starts an
+        /// object read in one of the UNAMBIGUOUS forms: null, escape, class
+        /// definition, or a class-ref to a class already known. Plain
+        /// object back-refs are excluded on purpose - any 2-byte junk below
+        /// 0x8000 would qualify, which is exactly the ambiguity this check
+        /// exists to avoid.</summary>
+        private static bool StrictNextTag(Archive ar, byte[] data, int at, bool allowNull = true)
+        {
+            if (at + 2 > data.Length) return false;
+            ushort t = Tlv.ReadU16(data, at);
+            if (t == 0x0000) return allowNull;
+            if (t == 0x7FFF || t == 0xFFFF) return true;
+            if ((t & 0x8000) != 0)
+            {
+                return ar.Slots.TryGetValue(t & 0x7FFF, out var ent) && ent.Kind == "class";
+            }
+            return false;
+        }
+
+        public static object ReadConstructionLine(Archive ar, LR r)
+        {
+            Preamble(ar, r);
+            Drawbase(ar, r);
+            var point = r.F64s(3);
+            var direction = r.F64s(3);
+            // Signed distance along `direction` from `point` marking where the visible segment
+            // starts/ends - ground truth (real SketchUp 2025, SDK/Ruby cross-checked): a bounded
+            // segment's start/end exactly equal point/direction scaled by these two parameters
+            // (verified against Sketchup::ConstructionLine#start/#end/#direction byte-for-byte,
+            // including the segment LENGTH as end_param); an unbounded direction uses a +-1e30
+            // sentinel, matching Sketchup::ConstructionLine#start/#end returning nil for that side.
+            var lineParams = r.F64s(2);
+            double startParam = lineParams[0], endParam = lineParams[1];
+            // The trailing block varies by the WRITING BUILD, not cleanly
+            // by version: 7 bytes on the v17 calibration corpus, 4 on v16
+            // and on a real v18, 0 on another real v17. Self-calibrate on
+            // the first guide line of the file - the length that lands on
+            // a legitimate next tag (strict forms only) - and cache it for
+            // the rest of the file.
+            int? k = ar.ClineTail;
+            if (k == null)
+            {
+                int def = ar.Ver == 17 ? 7 : 4;
+                var order = new List<int> { def };
+                foreach (var c in new[] { 0, 4, 7 }) if (c != def) order.Add(c);
+                // two passes: a zero tail full of padding can mimic a null
+                // tag, so only accept a null-anchored candidate when no
+                // candidate lands on a STRONG form (escape / known class /
+                // class definition)
+                foreach (var allowNull in new[] { false, true })
+                {
+                    foreach (var cand in order)
+                    {
+                        if (StrictNextTag(ar, r.Data, r.Pos + cand, allowNull))
+                        {
+                            k = cand;
+                            break;
+                        }
+                    }
+                    if (k != null) break;
+                }
+                if (k == null) k = def;
+                ar.ClineTail = k;
+            }
+            r.Raw(k.Value);
+
+            const double huge = 1e20; // well below the real +-1e30 sentinel, far above any real geometry extent
+            (double, double, double)? start = Math.Abs(startParam) >= huge
+                ? ((double, double, double)?)null
+                : (point[0] + direction[0] * startParam, point[1] + direction[1] * startParam, point[2] + direction[2] * startParam);
+            (double, double, double)? end = Math.Abs(endParam) >= huge
+                ? ((double, double, double)?)null
+                : (point[0] + direction[0] * endParam, point[1] + direction[1] * endParam, point[2] + direction[2] * endParam);
+            return new ConstructionLineRec
+            {
+                Point = (point[0], point[1], point[2]),
+                Direction = (direction[0], direction[1], direction[2]),
+                Start = start,
+                End = end,
+            };
+        }
+
+        public static object ReadConstructionPoint(Archive ar, LR r)
+        {
+            Preamble(ar, r);
+            var db = Drawbase(ar, r);
+            var pos = r.F64s(3);
+            r.F64s(3);
+            r.U8();
+            return new ConstructionPointRec { Db = db, Pos = pos };
+        }
+
+        public static object ReadSectionPlane(Archive ar, LR r)
+        {
+            Preamble(ar, r);
+            var db = Drawbase(ar, r);
+            double first = Tlv.ReadF64(r.Data, r.Pos);
+            if (!(Math.Abs(first) <= 1.0001))
+            {
+                ar.ReadObject(r);
+            }
+            var plane = r.F64s(4);
+            string name = "";
+            string label = "";
+            if (LegacyBytes.BytesEqual(r.Peek(3), 0, LegacyBytes.StrMarker))
+            {
+                name = r.Utf16();
+                label = r.Utf16();
+            }
+            return new SectionPlaneRec { Db = db, Plane = plane, Name = name, Label = label };
+        }
+
+        public static object ReadSkFont(Archive ar, LR r)
+        {
+            ar.ReadObject(r, "CAttributeContainer");
+            if (ar.HasPid)
+            {
+                // the mask byte says how many pid bytes follow (SketchUp 2017+ writes two or more here)
+                int mask = r.U8();
+                int n = 0;
+                for (int bit = 0; bit < 8; bit++) if ((mask & (1 << bit)) != 0) n++;
+                r.Raw(n);
+            }
+            r.Utf16();
+            r.Raw(15);
+            return new FontRec();
+        }
+
+        public static object ReadDimLinear(Archive ar, LR r)
+        {
+            Preamble(ar, r);
+            var db = Drawbase(ar, r);
+            string text = r.Utf16();
+            if (ar.Ver >= 6) ar.ReadObject(r, "CSkFont");
+            // The tail is NOT a fixed 165-byte blob: it embeds two object
+            // references (the dimension's connection points into the
+            // geometry). Each is a normal MFC tag - 2 bytes in small
+            // files, but 6 bytes once the archive holds more than 0x7FFE
+            // objects and the 0x7FFF big-tag escape kicks in - so a
+            // fixed-size skip walks off the rails exactly on large models
+            // (found on a real 17 MB SketchUp 2018 file whose dimension
+            // sat past object #517k).
+            //
+            // Each connection ref is followed by a second entity ref and two
+            // ref lists, [ref][u32 n1][n1 refs][u32 n2][n2 refs] - the
+            // INSTANCE PATHS of the anchored entity: the groups/components it
+            // lives in. A dimension on loose geometry has a null ref and two
+            // empty lists (the zeros the fixed 42/82-byte blocks used to
+            // skip); one anchored to a vertex inside nested groups carries a
+            // ref per group, and the fixed-size read slid off the record by
+            // exactly those refs - silently truncating the ROOT entity list
+            // after it, because the root reader stops at the first
+            // unreadable item. Every record is 161 fixed bytes plus its refs
+            // (openskp#384, the Python fix; found again on a real SketchUp
+            // 2017 cabinet, openskp#412).
+            // SketchUp 4 and 5 write neither the font object above nor the 5
+            // bytes in front of the first connection block, nor the trailing
+            // u32 of the last one.
+            r.Raw(ar.Ver >= 6 ? 37 : 32);
+            PathRef(rr => ar.ReadObject(rr).Slot, r);   // connection point 1 (may be null; may be written in full)
+            ConnectionPaths(rr => ar.ReadObject(rr).Slot, r, ar);
+            r.Raw(32);
+            PathRef(rr => ar.ReadObject(rr).Slot, r);   // connection point 2 (may be null; may be written in full)
+            ConnectionPaths(rr => ar.ReadObject(rr).Slot, r, ar);
+            r.Raw(ar.Ver >= 6 ? 72 : 68);
+            return new DimLinearRec { Db = db, Text = text };
+        }
+
+        /// <summary>What follows a dimension connection ref (see
+        /// <see cref="ReadDimLinear"/>): [entity ref][u32 n1][n1 refs][u32 n2]
+        /// [n2 refs]. <paramref name="readNewObject"/> reads a path entry that
+        /// MFC wrote in full (the first time anything pointed at it) and
+        /// returns its slot; <paramref name="ar"/>, when given, notes such an
+        /// entry for the entity list being read (see PathRef).</summary>
+        internal static (int? Extra, List<int?> First, List<int?> Second) ConnectionPaths(
+            Func<LR, int?> readNewObject, LR r, Archive? ar = null)
+        {
+            int? extra = EntityRef(null, r);
+            var lists = new List<int?>[2];
+            for (int k = 0; k < 2; k++)
+            {
+                uint count = r.U32();
+                if (count > 1000)
+                {
+                    throw new LegacyParseError($"implausible dimension path length {r.Ctx()}");
+                }
+                var refs = new List<int?>();
+                for (uint i = 0; i < count; i++)
+                {
+                    refs.Add(PathRef(readNewObject, r, i == 0 ? ar : null));
+                }
+                lists[k] = refs;
+            }
+            return (extra, lists[0], lists[1]);
+        }
+
+        /// <summary>One instance of a dimension's path. Usually a reference,
+        /// but MFC writes an object IN FULL the first time anything points at
+        /// it - and a dimension serialized before the group it is anchored in
+        /// carries that whole group right here (the root list later holds a
+        /// back-reference). Read it like any object then, so it is registered
+        /// and the stream stays aligned; return its slot either way. A path
+        /// runs from the outermost instance in, so its first one is an entity
+        /// of the list the annotation is in: <paramref name="member"/> is
+        /// given for it, and one written here in full is noted for that list
+        /// (see ReadEntityList).</summary>
+        private static int? PathRef(Func<LR, int?> readNewObject, LR r, Archive? member = null)
+        {
+            ushort tag = r.PeekU16();
+            bool isNew = tag == 0xFFFF || (tag != 0x7FFF && (tag & 0x8000) != 0);
+            if (tag == 0x7FFF)
+            {
+                isNew = (Tlv.ReadU32(r.Data, r.Pos + 2) & 0x80000000) != 0;
+            }
+            if (!isNew) return EntityRef(null, r);
+            int? slot = readNewObject(r);
+            if (member != null && slot != null && member.InlineStack.Count > 0)
+            {
+                member.InlineStack[member.InlineStack.Count - 1].Add(slot.Value);
+            }
+            return slot;
+        }
+
+        /// <summary>The text's string start: the variable-length variant
+        /// middle ends in an 11-byte block `01 00 00 00 ?? 00 &lt;arrow type&gt;
+        /// 00 00 00 01` right before it.</summary>
+        private static int TextDelimiter(LR r)
+        {
+            int p = r.Pos;
+            while (true)
+            {
+                int idx = LegacyBytes.FindBytes(r.Data, LegacyBytes.StrMarker, p, r.Pos + 512);
+                if (idx < 0)
+                {
+                    throw new LegacyParseError($"text delimiter not found {r.Ctx()}");
+                }
+                var blk = new byte[11];
+                Array.Copy(r.Data, idx - 11, blk, 0, 11);
+                if (blk[0] == 0x01 && blk[1] == 0x00 && blk[2] == 0x00 && blk[3] == 0x00
+                    && blk[6] <= 8 && blk[7] == 0x00 && blk[8] == 0x00 && blk[9] == 0x00
+                    && blk[10] == 1)
+                {
+                    return idx;
+                }
+                p = idx + 3;
+            }
+        }
+
+        /// <summary>Whether the text whose font ends at <paramref name="pos"/>
+        /// is anchored to an entity: after the two screen-fraction f64s comes
+        /// the connection block, [u32 type][u32 4][point3d], and a type other
+        /// than 0 or 1 (2, 4, 5 and 7 seen; see
+        /// docs/dimension-record-notes.md) anchors the label.</summary>
+        private static bool AnchoredConnection(byte[] data, int pos)
+        {
+            if (pos + 24 > data.Length) return false;
+            if (Tlv.ReadU32(data, pos + 20) != 4) return false;
+            uint kind = Tlv.ReadU32(data, pos + 16);
+            return kind >= 2 && kind <= 15;
+        }
+
+        public static object ReadText(Archive ar, LR r)
+        {
+            Preamble(ar, r);
+            var db = Drawbase(ar, r);
+            ar.ReadObject(r, "CSkFont");
+            if (AnchoredConnection(r.Data, r.Pos))
+            {
+                // An anchored connection block is followed, as a dimension's
+                // is (see ReadDimLinear), by the anchored entity's ref and
+                // its instance paths - and MFC writes a path instance IN FULL
+                // there when nothing has pointed at it before (a label
+                // anchored to a component instance serialized after it, its
+                // class declaration included when it is the file's first
+                // instance). Skipped as bytes, that instance never gets its
+                // store-map slots and every later reference is off by them
+                // ("class-ref to non-class slot"); read it instead.
+                r.Raw(16 + 32);
+                EntityRef(ar, r);
+                ConnectionPaths(rr => ar.ReadObject(rr).Slot, r, ar);
+            }
+            int idx = TextDelimiter(r);
+            r.Raw(idx - r.Pos);
+            string text = r.Utf16();
+            r.Raw(5);
+            // Optional leader-attachment refs follow the fixed tail (a
+            // text label anchored to geometry stores the anchored entities
+            // here; they can point FORWARD - see EntityRef). Only the
+            // escaped 6-byte form is recognisable without risk: a 2-byte
+            // back-ref here would be indistinguishable from the next list
+            // item's tag, and every known sample either has no attachments
+            // or lives in a >0x7FFE-object file where the escape is
+            // mandatory anyway.
+            while (r.Pos + 2 <= r.Data.Length && r.Data[r.Pos] == 0xFF && r.Data[r.Pos + 1] == 0x7F)
+            {
+                uint val = Tlv.ReadU32(r.Data, r.Pos + 2);
+                if ((val & 0x80000000) != 0) break;   // new-object tag - the next entity
+                r.Raw(6);
+            }
+            return new TextRec { Db = db, Text = text };
+        }
+
+        public static List<(int Slot, string? Name, object? Value)> ReadEntityList(Archive ar, LR r, long count, string owner)
+        {
+            ar.BurnStack.Add(0);
+            ar.InlineStack.Add(new List<int>());
+            try
+            {
+                var ents = ReadEntityListInner(ar, r, count, owner);
+                // An instance an annotation wrote in full (see PathRef) is one
+                // of this list's items, and the declared count holds it - but
+                // SketchUp does not always list it again with a back-reference
+                // (labels anchored to the loudspeakers of an auditorium: of
+                // five instances written in a definition's labels, three were
+                // listed again, two not). Keep the ones never listed, as the
+                // list's own entities.
+                foreach (int slot in ar.InlineStack[ar.InlineStack.Count - 1])
+                {
+                    if (ents.Count >= count) break;
+                    ar.Slots.TryGetValue(slot, out var ent);
+                    ents.Add((slot, ent?.Name, ent?.Value));
+                }
+                return ents;
+            }
+            finally
+            {
+                ar.BurnStack.RemoveAt(ar.BurnStack.Count - 1);
+                ar.InlineStack.RemoveAt(ar.InlineStack.Count - 1);
+            }
+        }
+
+        private static List<(int Slot, string? Name, object? Value)> ReadEntityListInner(Archive ar, LR r, long count, string owner)
+        {
+            var ents = new List<(int, string?, object?)>();
+            var inline = ar.InlineStack.Count > 0 ? ar.InlineStack[ar.InlineStack.Count - 1] : null;
+            while (ents.Count < count)
+            {
+                int p = r.Pos;
+                if (inline != null && inline.Count > 0 && ents.Count + inline.Count >= count)
+                {
+                    int? next = ar.PeekBackref(r);
+                    if (next == null || !inline.Contains(next.Value))
+                    {
+                        // every item left is an instance an annotation already
+                        // wrote in full and the list does not list again (see
+                        // ReadEntityList)
+                        break;
+                    }
+                }
+                bool hasBurnCredit = owner == "def" && ar.BurnStack.Count > 0 && ar.BurnStack[ar.BurnStack.Count - 1] > 0;
+                if (hasBurnCredit
+                    && p + 25 <= r.Data.Length
+                    && Tlv.ReadU32(r.Data, p) == 0
+                    && LegacyBytes.BytesEqual(r.Data, p + 22, LegacyBytes.StrMarker))
+                {
+                    // burned MapObject indices (see RegisterBurn) mean the
+                    // declared count includes phantom entities the stream
+                    // never carries; the definition tail signature (nrel=0
+                    // + pad + 16-byte GUID + name marker at +22) marks the
+                    // list's REAL end
+                    break;
+                }
+                bool prevFlag = ar.InEntityList;
+                ar.InEntityList = true;
+                int? s = null;
+                string? n = null;
+                object? v = null;
+                bool failed = false;
+                try
+                {
+                    (s, n, v) = ar.ReadObject(r);
+                }
+                catch (LegacyParseError)
+                {
+                    if (owner != "root" && !hasBurnCredit)
+                    {
+                        throw;
+                    }
+                    // owner == "root": over-declared root counts run into
+                    // the document tail - stop.
+                    // hasBurnCredit: this list had burned MapObject indices
+                    // (see RegisterBurn): the phantom connection points
+                    // were also counted as items, so the declared count
+                    // overshoots the real records. Stop at the failed item
+                    // - the definition tail that follows (nrel, GUID
+                    // anchor, thumbnail scan) validates the cut.
+                    failed = true;
+                }
+                finally
+                {
+                    ar.InEntityList = prevFlag;
+                }
+                if (failed)
+                {
+                    r.Pos = p;
+                    break;
+                }
+                inline?.Remove(s!.Value);
+                ents.Add((s!.Value, n, v));
+            }
+            return ents;
+        }
+
+        public static object ReadDefinition(Archive ar, LR r)
+        {
+            Preamble(ar, r);
+            // undecoded base block: 13 bytes in SketchUp 3, 19 in 4, 20 from 5,
+            // 22 from 2017
+            r.Raw(ar.Ver >= 17 ? 22 : ar.Ver >= 5 ? 20 : ar.Ver >= FirstV4 ? 19 : 13);
+            uint nlayers = r.U32();
+            if (nlayers > 10000)
+            {
+                throw new LegacyParseError($"implausible def layer count {r.Ctx()}");
+            }
+            // like the model-level layer list, the count is REAL layers
+            // (new records or back-refs); SketchUp 2020 interleaves null
+            // separators between them
+            int got = 0;
+            while (got < nlayers)
+            {
+                if (r.PeekU16() == 0)
+                {
+                    r.Pos += 2;
+                    continue;
+                }
+                ar.ReadObject(r, "CLayer");
+                got++;
+            }
+            if (ar.Ver == 19 && nlayers > 0 && r.PeekU16() == 0)
+            {
+                // SketchUp 2019 follows the LAST layer with a separator null
+                // too (2020 does as well, but its count recovery already
+                // absorbs it).
+                r.Pos += 2;
+            }
+            uint decl = r.U16();
+            if (decl == 0x7FFF)
+            {
+                decl = r.U32();
+            }
+            // v20 can drop its undocumented filler right here, swallowing
+            // the u32 field (and, behind a layer-separator null, even the
+            // decl itself): if the empty-string marker sits in the next
+            // few bytes, the real count is the first non-zero u32 after
+            // its padding.
+            uint? count = null;
+            if (ar.Ver >= 20)
+            {
+                count = LegacyBytes.RetryCountAfterV20Filler(r, r.Pos, 5_000_000, ar);
+            }
+            if (count == null)
+            {
+                r.U32();
+                count = r.U32();
+            }
+            // A zero count is as much a symptom of the v20 filler as an
+            // implausibly large one: the reader lands on the leading zero
+            // bytes of the filler instead of the count. A genuinely empty
+            // definition reads zero with no filler ahead, and
+            // RetryCountAfterV20Filler leaves those alone.
+            if (count > 5_000_000 || count == 0)
+            {
+                var retry = LegacyBytes.RetryCountAfterV20Filler(r, r.Pos - 4, 5_000_000, ar);
+                if (retry.HasValue) count = retry.Value;
+            }
+            if (count > 5_000_000)
+            {
+                throw new LegacyParseError($"implausible def entity count {r.Ctx()}");
+            }
+            var ents = ReadEntityList(ar, r, count.Value, "def");
+            uint nrel = r.U32();
+            if (nrel > 100000)
+            {
+                var retry = LegacyBytes.RetryCountAfterV20Filler(r, r.Pos - 4, 100_000, ar);
+                if (retry.HasValue) nrel = retry.Value;
+            }
+            if (nrel > 100000)
+            {
+                throw new LegacyParseError($"definition list misaligned {r.Ctx()}");
+            }
+            for (int i = 0; i < nrel; i++)
+            {
+                ar.ReadObject(r, "CRelationship");
+            }
+            r.U16();
+            // The GUID is followed immediately by the name string. Some
+            // files (SketchUp 2020) carry two extra bytes ahead of the GUID,
+            // which would shift this read and leave the cursor mid-record.
+            // Anchor on the string marker that must follow the 16 GUID
+            // bytes instead of trusting the fixed prefix width.
+            if (!LegacyBytes.BytesEqual(r.Data, r.Pos + 16, LegacyBytes.StrMarker))
+            {
+                for (int skip = 1; skip <= 4; skip++)
+                {
+                    int at = r.Pos + skip;
+                    if (LegacyBytes.BytesEqual(r.Data, at + 16, LegacyBytes.StrMarker))
+                    {
+                        r.Pos = at;
+                        break;
+                    }
+                }
+            }
+            var guid = r.Raw(16);
+            string name = r.Utf16();
+            r.Utf16();
+            r.Utf16();
+            r.U32();
+
+            int? tpos = null;
+            bool haveThumbSlot = ar.ClassSlot.TryGetValue("CThumbnail", out int thumbSlot);
+            for (int off = 0; off < 96; off++)
+            {
+                int p = r.Pos + off;
+                if (p + 16 <= r.Data.Length
+                    && r.Data[p] == 0xFF && r.Data[p + 1] == 0xFF
+                    && r.Data[p + 4] == 0x0a && r.Data[p + 5] == 0x00
+                    && LegacyBytes.MatchesAscii(r.Data, p + 6, "CThumbnail"))
+                {
+                    tpos = p;
+                    break;
+                }
+                if (haveThumbSlot && LegacyBytes.IsClassRef(r.Data, p, thumbSlot))
+                {
+                    tpos = p;
+                    break;
+                }
+            }
+            if (tpos == null)
+            {
+                throw new LegacyParseError($"definition tail: thumbnail not found {r.Ctx()}");
+            }
+            var gap = r.Raw(tpos.Value - r.Pos);
+            int behavior = gap.Length >= 9 ? gap[gap.Length - 9] : 0;
+            // the last u32 before the thumbnail is 1 for the definition of a group
+            // and 0 for a component's (what SketchUp's SUComponentDefinitionGetType
+            // reports), measured against SketchUp 2025's own counts
+            bool isGroup = gap.Length >= 4 && (gap[gap.Length - 4] | (gap[gap.Length - 3] << 8) | (gap[gap.Length - 2] << 16) | (gap[gap.Length - 1] << 24)) == 1;
+            ar.ReadObject(r, "CThumbnail");
+            return new DefinitionRec
+            {
+                Name = name,
+                Guid = LegacyBytes.ToHex(guid),
+                Ents = ents,
+                FacesCamera = (behavior & 1) != 0,
+                ShadowsFaceSun = (behavior & 2) != 0,
+                IsGroup = isGroup,
+            };
+        }
+
+        public static object ReadInstance(Archive ar, LR r)
+        {
+            var pre = Preamble(ar, r);
+            var db = Drawbase(ar, r);
+            var (ds, dn, _) = ar.ReadObject(r, "CComponentDefinition");
+            if (dn != "CComponentDefinition")
+            {
+                throw new LegacyParseError($"instance definition ref is {dn} {r.Ctx()}");
+            }
+            var xf = r.F64s(13);
+            // SketchUp 3 and 4 instances carry no name string (5 is the first
+            // to write one); where it is optional, take it only if a string
+            // is there.
+            string name = ar.Ver >= FirstNamedInstance || LegacyBytes.BytesEqual(r.Peek(3), 0, LegacyBytes.StrMarker) ? r.Utf16() : "";
+
+            // The trailing instance GUID is a version-14 (SketchUp 2014)
+            // addition for BOTH CComponentInstance and CGroup - gated by the
+            // file's own version, not by the class's reported schema. Schema
+            // doesn't generalize: a v7 file's CComponentInstance reports
+            // schema 6, and CGroup reports schema 1 on every version, so a
+            // schema gate is always true for it and forces a phantom 16-byte
+            // read on every pre-2014 group (openskp#284 / #310).
+            byte[] guid = ar.Ver >= 14 ? r.Raw(16) : Array.Empty<byte>();
+
+            return new InstanceRec { Db = db, Def = ds, Xf = xf, Name = name, Guid = LegacyBytes.ToHex(guid), Attrs = pre.Attrs as AttrsRec };
+        }
+
+        // SketchUp's Dynamic Components extension stores its data in an
+        // attribute dictionary literally named "dynamic_attributes" - a
+        // stable, publicly documented part of the SketchUp Ruby API
+        // (Entity#attribute_dictionary("dynamic_attributes")).
+        // ReadAttrContainer/ReadAttrNamed above already fully decode an
+        // entity's CAttributeContainer into typed (dict-name, {key: value})
+        // pairs for other purposes (CFaceTextureCoords lookup on faces) -
+        // this just looks up that one dictionary by name, mirroring what the
+        // VFF path's Geometry.ExtractDynamicProperties does for D007/DC05 TLV
+        // data.
+        private const string DynamicAttributesDictName = "dynamic_attributes";
+
+        /// <summary>Render an already-typed legacy attribute value (number,
+        /// string, list, or null) as a string, matching the string-valued
+        /// Dictionary&lt;string, string&gt; contract the VFF path's
+        /// Geometry.ExtractDynamicProperties produces.</summary>
+        public static string StringifyAttrValue(object? value)
+        {
+            if (value == null) return "";
+            if (value is System.Collections.IEnumerable list && !(value is string))
+            {
+                var parts = new List<string>();
+                foreach (var v in list) parts.Add(StringifyAttrValue(v));
+                return string.Join(",", parts);
+            }
+            return Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? "";
+        }
+
+        /// <summary>Extract Dynamic Component attribute key/value pairs from a
+        /// legacy entity's already-parsed CAttributeContainer, or {} when the
+        /// entity carries no attribute container or no dynamic_attributes
+        /// dictionary.</summary>
+        public static Dictionary<string, string> ExtractLegacyDynamicProperties(AttrsRec? attrs)
+        {
+            if (attrs == null) return new Dictionary<string, string>();
+            // Each child tuple's Name is the entity CLASS NAME (always
+            // 'CAttributeNamed', from Archive.ReadObject) - never the
+            // dictionary's own declared name, which lives in DictRec.Name.
+            foreach (var (_, value) in attrs.Children)
+            {
+                if (value is DictRec dict && dict.Name == DynamicAttributesDictName)
+                {
+                    var result = new Dictionary<string, string>();
+                    foreach (var kv in dict.Entries) result[kv.Key] = StringifyAttrValue(kv.Value);
+                    return result;
+                }
+            }
+            return new Dictionary<string, string>();
+        }
+
+        public static readonly Dictionary<string, LegacyReader> Readers = new Dictionary<string, LegacyReader>
+        {
+            ["CVertex"] = ReadVertex,
+            ["CEdge"] = ReadEdge,
+            ["CCurve"] = ReadCurve,
+            ["CArcCurve"] = ReadArcCurve,
+            ["CEdgeUse"] = ReadEdgeUse,
+            ["CLoop"] = ReadLoop,
+            ["CFace"] = ReadFace,
+            ["CLayer"] = ReadLayer,
+            ["CMaterial"] = ReadMaterial,
+            ["CDib"] = ReadDib,
+            ["CAttributeContainer"] = ReadAttrContainer,
+            ["CAttributeNamed"] = ReadAttrNamed,
+            ["CCamera"] = ReadCamera,
+            ["CThumbnail"] = ReadThumbnail,
+            ["CRelationship"] = ReadRelationship,
+            ["CComponentDefinition"] = ReadDefinition,
+            ["CImage"] = ReadImage,
+            ["CComponentInstance"] = ReadInstance,
+            ["CGroup"] = ReadInstance,
+            ["CFaceTextureCoords"] = ReadFtc,
+            ["CConstructionLine"] = ReadConstructionLine,
+            ["CConstructionPoint"] = ReadConstructionPoint,
+            ["CSectionPlane"] = ReadSectionPlane,
+            ["CSkFont"] = ReadSkFont,
+            ["CDimensionLinear"] = ReadDimLinear,
+            ["CText"] = ReadText,
+        };
+    }
+
+    internal static class Legacy
+    {
+        /// <summary>True when data is a classic (pre-2021) MFC-container .skp.</summary>
+        public static bool IsLegacy(byte[] data)
+        {
+            if (!(data.Length >= 4 && data[0] == 0xFF && data[1] == 0xFE && data[2] == 0xFF && data[3] == 0x0E))
+            {
+                return false;
+            }
+            int head100Len = Math.Min(0x100, data.Length);
+            if (LegacyBytes.FindBytes(data, new byte[] { 0x50, 0x4B, 0x03, 0x04 }, 0, head100Len) >= 0)
+            {
+                return false;
+            }
+            int head200Len = Math.Min(0x200, data.Length);
+            return LegacyBytes.FindBytes(data, Encoding.ASCII.GetBytes("CVersionMap"), 0, head200Len) >= 0;
+        }
+
+        private static readonly int?[] CMaterialPattern = BuildCMaterialPattern();
+        private static readonly int?[] CLayerPattern = BuildCLayerPattern();
+
+        private static int?[] BuildCMaterialPattern()
+        {
+            var prefix = new int?[] { 0xFF, 0xFF, null, null, 0x09, 0x00 };
+            var name = Encoding.ASCII.GetBytes("CMaterial").Select(b => (int?)b);
+            return prefix.Concat(name).ToArray();
+        }
+
+        private static int?[] BuildCLayerPattern()
+        {
+            var prefix = new int?[] { 0xFF, 0xFF, null, null, 0x06, 0x00 };
+            var name = Encoding.ASCII.GetBytes("CLayer").Select(b => (int?)b);
+            return prefix.Concat(name).ToArray();
+        }
+
+        private static int? FindVersionMajor(byte[] data)
+        {
+            int headLen = Math.Min(0x60, data.Length);
+            var stripped = new List<byte>();
+            for (int i = 0; i < headLen; i++)
+            {
+                if (data[i] != 0x00) stripped.Add(data[i]);
+            }
+            string text = Encoding.GetEncoding("ISO-8859-1").GetString(stripped.ToArray());
+            var m = System.Text.RegularExpressions.Regex.Match(text, @"\{(\d+)\.");
+            if (!m.Success) return null;
+            return int.Parse(m.Groups[1].Value);
+        }
+
+        internal sealed class WalkResult
+        {
+            public Archive Ar = null!;
+            public List<(int Slot, string? Name, object? Value)> Root = new List<(int, string?, object?)>();
+            public List<(int Slot, object? Value)> Layers = new List<(int, object?)>();
+            public List<(int Slot, object? Value)> Materials = new List<(int, object?)>();
+        }
+
+        /// <summary>Bootstrap the absolute slot base: parse material 1 with
+        /// a throwaway archive; material 2's class-ref tag names
+        /// CMaterial's true slot.</summary>
+        private static int BootstrapTwoMaterials(byte[] data, int ver, int matHdr)
+        {
+            var boot = new Archive(data, ver);
+            foreach (var kv in LegacyReaders.Readers) boot.Readers[kv.Key] = kv.Value;
+            boot.NextSlot = 1 << 20;
+            boot.WalkBase = 1 << 20;
+            boot.R.Pos = matHdr;
+            boot.ReadObject(boot.R, "CMaterial");
+            ushort tag = boot.R.PeekU16();
+            if (tag == 0xFFFF || (tag & 0x8000) == 0)
+            {
+                throw new LegacyParseError("cannot bootstrap the slot base");
+            }
+            return tag & 0x7FFF;
+        }
+
+        /// <summary>Slot-base candidates for files where the two-material
+        /// trick is unavailable (0 or 1 materials).
+        ///
+        /// Parse the model prefix (materials, layer list) with a throwaway
+        /// base; the object right after the layer list is the
+        /// definition-list anchor - an ABSOLUTE back-ref to the active
+        /// layer, an object we just allocated relatively. Each walked layer
+        /// yields one candidate base; with a single layer (the common case)
+        /// the answer is exact.</summary>
+        /// <summary>Internal (not private) so Create.cs's SkpBuilder
+        /// constructor can bootstrap the same slot base against the bundled
+        /// blank scaffold - the writer-side mirror of this reader-side
+        /// probe, same reasoning as the docs above.</summary>
+        internal static List<int> ProbeLayerAnchorBases(byte[] data, int ver, int start, uint matCount)
+        {
+            var boot = new Archive(data, ver);
+            foreach (var kv in LegacyReaders.Readers) boot.Readers[kv.Key] = kv.Value;
+            const int b0 = 1 << 20;
+            boot.NextSlot = b0;
+            boot.WalkBase = b0;
+            boot.R.Pos = start;
+            for (int i = 0; i < matCount; i++)
+            {
+                boot.ReadObject(boot.R, "CMaterial");
+            }
+            boot.R.U32();
+            if (ver >= 17)
+            {
+                boot.R.U8();
+            }
+            // SketchUp 3 writes no layer count: the layer records simply run
+            // until the definition-list anchor, which CollectTrailingLayers
+            // (below) already stops at. Reading a count here would consume the
+            // first layer record and reject every single-material V3 file.
+            uint layerCount = 0;
+            if (ver >= LegacyReaders.FirstV4)
+            {
+                layerCount = boot.R.U32();
+                if (layerCount < 1 || layerCount > 100000)
+                {
+                    throw new LegacyParseError("implausible layer count in base probe");
+                }
+            }
+            var layerSlots = new List<int>();
+            for (int i = 0; i < layerCount; i++)
+            {
+                var (s, _, _) = boot.ReadObject(boot.R, "CLayer");
+                // a null entry in the layer list has no slot, so it is no candidate (files saved
+                // through SketchUp's C API as 2019 or 2020 have one)
+                if (s != null) layerSlots.Add(s.Value);
+            }
+            boot.CollectTrailingLayers(layerSlots, null, true);
+            var (anchorSlot, anchorName, _) = boot.ReadObject(boot.R);
+            if (anchorName != "premodel")
+            {
+                // under the throwaway base every absolute back-ref classifies as
+                // premodel; anything else means the prefix did not parse
+                throw new LegacyParseError($"base probe: anchor resolved to {anchorName}");
+            }
+            var result = new List<int>();
+            foreach (var rel in layerSlots)
+            {
+                int candidate = anchorSlot!.Value - (rel - b0);
+                if (candidate > 0 && candidate < b0) result.Add(candidate);
+            }
+            return result;
+        }
+
+        private static WalkResult Walk(byte[] data)
+        {
+            int? ver = FindVersionMajor(data);
+            if (ver == null)
+            {
+                throw new LegacyParseError("no version string in header");
+            }
+
+            // anchor: the material manager (u32 count right before the first
+            // CMaterial new-class record); zero-material files have no
+            // CMaterial record anywhere, so fall back to the first CLayer
+            // class record and start at the layer-list marker just before it
+            int matHdr = LegacyBytes.FindPattern(data, CMaterialPattern);
+            int start;
+            uint matCount;
+            if (matHdr >= 0)
+            {
+                start = matHdr;
+                matCount = Tlv.ReadU32(data, matHdr - 4);
+                if (matCount > 100000)
+                {
+                    throw new LegacyParseError("implausible material count");
+                }
+            }
+            else
+            {
+                int layerHdr = LegacyBytes.FindPattern(data, CLayerPattern);
+                if (layerHdr < 0)
+                {
+                    throw new LegacyParseError("no CMaterial or CLayer class record found");
+                }
+                matCount = 0;
+                start = layerHdr - (ver >= 17 ? 9 : 8);
+            }
+
+            List<int> bases = matCount >= 2
+                ? new List<int> { BootstrapTwoMaterials(data, ver.Value, start) }
+                : ProbeLayerAnchorBases(data, ver.Value, start, matCount);
+
+            // Every candidate but the right one dies almost immediately (the
+            // slot numbers it hands out disagree with the file's own
+            // class-refs), while the right one only fails where the file
+            // really differs from what we know. So report the failure that
+            // got FURTHEST into the file - not the last candidate's, which is
+            // the earliest to fail and says nothing useful.
+            LegacyParseError? bestExc = null;
+            int bestAt = -1;
+            foreach (var b in bases)
+            {
+                try
+                {
+                    return WalkModel(data, ver.Value, start, matCount, b);
+                }
+                catch (LegacyParseError e)
+                {
+                    var m = System.Text.RegularExpressions.Regex.Match(e.Message, "@0x([0-9a-f]+)");
+                    int at = m.Success ? System.Convert.ToInt32(m.Groups[1].Value, 16) : -1;
+                    if (bestExc == null || at > bestAt)
+                    {
+                        bestExc = e;
+                        bestAt = at;
+                    }
+                }
+            }
+            if (bestExc != null) throw bestExc;
+            throw new LegacyParseError("no viable slot base candidate");
+        }
+
+        /// <summary>True when the bytes at <paramref name="at"/> begin a
+        /// CComponentDefinition record: its first-use class declaration, or a
+        /// class-ref to its known slot.</summary>
+        private static bool DefinitionStartsAt(Archive ar, byte[] data, int at)
+        {
+            if (at + 26 <= data.Length && data[at] == 0xFF && data[at + 1] == 0xFF
+                && LegacyBytes.MatchesAscii(data, at + 6, "CComponentDefinition"))
+            {
+                return true;
+            }
+            return ar.ClassSlot.TryGetValue("CComponentDefinition", out int defCls)
+                && LegacyBytes.IsClassRef(data, at, defCls);
+        }
+
+        private static WalkResult WalkModel(byte[] data, int ver, int start, uint matCount, int baseSlot)
+        {
+            var ar = new Archive(data, ver);
+            foreach (var kv in LegacyReaders.Readers) ar.Readers[kv.Key] = kv.Value;
+            ar.NextSlot = baseSlot;
+            ar.WalkBase = baseSlot;
+            var r = ar.R;
+
+            r.Pos = start;
+            var materials = new List<(int, object?)>();
+            for (int i = 0; i < matCount; i++)
+            {
+                var (s, _, v) = ar.ReadObject(r, "CMaterial");
+                materials.Add((s!.Value, v));
+            }
+
+            r.U32();
+            if (ver >= 17)
+            {
+                r.U8();
+            }
+            // SketchUp 3 writes no layer count: the layer records simply run
+            // until the definition-list anchor, which the loop below already
+            // stops at (a back-ref, not a layer record).
+            uint layerCount = ver < LegacyReaders.FirstV4 ? 1u << 30 : r.U32();
+            if (layerCount > 100000 && ver >= LegacyReaders.FirstV4)
+            {
+                throw new LegacyParseError("implausible layer count");
+            }
+            // layerCount counts REAL layers. SketchUp 2020 interleaves a
+            // null object-ref after each layer record (a separator, not a
+            // layer), so counting reads walks off mid-list on files with
+            // several layers; count parsed layers instead, skip the
+            // separators, and stop early if the next tag is a back-ref
+            // (the definition-list anchor) - a v20 variant where the count
+            // over-includes separators.
+            var layers = new List<(int, object?)>();
+            while (layers.Count < layerCount)
+            {
+                ushort tag = r.PeekU16();
+                if (tag == 0)
+                {
+                    r.Pos += 2;
+                    continue;
+                }
+                if (tag != 0xFFFF && (tag & 0x8000) == 0)
+                {
+                    break;
+                }
+                var (s, _, v) = ar.ReadObject(r, "CLayer");
+                if (v == null) continue;
+                layers.Add((s!.Value, v));
+            }
+            // trailing separators (and any layer records past the declared count)
+            ar.CollectTrailingLayers(null, layers);
+
+            var (_, dn, _) = ar.ReadObject(r);
+            if (dn != "CLayer")
+            {
+                throw new LegacyParseError($"definition-list anchor is {dn}, not a layer");
+            }
+            uint defCount = r.U32();
+            if (defCount > 1_000_000)
+            {
+                var retry = LegacyBytes.RetryCountAfterV20Filler(r, r.Pos - 4, 1_000_000, ar);
+                if (retry.HasValue)
+                {
+                    defCount = retry.Value;
+                    if (!DefinitionStartsAt(ar, r.Data, r.Pos))
+                    {
+                        // A model with NO component definitions has no
+                        // definition count to find: SketchUp 2020 writes its
+                        // filler where the count would be, and the first
+                        // count behind it is the ROOT entity count. The retry
+                        // cannot tell the two apart, so it handed the root
+                        // count over as a definition count - and the root
+                        // entities were then read (and silently dropped) as
+                        // "definitions". A real definition count is always
+                        // followed by a definition record; anything else
+                        // means this is the root count, so put it back.
+                        defCount = 0;
+                        r.Pos -= 4;
+                    }
+                }
+                else
+                {
+                    // No count behind the filler at all: an entirely empty model, whose root count is 0 (the retry
+                    // only accepts counts > 0).
+                    var rootCountAt = LegacyBytes.FindEmptyRootAfterV20Filler(r.Data, r.Pos - 4);
+                    if (rootCountAt.HasValue)
+                    {
+                        defCount = 0;
+                        r.Pos = rootCountAt.Value;
+                    }
+                }
+            }
+            if (defCount > 1_000_000)
+            {
+                throw new LegacyParseError("implausible definition count");
+            }
+            for (int i = 0; i < defCount; i++)
+            {
+                ar.ReadObject(r, "CComponentDefinition");
+            }
+
+            bool haveDefCls = ar.ClassSlot.TryGetValue("CComponentDefinition", out int defCls);
+            while (true)
+            {
+                ushort tag = r.PeekU16();
+                bool isDef = haveDefCls && tag == (0x8000 | defCls);
+                if (!isDef && tag == 0xFFFF && LegacyBytes.MatchesAscii(r.Peek(26), 6, "CComponentDefinition"))
+                {
+                    isDef = true;
+                }
+                if (!isDef) break;
+                ar.ReadObject(r);
+            }
+
+            uint rootCount = r.U32();
+            if (rootCount > 5_000_000)
+            {
+                var retry = LegacyBytes.RetryCountAfterV20Filler(r, r.Pos - 4, 5_000_000, ar);
+                if (retry.HasValue) rootCount = retry.Value;
+            }
+            if (rootCount > 5_000_000)
+            {
+                throw new LegacyParseError("implausible root entity count");
+            }
+            var root = LegacyReaders.ReadEntityList(ar, r, rootCount, "root");
+
+            return new WalkResult { Ar = ar, Root = root, Layers = layers, Materials = materials };
+        }
+
+        // ── adapter to the shared raw-parse shape ─────────────────────────
+
+        /// <summary>Mirror of Geometry.cs's GeometryBuilder, kept
+        /// dependency-free from the VFF-specific TLV machinery.</summary>
+        internal sealed class LegacyBuilder
+        {
+            public Dictionary<long, (double X, double Y, double Z)> Vertices = new Dictionary<long, (double, double, double)>();
+            public Dictionary<long, (long? V1, long? V2)> Edges = new Dictionary<long, (long?, long?)>();
+            public Dictionary<long, int> EdgeFlags = new Dictionary<long, int>();
+            public Dictionary<long, long> EdgeCurves = new Dictionary<long, long>();
+            public Dictionary<long, ArcFrame> ArcCurves = new Dictionary<long, ArcFrame>();
+            public Dictionary<long, GeometryBuilderFace> Faces = new Dictionary<long, GeometryBuilderFace>();
+            public List<GeometryBuilderInstance> Instances = new List<GeometryBuilderInstance>();
+            public List<SectionPlane> SectionPlanes = new List<SectionPlane>();
+            public List<TextEntity> Texts = new List<TextEntity>();
+            public List<Dimension> Dimensions = new List<Dimension>();
+            public List<ConstructionLine> ConstructionLines = new List<ConstructionLine>();
+            public List<ConstructionPoint> ConstructionPoints = new List<ConstructionPoint>();
+        }
+
+        private static void AddEdge(LegacyBuilder builder, int slot, EdgeRec e, Dictionary<int, SlotEntry> slots)
+        {
+            if (builder.Edges.ContainsKey(slot)) return;
+            foreach (var vs in new[] { e.V1, e.V2 })
+            {
+                if (vs == null) continue;
+                if (slots.TryGetValue(vs.Value, out var ent) && ent.Value != null && !builder.Vertices.ContainsKey(vs.Value))
+                {
+                    var xyz = ((VertexRec)ent.Value).Xyz;
+                    builder.Vertices[vs.Value] = (xyz[0], xyz[1], xyz[2]);
+                }
+            }
+            builder.Edges[slot] = (e.V1, e.V2);
+            var db = e.Db;
+            int flags = (db.Soft != 0 ? 0x08 : 0) | (db.Smooth != 0 ? 0x10 : 0) | (db.Hidden != 0 ? 0x01 : 0);
+            if (flags != 0)
+            {
+                builder.EdgeFlags[slot] = flags;
+            }
+            // The edge's parent Curve (the CCurve/CArcCurve slot) and, if that curve is an
+            // analytic arc, its frame: it arrives on the edge that first references the
+            // CArcCurve; every later edge on the arc back-refs it.
+            if (e.Curve != null)
+            {
+                builder.EdgeCurves[slot] = e.Curve.Value;
+                if (e.CurveValue is ArcCurveRec arc)
+                {
+                    builder.ArcCurves[e.Curve.Value] = arc.Frame;
+                }
+            }
+        }
+
+        private static void FillBuilder(LegacyBuilder builder, List<(int Slot, string? Name, object? Value)> ents, Dictionary<int, SlotEntry> slots)
+        {
+            foreach (var (s, _, v) in ents)
+            {
+                if (v == null) continue;
+                if (v is EdgeRec edgeRec)
+                {
+                    AddEdge(builder, s, edgeRec, slots);
+                }
+                else if (v is ArcCurveRec arcRec)
+                {
+                    builder.ArcCurves[s] = arcRec.Frame;
+                }
+                else if (v is FaceRec faceRec)
+                {
+                    var loops = new List<List<(long EdgeId, long Orientation)>>();
+                    foreach (var lp in faceRec.Loops)
+                    {
+                        var loop = new List<(long, long)>();
+                        foreach (var u in lp.Uses)
+                        {
+                            int? es = u.Edge;
+                            if (es == null || !slots.TryGetValue(es.Value, out var ent) || ent.Value == null) continue;
+                            AddEdge(builder, es.Value, (EdgeRec)ent.Value, slots);
+                            // Normalize to the documented CoEdge contract (+1 = same
+                            // direction as the edge, -1 = reversed) - u.Sense is the raw
+                            // SketchUp bit (0 = forward, 1 = reversed).
+                            loop.Add((es.Value, u.Sense != 0 ? -1 : 1));
+                        }
+                        loops.Add(loop);
+                    }
+                    var face = new GeometryBuilderFace
+                    {
+                        Loops = loops,
+                        Normal = (faceRec.Plane[0], faceRec.Plane[1], faceRec.Plane[2]),
+                        MaterialId = faceRec.Db.Mat != 0 ? faceRec.Db.Mat : (long?)null,
+                        BackMaterialId = faceRec.BackMat != 0 ? faceRec.BackMat : (long?)null,
+                        UvTransform = null,
+                        UvTransformBack = null,
+                        Hidden = faceRec.Db.Hidden != 0,
+                    };
+                    var attrs = faceRec.Attrs;
+                    if (attrs != null)
+                    {
+                        foreach (var (_, cv) in attrs.Children)
+                        {
+                            if (cv is FtcRec ftc)
+                            {
+                                face.UvTransform = (double[])ftc.Front.Clone();
+                                face.UvTransformBack = (double[])ftc.Back.Clone();
+                                face.UvProjected = ftc.FrontProjected;
+                                face.UvProjectedBack = ftc.BackProjected;
+                            }
+                        }
+                    }
+                    builder.Faces[s] = face;
+                }
+                else if (v is InstanceRec instRec)
+                {
+                    builder.Instances.Add(new GeometryBuilderInstance
+                    {
+                        Offset = 0,
+                        Name = instRec.Name,
+                        RefIdx = instRec.Def,
+                        RefGuid = "",
+                        Matrix = instRec.Xf.ToList(),
+                        MaterialId = instRec.Db.Mat != 0 ? instRec.Db.Mat : (long?)null,
+                        Hidden = instRec.Db.Hidden != 0,
+                        LayerId = instRec.Db.Layer != 0 ? instRec.Db.Layer : (long?)null,
+                        Children = new List<TlvNode>(),
+                        Properties = LegacyReaders.ExtractLegacyDynamicProperties(instRec.Attrs),
+                    });
+                }
+                else if (v is ImageRec imgRec)
+                {
+                    // Placed exactly like an ordinary component instance -
+                    // same transform/definition-reference shape - the only
+                    // difference is the definition it points at is flagged
+                    // IsImage=true (set below via imageDefIds), matching
+                    // how the VFF/modern reader already treats an Image
+                    // entity as "a component placed through the same
+                    // instance machinery as any other". Previously
+                    // dropped here entirely: this record matched none of
+                    // the branches above, so an Image entity parsed
+                    // without error but never appeared anywhere a caller
+                    // could see it.
+                    builder.Instances.Add(new GeometryBuilderInstance
+                    {
+                        Offset = 0,
+                        Name = "",
+                        RefIdx = imgRec.Def,
+                        RefGuid = imgRec.Guid,
+                        Matrix = imgRec.Xform.ToList(),
+                        MaterialId = imgRec.Db.Mat != 0 ? imgRec.Db.Mat : (long?)null,
+                        Hidden = imgRec.Db.Hidden != 0,
+                        LayerId = imgRec.Db.Layer != 0 ? imgRec.Db.Layer : (long?)null,
+                        Children = new List<TlvNode>(),
+                        Properties = new Dictionary<string, string>(),
+                    });
+                }
+                else if (v is SectionPlaneRec spRec)
+                {
+                    builder.SectionPlanes.Add(new SectionPlane
+                    {
+                        Plane = spRec.Plane,
+                        Name = spRec.Name,
+                        Label = spRec.Label,
+                        Hidden = spRec.Db.Hidden != 0
+                    });
+                }
+                else if (v is TextRec trRec)
+                {
+                    builder.Texts.Add(new TextEntity
+                    {
+                        Text = trRec.Text,
+                        Hidden = trRec.Db.Hidden != 0
+                    });
+                }
+                else if (v is DimLinearRec dlRec)
+                {
+                    builder.Dimensions.Add(new Dimension
+                    {
+                        Text = dlRec.Text,
+                        Hidden = dlRec.Db.Hidden != 0
+                    });
+                }
+                else if (v is ConstructionLineRec clRec)
+                {
+                    builder.ConstructionLines.Add(new ConstructionLine
+                    {
+                        Point = clRec.Point,
+                        Direction = clRec.Direction,
+                        Start = clRec.Start,
+                        End = clRec.End,
+                    });
+                }
+                else if (v is ConstructionPointRec cpRec)
+                {
+                    builder.ConstructionPoints.Add(new ConstructionPoint
+                    {
+                        Position = (cpRec.Pos[0], cpRec.Pos[1], cpRec.Pos[2]),
+                    });
+                }
+            }
+        }
+
+        /// <summary>Parse a classic MFC .skp into the shared raw-parse shape
+        /// (Core.RawParsed), which Parser.cs converts to the public
+        /// SkpModel exactly like the VFF path.</summary>
+        public static Core.RawParsed FullParseLegacy(byte[] data, SkpParseOptions? options = null)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            Observability.Log(options, SkpLogLevel.Information, $"Parsing legacy buffer ({data.Length} bytes)");
+
+            string version = "unknown";
+            int second = LegacyBytes.FindBytes(data, LegacyBytes.StrMarker, 4);
+            if (second > 0)
+            {
+                int start = second + 4;
+                int len = Math.Min(100, data.Length - start);
+                string text = Encoding.Unicode.GetString(data, start, len);
+                int braceStart = text.IndexOf('{');
+                int braceEnd = text.IndexOf('}');
+                if (braceStart >= 0 && braceEnd >= 0)
+                {
+                    version = text.Substring(braceStart, braceEnd - braceStart + 1);
+                }
+            }
+            Observability.Log(options, SkpLogLevel.Debug, $"Detected legacy version {version}");
+
+            WalkResult walkResult;
+            try
+            {
+                walkResult = Walk(data);
+            }
+            catch (LegacyParseError e)
+            {
+                throw new SkpParseException($"legacy .skp parse failed: {e.Message}", stage: "legacy_walk", innerException: e);
+            }
+
+            var ar = walkResult.Ar;
+            var slots = ar.Slots;
+            Observability.Log(
+                options, SkpLogLevel.Debug,
+                $"Legacy walk complete: {walkResult.Materials.Count} materials, {walkResult.Layers.Count} layers");
+
+            var materialsMap = new Dictionary<string, Geometry.RawMaterial>();
+            var materialIdToName = new Dictionary<long, string>();
+            foreach (var (s, vObj) in walkResult.Materials)
+            {
+                var v = (MaterialRec)vObj!;
+                byte[] rgba = v.Rgba;
+                double trans = v.UseOpacity != 0 ? Math.Min(Math.Max(1.0 - v.Opacity, 0.0), 1.0) : 1.0;
+                bool colorized = v.Colorized;
+                Geometry.RawTexture? texture = null;
+                if (v.HasTexture)
+                {
+                    byte[]? texData = null;
+                    if (v.TexDib != null && slots.TryGetValue(v.TexDib.Value, out var dibEnt) && dibEnt.Value is DibRec dibRec)
+                    {
+                        texData = dibRec.Data;
+                    }
+                    else if (v.TexData != null)
+                    {
+                        texData = v.TexData;
+                    }
+                    bool isPng = texData != null && texData.Length >= 4
+                        && texData[0] == 0x89 && texData[1] == 0x50 && texData[2] == 0x4E && texData[3] == 0x47;
+                    string ext = isPng ? ".png" : ".jpg";
+                    string fname = v.TexFile.Length > 0 ? v.TexFile : v.Name + ext;
+                    texture = new Geometry.RawTexture { Filename = fname, XScale = v.TexW, YScale = v.TexH, Data = texData };
+                }
+                var matObj = new Geometry.RawMaterial
+                {
+                    Name = v.Name,
+                    R = rgba[0],
+                    G = rgba[1],
+                    B = rgba[2],
+                    A = rgba.Length > 3 ? rgba[3] : 255,
+                    Transparency = trans,
+                    Colorized = colorized,
+                    ColorizeType = v.ColorizeType,
+                    Texture = texture,
+                };
+                materialsMap[v.Name] = matObj;
+                materialIdToName[s] = v.Name;
+            }
+
+            var layerColors = new Dictionary<string, (int, int, int)>();
+            var layerHidden = new Dictionary<string, bool>();
+            var layerIdToName = new Dictionary<long, string>();
+            foreach (var (s, vObj) in walkResult.Layers)
+            {
+                var v = (LayerRec)vObj!;
+                byte[] rgba = v.Rgba;
+                layerColors[v.Name] = (rgba[0], rgba[1], rgba[2]);
+                layerHidden[v.Name] = v.Hidden != 0;
+                layerIdToName[s] = v.Name;
+            }
+            if (!layerColors.ContainsKey("Layer0"))
+            {
+                layerColors["Layer0"] = (136, 136, 136);
+            }
+            if (!layerHidden.ContainsKey("Layer0"))
+            {
+                layerHidden["Layer0"] = false;
+            }
+
+            // Scanned before the definitions loop below so IsImage can be
+            // set correctly the first time a definition is built, matching
+            // the VFF reader's RawDefinition.IsImage field.
+            var imageDefIds = new HashSet<int>();
+            foreach (var kv in slots)
+            {
+                if (kv.Value.Kind == "obj" && kv.Value.Name == "CImage" && kv.Value.Value is ImageRec imgDefRec
+                    && imgDefRec.Def.HasValue)
+                {
+                    imageDefIds.Add(imgDefRec.Def.Value);
+                }
+            }
+
+            var defsDict = new Dictionary<long, Geometry.RawDefinition>();
+            int processed = 0;
+            long lastSlot = -1;
+            try
+            {
+                foreach (var kv in slots)
+                {
+                    lastSlot = kv.Key;
+                    if (kv.Value.Kind == "obj" && kv.Value.Name == "CComponentDefinition" && kv.Value.Value != null)
+                    {
+                        var d = (DefinitionRec)kv.Value.Value;
+                        var b = new LegacyBuilder();
+                        FillBuilder(b, d.Ents, slots);
+                        defsDict[kv.Key] = new Geometry.RawDefinition
+                        {
+                            Guid = d.Guid,
+                            Name = d.Name,
+                            IsImage = imageDefIds.Contains((int)kv.Key),
+                            IsGroup = d.IsGroup,
+                            AlwaysFacesCamera = d.FacesCamera,
+                            ShadowsFaceSun = d.ShadowsFaceSun,
+                            Builder = ToGeometryBuilder(b),
+                        };
+                        processed++;
+                        if (processed % ParseTuning.ProgressInterval == 0)
+                        {
+                            Observability.Progress(options, "legacy_defs", processed, processed);
+                            Observability.Log(options, SkpLogLevel.Debug, $"Processed {processed} component definitions");
+                        }
+                    }
+                }
+            }
+            catch (Exception e) when (!(e is SkpParseException))
+            {
+                throw new SkpParseException(
+                    $"Failed while building component definitions: {e.Message}",
+                    stage: "legacy_defs", definitionId: lastSlot, innerException: e);
+            }
+
+            var rootBuilder = new LegacyBuilder();
+            FillBuilder(rootBuilder, walkResult.Root, slots);
+
+            Observability.Log(
+                options, SkpLogLevel.Information,
+                $"Parse complete: {defsDict.Count} defs ({sw.Elapsed.TotalSeconds:F2}s)");
+
+            // Scenes come from the scene list in the document tail (see LegacyPages).
+            var pages = LegacyPages.ReadPageList(data, ar) ?? new List<RawPage>();
+
+            return new Core.RawParsed
+            {
+                Version = version,
+                Pages = pages,
+                // Legacy (pre-2021 MFC) files carry no meta/meta.dat
+                // container - that's a VFF/ZIP-only construct - so there
+                // is no known source for the model's unit-system string
+                // here.
+                Units = null,
+                LayerColors = layerColors,
+                LayerHidden = layerHidden,
+                LayerIdToName = layerIdToName,
+                MaterialIdToName = materialIdToName,
+                Materials = materialsMap,
+                MaterialsByFolder = new Dictionary<string, Geometry.RawMaterial>(),
+                Styles = new List<Geometry.RawStyle>(),
+                DefsDict = defsDict,
+                Root = new Geometry.RawDefinition
+                {
+                    Guid = "ROOT",
+                    Name = "ROOT_MODEL",
+                    IsImage = false,
+                    AlwaysFacesCamera = false,
+                    Builder = ToGeometryBuilder(rootBuilder),
+                },
+            };
+        }
+
+        /// <summary>LegacyBuilder and GeometryBuilder hold identical shapes;
+        /// copy across so the rest of the pipeline (Parser.cs) only needs to
+        /// know about GeometryBuilder.</summary>
+        private static GeometryBuilder ToGeometryBuilder(LegacyBuilder b)
+        {
+            var g = new GeometryBuilder();
+            foreach (var kv in b.Vertices) g.Vertices[kv.Key] = kv.Value;
+            foreach (var kv in b.Edges) g.Edges[kv.Key] = kv.Value;
+            foreach (var kv in b.EdgeFlags) g.EdgeFlags[kv.Key] = kv.Value;
+            foreach (var kv in b.EdgeCurves) g.EdgeCurves[kv.Key] = kv.Value;
+            foreach (var kv in b.ArcCurves) g.ArcCurves[kv.Key] = kv.Value;
+            foreach (var kv in b.Faces) g.Faces[kv.Key] = kv.Value;
+            g.Instances = b.Instances;
+            // SectionPlanes/Texts/Dimensions were already correctly read
+            // into LegacyBuilder (see FillBuilder's own dispatch for
+            // SectionPlaneRec/TextRec/DimRec above) but never copied across
+            // this conversion - the same "already-decoded-but-discarded"
+            // shape as this file's earlier layer/face/instance-hidden and
+            // attribute-container fixes, just one level deeper. Legacy-only
+            // by design (matching Python's own legacy.py; VFF/2021+ files
+            // don't extract these at all yet in any language - openskp#285).
+            g.SectionPlanes = b.SectionPlanes;
+            g.Texts = b.Texts;
+            g.Dimensions = b.Dimensions;
+            // ConstructionLines/ConstructionPoints: same reader-already-
+            // captures-it-but-never-copies-it gap as SectionPlanes/Texts/
+            // Dimensions above - ReadConstructionLine/ReadConstructionPoint
+            // (and now the ConstructionLineRec/ConstructionPointRec dispatch
+            // in FillBuilder) already carried real point/direction/start/end
+            // data, but this conversion step never forwarded it (openskp#285).
+            g.ConstructionLines = b.ConstructionLines;
+            g.ConstructionPoints = b.ConstructionPoints;
+            return g;
+        }
+    }
+}

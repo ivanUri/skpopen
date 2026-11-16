@@ -1,0 +1,367 @@
+using System;
+using System.Collections.Generic;
+
+namespace OpenSkp
+{
+    public sealed class Vertex
+    {
+        public long Id { get; set; }
+        public double X { get; set; }
+        public double Y { get; set; }
+        public double Z { get; set; }
+    }
+
+    public sealed class Edge
+    {
+        public long Id { get; set; }
+        public long V1Id { get; set; }
+        public long V2Id { get; set; }
+        public bool Soft { get; set; }
+        public bool Smooth { get; set; }
+        public bool Hidden { get; set; }
+        /// <summary>SketchUp's own <c>Edge#curve</c> grouping: the id of the Curve this edge belongs
+        /// to, or null when it belongs to none. Edges sharing a CurveId were drawn as one continuous
+        /// multi-segment line or arc; if the curve is an arc, <see cref="Definition.Arcs"/> has it
+        /// under the same id.</summary>
+        public long? CurveId { get; set; }
+    }
+
+    /// <summary>The analytic arc behind a curve: SketchUp's own <c>ArcCurve</c>. A curve SketchUp drew
+    /// as an arc or a circle is a run of straight edges (<see cref="Edge.CurveId"/>) and also this
+    /// exact description. The arc is the set of points <c>Center + cos(t) * XAxis + sin(t) * YAxis</c>
+    /// for t from <see cref="StartAngle"/> to <see cref="EndAngle"/>. For a circle XAxis and YAxis
+    /// are perpendicular and both of length <see cref="Radius"/>; an arc scaled non-uniformly keeps
+    /// its arc identity and stores an affine image of a circle, where they are not (then Radius is
+    /// the length of XAxis only). Arcs and circles that bound a face are arcs too. Lengths are in
+    /// the model's units (inches), in the definition's local space, like <see cref="Vertex.X"/>.</summary>
+    public sealed class ArcCurve
+    {
+        public (double X, double Y, double Z) Center { get; set; }
+        /// <summary>Unit normal of the arc's plane.</summary>
+        public (double X, double Y, double Z) Normal { get; set; }
+        /// <summary>Vector from the centre to the arc's start (length = radius).</summary>
+        public (double X, double Y, double Z) XAxis { get; set; }
+        /// <summary><c>Normal x XAxis</c>.</summary>
+        public (double X, double Y, double Z) YAxis { get; set; }
+        /// <summary>Start parameter in radians.</summary>
+        public double StartAngle { get; set; }
+        /// <summary>End parameter in radians. A full circle has EndAngle == StartAngle in a classic
+        /// (pre-2021) file and StartAngle + 2 pi in a 2021+ file; <see cref="IsFullCircle"/> covers
+        /// both.</summary>
+        public double EndAngle { get; set; }
+        public double Radius => Math.Sqrt(XAxis.X * XAxis.X + XAxis.Y * XAxis.Y + XAxis.Z * XAxis.Z);
+        public bool IsFullCircle
+        {
+            get
+            {
+                double sweep = (EndAngle - StartAngle) % (2.0 * Math.PI);
+                if (sweep < 0) sweep += 2.0 * Math.PI;
+                return Math.Min(sweep, 2.0 * Math.PI - sweep) < 1e-9;
+            }
+        }
+    }
+
+    public sealed class Face
+    {
+        public long Id { get; set; }
+
+        /// <summary>Ordered list of loops; each loop is a list of
+        /// (edgeId, orientation) pairs where orientation is 1 for forward or
+        /// -1 for reversed.</summary>
+        public List<List<(long EdgeId, long Orientation)>> Loops { get; set; } = new List<List<(long, long)>>();
+
+        public (double Nx, double Ny, double Nz)? Normal { get; set; }
+        public long? MaterialId { get; set; }
+        public long? BackMaterialId { get; set; }
+
+        /// <summary>Per-face texture mapping for a positioned/photo-fitted
+        /// texture (SketchUp's pins), or null when the default projection
+        /// applies. A 9-element row-major 3x3 matrix mapping texture space to
+        /// the face plane.</summary>
+        public double[]? UvTransform { get; set; }
+        public double[]? UvTransformBack { get; set; }
+
+        /// <summary>The texture is PROJECTED (e.g. the Add Location terrain
+        /// drape): its UVs run in the projection plane's frame, not the face
+        /// frame.</summary>
+        public bool UvProjected { get; set; }
+
+        /// <summary>Same for the face's back side.</summary>
+        public bool UvProjectedBack { get; set; }
+
+        /// <summary>Whether the face is hidden (SketchUp's "Hide" on this
+        /// specific face, not a layer/tag visibility toggle).</summary>
+        public bool Hidden { get; set; }
+    }
+
+    public sealed class Layer
+    {
+        public string Name { get; set; } = "";
+        public int ColorR { get; set; } = 200;
+        public int ColorG { get; set; } = 200;
+        public int ColorB { get; set; } = 200;
+
+        /// <summary>Whether the layer's visibility is switched off. Only
+        /// populated for legacy (pre-2021 MFC) files, where the byte is read
+        /// directly from the layer record - modern (VFF) files derive layers
+        /// from Layer_&lt;name&gt;-prefixed materials, which carry no
+        /// visibility data, so this is always false there.</summary>
+        public bool Hidden { get; set; }
+    }
+
+    public sealed class Style
+    {
+        public string Name { get; set; } = "";
+        public (int R, int G, int B)? FrontColor { get; set; }
+        public (int R, int G, int B)? BackColor { get; set; }
+    }
+
+    public sealed class Texture
+    {
+        public string Filename { get; set; } = "";
+        public double Width { get; set; }
+        public double Height { get; set; }
+        public byte[]? Data { get; set; }
+
+        public System.IO.FileInfo Save(string filepath)
+        {
+            if (Data == null)
+            {
+                throw new System.InvalidOperationException($"Texture '{Filename}' has no image data");
+            }
+            System.IO.File.WriteAllBytes(filepath, Data);
+            return new System.IO.FileInfo(filepath);
+        }
+    }
+
+    public sealed class Material
+    {
+        public string Name { get; set; } = "";
+        public (int R, int G, int B, int A) Color { get; set; } = (200, 200, 200, 255);
+        public double Transparency { get; set; } = 1.0;
+
+        /// <summary>Numeric material ID from the TLV stream - the value that
+        /// Face.MaterialId references. Null when the file assigns the
+        /// material no ID.</summary>
+        public long? Id { get; set; }
+
+        public Texture? Texture { get; set; }
+        public bool Colorized { get; set; }
+        public int ColorizeType { get; set; }
+    }
+
+    public sealed class Instance
+    {
+        public string Name { get; set; } = "";
+        public long? RefIdx { get; set; }
+        public string Guid { get; set; } = "";
+
+        /// <summary>4x4 transform stored as a flat 16-element list in
+        /// column-major order (empty when the entity carried none).</summary>
+        public List<double> Matrix { get; set; } = new List<double>();
+
+        /// <summary>This instance's own explicit layer override, or ""
+        /// when it has none. An instance without an explicit override
+        /// inherits its *placement's* layer, which can only be resolved
+        /// once the scene graph is flattened - see
+        /// SkpFile.BuildScene()'s InstanceNode.Layer for that resolved
+        /// value.</summary>
+        public string Layer { get; set; } = "";
+
+        /// <summary>Arbitrary key/value dynamic attributes attached
+        /// directly to this instance (SketchUp's Dynamic Components).</summary>
+        public Dictionary<string, string> Properties { get; set; } = new Dictionary<string, string>();
+        public long? MaterialId { get; set; }
+
+        /// <summary>Whether the instance itself is hidden (SketchUp's "Hide"
+        /// on this specific component/group placement, not a layer/tag
+        /// visibility toggle).</summary>
+        public bool Hidden { get; set; }
+    }
+
+    public sealed class SectionPlane
+    {
+        public double[] Plane { get; set; } = new double[] { 0.0, 0.0, 1.0, 0.0 };
+        public string Name { get; set; } = "";
+        public string Label { get; set; } = "";
+        public bool Hidden { get; set; }
+    }
+
+    public sealed class TextEntity
+    {
+        public string Text { get; set; } = "";
+        public bool Hidden { get; set; }
+    }
+
+    /// <summary>A linear dimension (SketchUp's Dimension tool).
+    ///
+    /// The legacy (pre-2021) reader recovers only Text/Hidden. The VFF
+    /// reader (2021+) recovers the full geometry - see
+    /// <see cref="SkpModel.Dimensions"/> for the model-level, world-space
+    /// list.</summary>
+    public sealed class Dimension
+    {
+        /// <summary>The displayed text. Empty when the dimension shows its
+        /// auto-computed measured value (the caller formats |B - A|).</summary>
+        public string Text { get; set; } = "";
+        public bool Hidden { get; set; }
+
+        /// <summary>First measured point (x, y, z) in inches (world space),
+        /// or null when only the text was recovered.</summary>
+        public (double X, double Y, double Z)? A { get; set; }
+
+        /// <summary>Second measured point.</summary>
+        public (double X, double Y, double Z)? B { get; set; }
+
+        /// <summary>Offset distance (inches) - how far the dimension line
+        /// sits from the A-B segment, along the in-plane perpendicular.</summary>
+        public double Offset { get; set; }
+
+        /// <summary>Historical name: for a VFF dimension this is tag 5BCF, which is the plane NORMAL (SketchUp's SUDimensionLinearGetNormal equals it), or null.</summary>
+        public (double X, double Y, double Z)? PlaneX { get; set; }
+
+        /// <summary>Historical name: for a VFF dimension this is tag 5BD0, the plane's X axis, or null.</summary>
+        public (double X, double Y, double Z)? Normal { get; set; }
+    }
+
+    /// <summary>A construction/guide line (SketchUp's Construction Line
+    /// tool). Supported in both legacy and VFF (2021+) models.
+    ///
+    /// Stored internally (and here, unchanged) as a point + normalized
+    /// direction + two signed distance parameters along that direction
+    /// marking where the visible segment starts/ends - the same shape
+    /// Sketchup::ConstructionLine's own start/end/direction properties
+    /// expose. A parameter magnitude of 1e30 means unbounded in that
+    /// direction (SketchUp draws this as an infinite guide line through
+    /// Point) - Start/End come back null in that case, matching the real
+    /// API returning nil.</summary>
+    public sealed class ConstructionLine
+    {
+        /// <summary>A point on the line, in inches (world space) - matches
+        /// the bounded case's own Start, or the anchor point given for an
+        /// infinite line.</summary>
+        public (double X, double Y, double Z) Point { get; set; }
+
+        /// <summary>The line's normalized direction vector.</summary>
+        public (double X, double Y, double Z) Direction { get; set; } = (1.0, 0.0, 0.0);
+
+        /// <summary>The bounded segment's start point, or null if
+        /// unbounded in this direction.</summary>
+        public (double X, double Y, double Z)? Start { get; set; }
+
+        /// <summary>The bounded segment's end point, or null if
+        /// unbounded.</summary>
+        public (double X, double Y, double Z)? End { get; set; }
+    }
+
+    /// <summary>A construction/guide point (SketchUp's Construction Point
+    /// tool). Read from both legacy (pre-2021) and VFF (2021+) files.</summary>
+    public sealed class ConstructionPoint
+    {
+        /// <summary>The point's position, in inches (world space).</summary>
+        public (double X, double Y, double Z) Position { get; set; }
+    }
+
+    /// <summary>A saved scene (SketchUp's "Scenes" tabs; "pages" in the SDK).</summary>
+    public sealed class Page
+    {
+        /// <summary>Scene name as shown on its tab.</summary>
+        public string Name { get; set; } = "";
+
+        /// <summary>Camera position (x, y, z) in inches, or null.</summary>
+        public (double X, double Y, double Z)? Eye { get; set; }
+
+        /// <summary>Point the camera looks at, in inches.</summary>
+        public (double X, double Y, double Z)? Target { get; set; }
+
+        /// <summary>Camera up vector.</summary>
+        public (double X, double Y, double Z)? Up { get; set; }
+
+        /// <summary>Field of view in degrees (SketchUp default 35).</summary>
+        public double Fov { get; set; } = 35.0;
+
+        /// <summary>True when the scene uses parallel (orthographic)
+        /// projection; Fov still holds the stored perspective angle.</summary>
+        public bool Parallel { get; set; }
+
+        /// <summary>Visible height in inches when Parallel.</summary>
+        public double OrthoHeight { get; set; }
+
+        /// <summary>Names of the layers this scene hides.</summary>
+        public List<string> HiddenLayers { get; set; } = new List<string>();
+    }
+
+    public sealed class Definition
+    {
+        public long Id { get; set; }
+        public string Guid { get; set; } = "";
+        public string Name { get; set; } = "";
+        public Dictionary<long, Vertex> Vertices { get; set; } = new Dictionary<long, Vertex>();
+        public Dictionary<long, Edge> Edges { get; set; } = new Dictionary<long, Edge>();
+        public Dictionary<long, Face> Faces { get; set; } = new Dictionary<long, Face>();
+        public List<Instance> Instances { get; set; } = new List<Instance>();
+        public List<SectionPlane> SectionPlanes { get; set; } = new List<SectionPlane>();
+        public List<TextEntity> Texts { get; set; } = new List<TextEntity>();
+        public List<Dimension> Dimensions { get; set; } = new List<Dimension>();
+        public List<ConstructionLine> ConstructionLines { get; set; } = new List<ConstructionLine>();
+        public List<ConstructionPoint> ConstructionPoints { get; set; } = new List<ConstructionPoint>();
+        /// <summary>The analytic arc of every curve that is one, keyed by curve id - the
+        /// <see cref="Edge.CurveId"/> of the edges that form it. A curve that is not an arc (a
+        /// freehand or polygon curve) has no entry.</summary>
+        public Dictionary<long, ArcCurve> Arcs { get; set; } = new Dictionary<long, ArcCurve>();
+        public bool AlwaysFacesCamera { get; set; }
+        public bool ShadowsFaceSun { get; set; }
+        public bool IsImage { get; set; }
+        /// <summary>True when SketchUp made this definition for a group rather than a
+        /// component (what its own API reports as <c>SUComponentType_Group</c>). Groups and
+        /// component instances are both <see cref="Instance"/> placements of a
+        /// <see cref="Definition"/>; this is the only thing that tells them apart. It comes
+        /// from the file itself - the definition kind in a 2021+ file, a flag in the
+        /// definition record in an older one - not from how often the definition is
+        /// placed.</summary>
+        public bool IsGroup { get; set; }
+    }
+
+    /// <summary>Complete parsed representation of a SketchUp file, mirroring
+    /// the shape of Python's public SkpFile.parse() result.</summary>
+    public sealed class SkpModel
+    {
+        public string Version { get; set; } = "unknown";
+
+        /// <summary>The model's unit-system string (e.g. "Millimeter"),
+        /// read from meta/meta.dat in modern (VFF) files. Null for legacy
+        /// (pre-2021 MFC) files, which carry no equivalent container, or
+        /// when the tag isn't found.</summary>
+        public string? Units { get; set; }
+
+        /// <summary>Component/group definitions keyed by their numeric TLV
+        /// entity ID. The implicit root definition (Python's "ROOT" dict
+        /// entry, which has no numeric ID) is exposed separately via
+        /// <see cref="Root"/> instead of living in this dictionary.</summary>
+        public Dictionary<long, Definition> Definitions { get; set; } = new Dictionary<long, Definition>();
+
+        /// <summary>The implicit top-level model definition: its Instances
+        /// are the entities placed directly in the model (not inside any
+        /// component/group). Corresponds to Python's defs_dict['ROOT'].</summary>
+        public Definition Root { get; set; } = new Definition { Name = "ROOT_MODEL" };
+
+        public List<Layer> Layers { get; set; } = new List<Layer>();
+
+        /// <summary>The file's saved scenes, from VFF files and from classic pre-2021 files.</summary>
+        public List<Page> Pages { get; set; } = new List<Page>();
+
+        /// <summary>Model-level linear dimensions with world-space endpoints
+        /// (VFF files). Legacy files surface text-only dimensions per
+        /// definition instead (<see cref="Definition.Dimensions"/>).</summary>
+        public List<Dimension> Dimensions { get; set; } = new List<Dimension>();
+
+        public List<Material> Materials { get; set; } = new List<Material>();
+
+        /// <summary>Join table for Face.MaterialId / Instance.MaterialId:
+        /// TLV material ID -> Material. Several IDs may alias the same
+        /// Material instance.</summary>
+        public Dictionary<long, Material> MaterialsById { get; set; } = new Dictionary<long, Material>();
+
+        public List<Style> Styles { get; set; } = new List<Style>();
+    }
+}

@@ -1,0 +1,2970 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Fixed — Python: SketchUp 2019 and 2020 models whose tags have a line style (#514)
+
+- A SketchUp 2019 or 2020 file in which a tag carries a line style ("Dash", "Dot", ...) failed to
+  open with `no reader for class CCustomLineStyle`. The style is stored inline where a tag first
+  uses it, takes an object slot between the tags, and is pointed at again by later tags that share
+  it; the reader now reads it and counts the slot, so every face stays on its own tag. Models
+  without tag line styles are unchanged (all 200+ sample files parse to identical results).
+  Reported by @mschache. The other readers do not handle the class either (TypeScript fails on the same models) and are tracked in #285.
+
+### Fixed and added — C++ (contributed by @modraup, #478, #488, #499, #500)
+
+- **Component identity and definition attributes (#478).** Every exported definition used to get a
+  new GUID, and independent files shared the blank scaffold's model GUID. `DefinitionOptions::guid`
+  now keeps a component's UUID (an empty value generates one), `SkpBuilder::set_guid()` sets the
+  file's, and each builder gets its own default that stays the same across repeated writes. Compact
+  and hyphenated UUID strings are accepted and checked before anything is written.
+  `Definition::parsed_dictionaries` exposes a VFF definition's own attribute dictionaries (empty for
+  classic files).
+  **Behaviour change:** definition and instance GUID strings are now in canonical UUID byte order
+  (uppercase, no hyphens) in classic and VFF files alike; before, they were in Windows storage byte
+  order. The same `Shelf` component in the 2017, 2020 and 2021 fixtures now has one GUID in all
+  three formats. Anything that stored the old strings has to normalise them before comparing.
+- **Annotation tags and visibility (#488).** Dimensions and text keep their own tag and hidden state
+  in classic and VFF files (the reader used to show them all on the default layer), along with their
+  anchors, label positions, screen fractions and leader types. Annotations belong to the definition
+  that owns them and are read in its coordinates; the model-level list of VFF dimensions stays for
+  compatibility. `DimensionOptions` and `TextOptions` write tags, hidden state, component text and
+  screen placement, and the existing overloads are unchanged. Leaderless model text is written as
+  model text with a hidden leader. The default tag is reported as `""`, as for faces and guides.
+- **DXF export (#499).** Layer names with characters outside ASCII were written as UTF-8 into an
+  ANSI file and came out wrong. They are now written as `\U+XXXX` escapes, cut at 255 UTF-16 units
+  without splitting a character, and kept unique after sanitising. A polyface whose counts exceed
+  the signed 16-bit limit is written as `3DFACE`s, and malformed mesh input is rejected. Numbers are
+  formatted the same way in every locale.
+- **Long attribute strings (#500).** An attribute value of 255 UTF-16 units or more was rejected, so
+  plugin JSON and other long metadata could not be saved. The writer now emits the 16-bit and 32-bit
+  MFC length forms. The classic reader joins UTF-16 surrogate pairs into valid UTF-8, and a
+  malformed surrogate reads as U+FFFD instead of ending the string.
+
+The other four languages have not been checked against these four changes; they are listed in #285.
+
+### Fixed — hostile files: deep nesting, deep `meta.dat` wrappers and truncated `model.dat` (#496, #497, #498)
+
+All five readers handled three kinds of damaged or hostile input badly. They now behave the same way.
+
+- **Deeply nested `model.dat` (#496).** The TLV parser descended into every container with no depth
+  limit. A 157 KB file nesting containers 100,000 deep killed the C++ process (SIGSEGV) and aborted
+  the .NET process ("Stack overflow", which no `catch` can intercept), and gave `RangeError`,
+  `RecursionError` or `StackOverflowError` in TypeScript, Python and Dart. Containers now nest at
+  most 64 levels, and deeper input raises the library's own parse error (stage `tlv_walk`, with the
+  tag and offset). Real files nest about a dozen levels at most: the deepest of the 53 modern-format
+  files checked (the repository's fixtures and other real files) reaches 11. The same limit applies to nested attribute dictionaries (C++ walked those with its own
+  recursion) and to nested definition-list wrappers (`F901`, TypeScript).
+- **Nested `6400` records in `meta/meta.dat` (#497).** `read_meta_units` called itself on every
+  `6400` wrapper, so the stack grew with the depth (and C++, .NET and Python copied nearly the whole
+  payload at every level: 3.4 s and 5.9 GB in .NET for 100,000 levels). The wrappers are now
+  followed in a loop over offsets, with no copies, and more than 64 of them gives unknown units
+  (`units` is `None`/`null`) instead of an error: the units are optional information, so a bad
+  `meta.dat` does not reject an otherwise valid model. TypeScript used to fail the whole parse here.
+- **Truncated `model.dat` (#498).** A `model.dat` cut short anywhere inside its single top-level
+  `F401` record used to parse as a model with no geometry and no error. It now raises a parse error
+  saying the record declares more bytes than the data holds. Only the top-level record is checked:
+  in real files some container payloads end with bytes that are not records (text that parses as
+  headers whose lengths overrun the container, found at the same depth in all 53 files checked), so the nested records stay lenient. Every real file ends exactly on its top-level record.
+### Fixed — files the TypeScript, .NET and Dart writers produced could not be saved by SketchUp for Web (#492)
+
+The Python and C++ writers already gave every entity in a file its own persistent id. The other
+three did not: each section (materials, layers, definitions, root geometry) numbered its ids from 1
+again, and the header's id counter stayed at the blank scaffold's 18 unless the file had materials
+or layers. A model with two groups therefore had a definition and a root instance with the same id,
+and ids up to 20 against a counter of 18. SketchUp for Web opens such a file but cannot save it
+("Save Failed"): it renumbers the repeated ids starting at the counter, and the new numbers clash
+with ids already in use. Ids now run in one sequence across the sections, continuing from the
+scaffold's counter, and the counter holds the last id handed out, as Python's does (it is a 32-bit
+field; these three treated it as 16-bit). The three writers now produce the same ids as Python: the
+Dart reference files under `test/fixtures/create_reference` were regenerated with the current
+Python writer (they carried the old numbering), and the Dart, TypeScript and .NET writers produce
+those eight files byte for byte. Found by Aleksei Gurianov, who traced the repeated ids and tested
+a corrected counter in SketchUp for Web.
+
+### Fixed — .NET writer: a large file used the wrong escape marker for a renumbered reference
+
+When a model is big enough that a reference in the blank scaffold lands at or past slot 32,767,
+the .NET writer widened it to the long form with the marker `0xFFFF`, which is the "new class
+declaration" tag. Our readers load such a file, but SketchUp's own library refuses it
+(`SU_ERROR_SERIALIZATION` on load; a 3,200-face model is enough). The marker is `0x7FFF`, as in the
+other four writers; the 3,200-face file the Dart suite compares is now byte-identical from .NET and
+loads in SketchUp's library.
+
+### Fixed — all five ports: a concave four-sided face is no longer triangulated across its outside (#493)
+
+- `triangulate_face_3d` split every single-loop quad along its 0-2 diagonal without checking
+  that the quad is convex. When the reflex corner is 1 or 3, that diagonal runs outside the
+  face and the mesh covered area the face does not have (a dart of area 4 came out as 12).
+  Such a quad is now split along its 1-3 diagonal. A convex quad is split exactly as before,
+  and so is a self-intersecting or warped quad unless the 1-3 split covers less area. On
+  `coedge_orientation_regression.skp` this corrects 45 quads; the sum over all faces of the
+  difference between triangle area and loop area drops from 1.58 in² to 0.23 in².
+
+## [1.5.0] — 2026-11-03 — all 5 languages
+
+> What most readers will notice, from the entries below (everything since 1.4.0):
+>
+> - **Files that failed, or read wrong, now read, in all five languages:** a SketchUp 2016
+>   model with a dimension attached to a vertex written in full lost all 148 of its root
+>   entities (#474); a legacy text label anchored to an entity no longer throws off the rest of
+>   the file, so four more room-acoustics benchmark models open (#473); a saved blank SketchUp
+>   2020 template opens as an empty model (#486).
+> - **Textured materials in classic (pre-2021) files:** Python, TypeScript, .NET and Dart read
+>   every plain textured material as colorized, and took the colour's alpha from the image
+>   average, which is `0` in some files. That is why the Blender add-on drew such faces as if
+>   they had no material (blender-openskp#9). They now read the material type, the colorize
+>   mode (new field `colorize_type`) and the paint colour the way C++ does, checked against
+>   SketchUp's own library on all 117 textured materials of the test files.
+> - **Writing:** all five writers store a face's plane with the sign SketchUp uses. C++ (from
+>   @modraup) also keeps a guide's layer and hidden flag, sets document options, adds
+>   dimensions with an offset vector, and writes files closer to what SketchUp itself writes.
+> - **Dart:** `fromFragments` reads uncompressed `.frag` files again with `archive` 4.6, which
+>   had also broken every Dart CI run.
+>
+> Upgrade notes: in a classic file `colorized` is now `false` for a plain textured material
+> and a material's colour has alpha 255 (it was `0`, or `254`, in some files), so code that
+> used `colorized` to tell whether a material has a texture should look at the texture
+> itself. Files the Python, TypeScript, .NET and Dart writers made before this release store
+> the face plane constant with the opposite sign; every reader ignores it, so they still open
+> everywhere. C++ has writer options the other four do not (guide options, document options),
+> tracked in the porting backlog (#285).
+
+### Fixed and added — C++ (contributed by @modraup, #475, #477, #481)
+
+- **Guides.** A construction line or point keeps its layer and its hidden flag when read, written
+  (`GuideOptions{layer, hidden}` on `add_construction_line` / `add_construction_point`) and replayed
+  by `open_existing()` (#475).
+- **Files the writer produces are closer to what SketchUp itself writes (#477).** A face's stored
+  plane constant had the wrong sign (SketchUp stores `n·p + d = 0`; every face of two real files
+  checked agrees); the persistent-id counter is now the 8-byte field it is, instead of wrapping at
+  16 bits; the texture average colour block is the one SketchUp writes. A fan triangulation is
+  validated before anything is written, so a degenerate polygon throws instead of corrupting the
+  entities after it. New `set_document_options(DocumentOptions)` sets the length unit and
+  precision and a few style items (e.g. the background colour) without scaling geometry; the
+  bundled `tools/check_native_skp.py` re-opens a file with SketchUp's own library to check them.
+- **Legacy texture materials.** The paint colour is read from the material colour, not the image
+  average, `colorized` is `true` only for a colorized texture (it was also `true` for every plain
+  textured material), and `colorize_type` distinguishes tint from shift. Checked against materials
+  written by SketchUp's library; the other four ports read it the same way now (next entry).
+- **Dimensions (#481).** A legacy dimension whose end vertex is written inline no longer stops the
+  rest of the entity list from being read, so annotation-only components are no longer empty. The
+  endpoints and plane offset are recovered for legacy dimensions (34 of 34 on the Vigors models,
+  equal to SketchUp's own values), `Dimension::offset_vector` gives the side of the dimension line
+  independently of the order of the endpoints, and VFF dimensions decode the constrained axis
+  (`5BD1`). `5BCF` is the plane **normal** (SketchUp's `SUDimensionLinearGetNormal` equals it) and
+  `5BD0` its X axis, the other way round from what the earlier notes said. New
+  `add_dimension(p1, p2, offset_vector)` on root and component builders; rewriting the real
+  dimensions through it reproduces SketchUp's own world bounding boxes.
+
+### Fixed — all five ports: a SketchUp 2020 model with nothing in it opens (#486)
+
+- A model saved by SketchUp 2020 with no entities and no component definitions (a blank template)
+  was rejected with "implausible definition count". SketchUp 2020 writes an empty string record and
+  zero padding where the definition count would be, and with nothing in the model the only count
+  behind it is the root entity count, which is 0; the search for that count skipped it. It now
+  reads as an empty model. Files that already opened read exactly as before: nothing changes
+  unless that search found no count at all and the filler is followed only by zeros.
+
+### Fixed — Python, TypeScript, .NET, Dart: classic textured materials are no longer all "colorized"
+
+In a classic (pre-2021) file a textured material's record holds the image's average colour and the
+material's paint colour side by side, and two words: the material type (1 textured, 2 colorized) and
+the colorize mode (0 shift, 1 tint). The readers took any material whose alpha byte was `0xFF` as
+colorized and always reported tint, so every plain textured material read as colorized: 96 of the 117
+textured materials in the repository's sample files and the differential-test files disagreed with
+SketchUp's own `SUMaterialGetType`. They now read `colorized` from the material type, `colorize_type` from the mode,
+and the colour from the paint colour (its alpha is 255, as C++ reads it since #477; a plain texture
+used to report 254 in one file). Against SketchUp's library the type, mode and colour of all 117
+agree, including the colorized ones; a fixture written by that library (plain, tint, shift and a
+half-opaque tint) is read the same by all five ports.
+
+### Fixed — Python, TypeScript, .NET, Dart: a dimension whose connection point is a vertex written in full no longer ends the entity list (#474)
+
+MFC writes an object in full the first time anything references it, and a dimension comes before the
+geometry it is attached to in its entity list, so a dimension's connection point can be a whole
+`CVertex` (class declaration included). The readers took that for the end of the list: a SketchUp
+2016 file kept all 15 of its definitions and none of its 148 root entities, so nothing was placed and
+the scene had no bounds. The connection points are read like path entries now, which reads and
+registers such an object. C++ was fixed by #481. Each port tests it with a small synthetic file that
+fails without the fix; every existing test still passes, and Python reads 63 differential-test files
+(every legacy version from 2013 to V8, and 2021+) to the same model as before.
+
+Also corrected, in the documentation of the four ports: `5BCF` is the dimension plane's **normal**
+and `5BD0` its X axis (the `planeX` / `normal` fields keep their old names).
+
+### Fixed — Python, TypeScript, .NET, Dart writers: a face's stored plane has the sign SketchUp uses
+
+SketchUp stores a face's plane as `n·p + d = 0` (every face of two real files agrees); the writers
+stored `d` with the opposite sign (`+n·centroid`), the defect @modraup found in the C++ writer in #477.
+openskp's readers only use the plane's normal and SketchUp's own API recomputes the plane, so nothing
+noticed. Each writer now stores `-d`, with a test on the raw record that fails without the change. The
+Dart `create_reference` files (written by an older Python writer) get the same change to each face's
+plane constant (3,210 faces), and nothing else in them changes.
+
+### Fixed — Dart: `fromFragments` reads uncompressed `.frag` files again with `archive` 4.6
+
+`fromFragments` told a zlib stream from raw FlatBuffers by letting `ZLibDecoder.decodeBytes` throw
+on bytes that are not zlib. `archive` 4.6.0 returns an empty list instead, so every uncompressed
+file reached the FlatBuffers reader empty (five tests failed, and so did every pull request that
+touched Dart). Both outcomes now mean "not zlib" (#482).
+
+### Fixed — all five ports: a legacy text label anchored to an entity no longer throws off the rest of the file
+
+A text label anchored to an entity (connection types 2, 4, 5 and 7 seen; types 0 and 1 anchor to
+nothing) carries, after its connection block, the anchored entity's reference and its instance
+paths, as a dimension does (openskp#412). MFC writes a path instance in full the first time anything
+references it, with its class declaration when it is the file's first instance. Every reader skipped
+those bytes, so the instance got no store-map slots and every later reference was off by them: a
+file whose labels come before the components they are anchored to stopped with "class-ref to
+non-class slot … (CText)", or silently lost the rest of its root entity list. The block is read now.
+An instance written in a label that its entity list never lists again is kept as one of that list's
+entities: the list's declared count holds it, but SketchUp does not always list it again.
+
+Measured on the 25 SketchUp 2015 models of the BRAS room-acoustics benchmark:
+
+- the four auditorium (CR4) models open; they failed before;
+- two coupled-room (CR1) models read their whole root entity list: 5 of 318 and 361 of 370
+  entities before; Python's scene has 11,626 and 18,928 triangles now (460 and 1,216 before);
+- a loudspeaker-setup model reads all 12 of its root instances: Python, TypeScript and C++ read
+  11, and .NET and Dart stopped on it;
+- every entity list in these models and in the sample files reads exactly its declared count
+  (counted in Python).
+
+The other 18 models, and the 48 sample files in this repository, parse to the same faces, edges,
+instances, dimensions and texts as before. Each port changes on the same 7 models, in the same way,
+and the five ports now read the same faces, edges, instances, dimensions and texts from all 73
+files, per definition and in the root.
+
+## [1.4.0] — 2026-10-27 — all 5 languages
+
+> What most readers will notice, from the entries below (everything since 1.3.0):
+>
+> - **Reading, now in all five languages:** a classic (pre-2021) file's scenes with their
+>   cameras and hidden layers; `Definition.is_group`, which says whether SketchUp made a
+>   definition for a group or a component; `Definition.arcs`, the exact centre, radius and
+>   angles of every arc and circle (including ones that bound a face, and from 2021+ files,
+>   where they were stored but never read), with `Edge.curveId` to join them to their edges.
+> - **Fixes that change what a model looks like:** an instance scaled through the matrix's
+>   scale term is placed and sized correctly (it came out 100x too big), and a 2021+ scene
+>   that saves no camera is kept. TypeScript, .NET, Dart and C++ now read every legacy save
+>   of a real multi-version project (SketchUp 4 through 2020); they stopped on it before.
+> - **Writing:** the writers mark a group's definition as a group (SketchUp counted written
+>   groups as components); Python writes scenes into legacy files.
+> - Much faster 2021+ parsing in Python, and a long list of smaller fixes below.
+>
+> Not identical capability: Python still has a few things the other four do not (writing
+> scenes, the per-edge and per-face layer ids, loose-edge curve scene support), tracked in
+> [docs/LANGUAGE_PARITY.md](docs/LANGUAGE_PARITY.md) and
+> [issue #285](https://github.com/iamahsanmehmood/openskp/issues/285).
+>
+> **Upgrade notes:** in TypeScript, `Edge.curveId` is optional but `Definition.isGroup` and
+> `Definition.arcs` are required, so code that builds `Definition` objects by hand needs the
+> two new fields (parsed models already carry them). A file written by an earlier version keeps
+> the old group flag on its definitions and reads back with `is_group` false for its groups.
+
+### Fixed — all five ports: a group the writer makes is a group to SketchUp (#446)
+
+A file written by `openskp.create` (or the TypeScript, .NET, Dart and C++ writers) placed a group
+with a `CGroup` record but wrote its definition as a component's: the flag in the definition record
+that SketchUp's own API reports as a group (`SUComponentType_Group`) was 0, so SketchUp counted
+every such group as a component and `Definition.is_group` read back false. The writers now set it
+for the definition `add_group` makes and for the definition `add_group_instance` places, which is
+the way to write a group nested inside a component (the first version of this fix covered only
+`add_group`, so a nested group still read back as a component, #467). A definition placed both as a
+group and as a component instance reads as a group. Checked with SketchUp 2025's own library: a file
+with one group and one component, and one with a group nested in a component, each report one group
+definition and one component definition, and OpenSKP reads the same;
+an existing test that asked SketchUp to count the definitions of a file with 20 components and 10
+groups used to expect 30 components and now expects 20 components and 10 groups. Each port tests it.
+
+### Added — TypeScript, .NET, Dart, C++: scenes in classic files, with their cameras (#445)
+
+The Python reader (#454, #460) ported: `SkpModel.pages` is filled from a classic (pre-2021)
+file's scene list in these four ports as well, with each scene's name, camera (eye, target, up,
+field of view, projection, parallel height) and the layers it hides. They returned no scenes before
+(C++ found names and hidden layers only, with a narrow scan that still runs when the full reader
+gives up on a record). SketchUp 2015 to 2020 desktop saves (record schema 12 and 13) and files saved
+through SketchUp's C API as 2017 to 2020 (schema 15) are read; a scene that captures everything
+(flags `0x1FF`) is read to its last byte.
+
+Checked by comparing all four against the Python reader on 78 files (every fixture of the five
+ports, the older models, the SketchUp-library saves and the VFF scene files; 29 scenes in 11 files):
+name, eye, target, up, field of view, projection, parallel height and hidden layers are identical
+in every scene, and the files that fail to parse fail in all of them. The files saved through the C
+API as 2019 and 2020 surfaced a second thing: .NET and Dart crashed opening them at all, on the null
+entry such a file has in its layer list that #459 fixed in Python; TypeScript and C++ were not
+affected. Both are fixed here. New tests in each port read `gondola_v20.skp`'s scene and the four
+`sdk_saved_*` fixtures (three scenes, one without a camera, one hiding a layer, and a scene
+capturing every property followed by a plain one).
+
+Not ported: Python's narrow scan fallback (scene names and hidden layers only, for records the full
+reader gives up on) in TypeScript, .NET and Dart, which return no scenes there. This is the
+reading half of #445; writing scenes into a file (`SkpBuilder.add_scene`) stays Python-only.
+
+### Fixed — TypeScript, .NET, Dart, C++: the real multi-version project reads in every legacy version (#442)
+
+On the real multi-version project from the #284 sweep (a 5 MB, 146-definition, textured model
+saved from SketchUp V3 through 2025) these four readers failed every legacy save. Two causes,
+both already handled in Python:
+
+- A `CText` is found by an 11-byte block just before its string, `01 00 00 00 ?? 00 <arrow type>
+  00 00 00 01`, and the four readers required arrow type 3. The type is 0 to 8 (a dot, a closed
+  or open arrow, a slash, none); one text with another stopped the walk (`text delimiter not
+  found` on V4 to 2016).
+- The text font (`CSkFont`) reads its pid as a mask byte plus the bytes the mask declares; the four
+  readers read only the mask byte. A pid above 255 takes two bytes, and the real project's 2017 to
+  2020 saves have one on the font, which threw every later field off (`expected a string record`).
+
+All four now parse every save of the project from V4 through 2020, 2021 and 2025, with
+identical totals: 32,982 vertices, 40,925 edges, 9,652 faces and 150 instances in each,
+the same as the 2021 and 2025 saves. V3 stays a failure in every reader (#284), and V5 is a
+corrupted 0-byte save. A new fixture, `legacy_text_arrows_2017.skp`, covers both causes in
+every port (three leader texts with arrow types 1, 2 and 4 and a two-byte font pid, from
+`openskp.create` plus two documented byte edits; SketchUp 2025 opens it and reports the same
+texts and arrow types), and its test fails on the old code (in TypeScript the old code did not
+even raise: the file parsed with no texts at all).
+### Added — TypeScript, .NET, Dart, C++: `Definition.arcs` and `Edge.curveId` (#462)
+
+The Python entry below, ported: `Definition.arcs` (`arcs`, `Arcs`) maps a curve id
+to an `ArcCurve` - centre, normal, x and y axis, start and end angle, plus
+`radius` and `isFullCircle` - for every arc and circle, including ones that bound
+a face, from classic and 2021+ files. These four ports did not expose which
+curve an edge belongs to at all, so `Edge.curveId` (`CurveId`, `curve_id`) comes
+with it: the id of the curve, or null/none, the same grouping Python's
+`Edge.curve_id` carries, and the key into `arcs`.
+
+2021+ files store the arc in a 128-byte `2D4C` record beside each curve's record;
+classic files in the `CArcCurve` the readers already stepped over. Checked in each
+port against the fixtures the Python entry used (a loose arc, a disc and a half disc
+saved as SketchUp 2017, 2020 and 2021, read back identically) and on the 368
+circles of `Untitled.skp`, each joined to the 24 edges SketchUp reports.
+
+### Added — Python: `Definition.arcs`, the analytic arc of every arc and circle (#462)
+
+A curve SketchUp drew as an arc or a circle is a run of straight edges and
+also an exact description: centre, plane, axes, radius and start and end
+angle. `Definition.arcs` maps a curve id (the `Edge.curve_id` of the edges
+that form it) to an `ArcCurve` with those, from classic and 2021+ files alike.
+It covers every arc, including a circle or an arc that bounds a face, which the
+scene's `curve_sets[].arc` (loose curves only) never reached.
+
+Classic files already carried the arc inside the reader; 2021+ files store it
+as a 128-byte record (`2D4C`: 16 doubles - centre, normal, a plane constant,
+x axis, y axis, radius, start and end angle) beside each curve's record
+(`384A`), and the reader skipped it. It is read now. Checked against SketchUp
+2025's own `SUArcCurve` getters: a loose arc, a circle and an arc closed by its
+chord (the last two bounding faces), saved as SketchUp 2017, 2020 and 2021,
+read back identically in all three; and the 368 arcs of `Untitled.skp`
+(24-edge circles) agree to 5e-6 inches, each joined to the 24 edges SketchUp
+reports.
+
+One visible change: `curve_sets[].arc` is now filled for loose arcs in 2021+
+files too, as it already was in classic ones, so a loose arc in a 2021+ file
+reaches a scene consumer as an arc and not only as segments. The scene output of every other
+fixture and of 26 older models is unchanged.
+
+### Added — all five ports: `Definition.is_group` tells a group from a component (#446)
+
+Groups and component instances are both an `Instance` of a `Definition`, and
+nothing in the model said which SketchUp made, so a reader that wanted
+SketchUp's own tree had to guess ("a definition placed once is a group" files a
+component placed once as a group). `Definition.is_group` (`isGroup`, `IsGroup`)
+is `True` for the definition SketchUp made for a group, which is what its API
+reports as `SUComponentType_Group`. It is read from the file, not inferred from
+how often a definition is placed: the definition kind (`8315`: 0 component, 1
+group, 2 image) in a 2021+ file, and in a classic file the last `u32` of the
+definition record before its thumbnail (1 for a group, 0 for a component). The
+placing record is not the signal there: `CGroup` over a definition SketchUp
+calls a component is what `openskp.create` writes, and what SketchUp reports
+for those files is "component".
+
+Checked against SketchUp 2025's own `SUModelGetNumGroupDefinitions` on 50
+files: the 36 repository fixtures and older models that SketchUp opens (14
+groups and 6 components on `gondola_v20.skp`, 46 groups on `Untitled.skp`), and
+14 saves of one model with 144 groups and 1 component, SketchUp 4 to 2025. The
+counts agree on every one. New fixtures `nesting_v6/2013/2017/2020/2021.skp` (a group holding a
+component holding a group, built through the library) test each port.
+
+Files written by `openskp.create` read back with `is_group` false for their
+groups in this entry's release, because the writer put the group flag in no
+definition (SketchUp reported those as components too); the next entry fixes it.
+
+### Fixed — Python: scenes in a legacy file saved through SketchUp's C API are read (#445)
+
+A model saved through the SketchUp library (`SUModelSaveToFileWithVersion`) as
+2017 to 2020 declares its `CViewPage` class at schema 15, and the scene
+reader only knew 12 and 13, so such a file came back with no scenes. Schema 15
+is read now: name, camera, hidden layers. Measured on files built and saved
+through SketchUp 2025's library, which reads the same names, cameras and
+hidden layers back: the camera is only there when its capture flag is, there
+is no thumbnail, the trailer is a byte shorter, the rendering options are 3
+bytes longer, and the style options use two more value types. A scene that
+captures everything (flags `0x1FF`) is read to its last byte, so the layout of
+every section is measured rather than assumed. Scenes of other schemas read as
+before: the scene output of every fixture and of 26 older models is
+unchanged. Files saved through the C API as SketchUp 2016 or older still fall
+back to the narrow scan, as before.
+
+### Added — Python: write scenes into legacy files, and read legacy scenes with their cameras
+
+`SkpBuilder.add_scene(name, eye, target, up=None, *, perspective, fov,
+ortho_height, hidden_layers)` adds a scene: a named camera plus the layers it
+hides, one click apart in SketchUp's Scenes tabs. Each scene is written the
+way SketchUp writes a new scene: `CViewPage` schema 13 (SketchUp 2016+; the
+version map still says 12), capturing everything (flags `0x7F`). The model's
+style moves into the first scene and the style manager refers back to it, as
+in SketchUp's own files. Scenes take pids from the shared sequence and slots
+from where the scaffold's font manager started; references past `0x7FFF` use
+the escape form. The ground truth is SketchUp's own 3D Warehouse model with
+eight scenes in its SketchUp 2017 format, plus SketchUp 2015 saves (neither
+redistributable, so not committed). Files written this way open in SketchUp
+Free (web) with working scenes. A file whose scenes left the style section
+out was rejected, which is why every scene captures everything.
+
+The legacy reader now reads whole scene records (`_read_page_list`) for
+schema 12 and 13: name, camera (eye, target, up, fov, parallel, ortho height)
+and hidden layers, the fields `Page` already had. That includes the common
+case the narrow scan skipped, a scene that saves its camera and style
+(#445 is only partly covered here: files saved through SketchUp's C API are
+the next entry). The `gondola_v20.skp` fixture (SketchUp 2020, flags `0x1FF`) now comes
+back with its scene, as do SketchUp's eight-scene sample, SketchUp 2015 saves
+and openskp's own output. The rendering options a scene carries grow with the
+file version (206 bytes up to SketchUp 2017, 211, 212 and 213 for 2018-2020,
+measured on the fixtures), so files from SketchUp 2014 to 2020 are covered;
+for other versions the reader gives up. The hidden-layer list is a `u32`
+count followed by the refs; the narrow scan's "refs, then a `u32` 1" reading
+takes a count of 1 for its end marker, so a scene hiding one layer came back
+with none. A record the new reader can't fully read (for example one with an
+attribute dictionary, or capture flags beyond `0x1FF`) falls back to the
+narrow scan.
+### Fixed — TypeScript: curved surfaces shade smoothly across smooth edges
+
+SketchUp draws the faces either side of an edge flagged smooth (Soften/Smooth
+Edges) as one continuous surface, but `buildScene`/`buildInstancedScene` gave
+every face its own flat normal, so cylinders, terrain and other curved models
+came out faceted in GLB and every other mesh export. Corners joined through a
+smooth edge between two faces that face the same way now share one vertex
+normal, the normalised sum of their faces' normals; hard edges keep their
+crease, and a definition without smooth edges is unchanged.
+### Added — TypeScript: `InstancedScene.layerColors` and `InstancedNode.ownLayer`
+
+`buildInstancedScene` already reports each node's effective layer and each
+layer's visibility (`layerHidden`), but not the layers' colours, so a consumer
+rebuilding the file's tag list had to run a second, full `parseSkp` (about as
+long as the scene build itself on a large model). The colours come from the
+same raw parse, so the scene now carries them too, for every layer the file
+defines whether a placement uses it or not. Optional in the type: a scene read
+back with `fromFragments` has none.
+
+Each node's `layer` is the effective one, inherited from its parent when the
+instance has none, so it cannot tell an inherited layer from an explicit
+assignment of the same layer. `ownLayer` is the layer the instance carries
+itself, absent when it inherits.
+### Fixed — all five ports: a VFF (2021+) scene that doesn't save its camera is kept (#447)
+
+SketchUp lets a scene leave "Camera Location" unticked. Such a scene saves no
+camera, but it still has a name and the layers it hides. All five ports dropped
+a scene unless they had found a camera for it, so those scenes disappeared (on
+a real 2024 model, 13 of 35). The Python port went further: a scene with no
+camera record at all made `parse()` raise a `TypeError`. A scene without a
+camera now comes back with its name and hidden layers and `eye`, `target` and
+`up` unset (`None`, `null`, or an empty optional). Fixture:
+`scene_without_camera_2021.skp`, three scenes built through SketchUp's own
+library (one with a camera, one without that hides a layer, one plain), which
+SketchUp reads back as the same three. Reported by @JFrancu.
+
+### Added — TypeScript: `SceneOptions.frontSideOnly`
+
+A face whose front and back resolve to different colours is emitted as a front
+plus a reversed back-side copy, which is right for a viewer. A modeler or CAD
+tool that rebuilds faces from the mesh reads that copy as a second, coincident
+face: the shared edges turn non-manifold and the two z-fight. With
+`frontSideOnly`, `buildScene` and `buildInstancedScene` emit every face once,
+double-sided with its front material. Off by default.
+
+### Fixed — all five ports: an instance scaled through the matrix's scale term is placed and sized correctly (#444)
+
+SketchUp can keep a uniform scale in the homogeneous term of an instance's
+transformation instead of in the 3x3: the 3x3 stays as it is, the translation
+is in the scaled units, and the 16th value `w` is the divisor (SketchUp's own
+library reports a 100 in cube placed with `w = 100` and a translation of 2000
+in as a 1 in cube at x = 20 in). The 13-value matrix stores `1/w` at index 12.
+The parse read it correctly, but `build_scene` / `build_instanced_scene` and
+every export built on them ignored it, so such an instance came out 100x its
+size and 100x its distance from its parent (a SpaceClaim export of a staircase
+landed about 76 m from the stair). The point transform, the matrix product and
+the glTF node-matrix conversion now fold the scale term into the rotation and
+translation first, so a composed matrix always has index 12 equal to 1.
+`Instance.matrix` itself still reports the raw 13 values. Checked against SketchUp's own bounding boxes
+for the same file saved in the SketchUp 6 and 2021 formats, and against 126
+local legacy and VFF files, none of which carries a scale term other than 1:
+their scene output is unchanged.
+
+### Fixed — Python: a file saved through SketchUp's C API as 2019 or 2020 parses
+
+Such a file has a null entry in its layer list. The probe that works out the
+archive's slot base subtracted from that entry's missing slot and raised
+`TypeError: unsupported operand type(s) for -: 'NoneType' and 'int'`, so
+`parse()` failed on every one of them that had a layer besides the default. The
+null entry is now skipped. The TypeScript port already read these files.
+Fixtures: `sdk_saved_2019.skp` and `sdk_saved_2020.skp` (a layer, a face and
+three scenes, built and saved through the installed SketchUp library).
+
+### Fixed — TypeScript, .NET, Dart, C++: legacy SketchUp 4, 5 and 2019 files parse correctly, and a 2020 model with no definitions keeps its root entities (#284)
+
+The four other readers now carry the fixes the Python reader got in #440: the
+bare inline texture image, the 7-byte (V4) and 8-byte (V5) draw block, the 19-
+and 20-byte definition headers, the shorter camera tail and the thumbnail
+without a trailing image pointer, no instance names in SketchUp 3 and 4,
+dimensions without the font object and trailing u32, the separator null after
+the last layer of a 2019 definition, and the 2020 root-count recovery.
+TypeScript, .NET and Dart also report the slot-base failure that got furthest
+into the file instead of the last candidate's (C++ gets the same through the
+reader position it reached). Each port is checked against the same
+SketchUp-written fixtures as Python, with tests that fail on the old code,
+and against a richer model with 47 definitions, 14 layers
+and 13 dimensions saved at V4 and V5; the real V4 sample parses to its cube
+(8 vertices, 12 edges, 6 faces) instead of nothing.
+
+Confirmed on the real multi-version project since #442: the four readers now
+parse its V4 and 2019 saves with the same totals as its V6 and 2018 saves.
+
+### Fixed — .NET: OBJ, MTL, ASCII PLY and ASCII STL exports use LF line endings on every platform (#424, #434)
+
+The four text exporters built their output with `StringBuilder.AppendLine()`,
+which writes CRLF on Windows and LF on Linux and macOS, so the same model
+produced different bytes depending on where it was exported - unlike the
+other four ports, which always write LF. All 56 calls now append an explicit
+`\n`, and the tests assert that no `\r` appears. **Behaviour change:** text
+exports written on Windows by this package now contain LF instead of CRLF.
+
+### Added — TypeScript, .NET, Dart: construction lines and points are read from VFF (2021+) files (#285, #435, #436, #437)
+
+These three readers already surfaced construction lines and points from
+legacy files but treated the VFF records as opaque. They now decode them the
+way Python and C++ do: the guide containers are traversed, a `6A42` record
+gives a line's point, direction and start/end parameters (an end whose
+distance is at or beyond the `1e20` sentinel is reported as unbounded),
+and a `6D42` record gives a point's position; truncated payloads are
+ignored. Covered by synthetic-record tests in each port, mirroring Python's.
+
+### Fixed — Python: legacy SketchUp 4, 5 and 2019 files now parse correctly, and two silent data losses are gone (#284)
+
+Three of the signatures still open on #284 are fixed in the Python legacy
+reader, found by byte-tracing each failure against the same model saved at a
+neighbouring version:
+
+- **SketchUp 4 and 5** (`texture object is not a dib`, and a longer chain behind
+  it). Everything below the CDib-object era differs in small fixed ways:
+  textures are a bare inline image (no object, no store-map slot) before
+  version 6; the draw block is 7 bytes in V4 and 8 from V5; the definition
+  header is 19 bytes in V4 and 20 from V5; the camera tail and thumbnail
+  are shorter and the thumbnail has no trailing image pointer before 6;
+  SketchUp 3 and 4 store no instance names; and linear dimensions have no
+  font object and a shorter lead-in and tail before 6. A real 5 MB, 146-
+  definition textured project saved at SketchUp 4 now parses identically to
+  its SketchUp 6 save (geometry, materials, texture bytes, layers, dimensions,
+  instance transforms - only the instance names, which a V4 file does not
+  carry, differ).
+- **SketchUp 2019** (`implausible def entity count`). 2019 follows the last
+  layer in a definition with a separator null, which shifted the entity count
+  by two bytes. The same real project saved at 2019 now parses identically to
+  its 2018 save.
+- **Silent data loss, no error raised:** the real SketchUp 4 sample used to parse
+  to an empty model instead of its 8 vertices, 12 edges and 6 faces, and a
+  SketchUp 2020 model with no component definitions lost every root entity
+  (they were read as "definitions"); both now come out complete.
+
+When none of the slot-base candidates parses, the error now comes from the
+candidate that got furthest into the file rather than the last one tried. The
+last one is the earliest to fail, so it used to point at the layer list for
+files that actually broke much later.
+
+A 1 MB model with 47 definitions, 14 layers and 13 dimensions, saved at
+SketchUp 4 and 5, also parses identically to its SketchUp 6 save.
+
+Not covered: the real SketchUp 3 project from the same sweep still fails
+(`edge-use parent slot None != current loop`; the synthetic V3 fixtures from
+#407 are fine), and the project's own SketchUp 5 save is a 0-byte file, so V5
+has only been checked on SketchUp-written synthetic files. The other four
+readers are not changed by this entry.
+
+### Changed — Python: `full_parse` is about 1.8× faster on large VFF models (#431)
+
+`full_parse` used to walk every top-level record's TLV tree six separate times
+(layers, materials, component definitions, vertex positions, instance
+transforms, scenes node). It now does all of that in one pass, reads node
+fields as attributes instead of through `__getitem__`, decodes each record
+header with a single `struct` call, and shares one string per tag. The parsed
+result is unchanged: the full output was compared against the previous code,
+including dictionary order, on six real production models (13 to 359 MB) and a
+98-file local corpus, and was identical in every case. On those six models
+parse time drops from 17.7 / 56 / 64 / 185 / 271 / 256 s to 9.6 / 32 / 36 /
+101 / 156 / 138 s. Peak memory is essentially unchanged, since it is dominated
+by the parsed result rather than the traversal.
+
+### Changed — TypeScript: minimum `earcut` is now 3.1.0, and the `@types/earcut` dev dependency is gone
+
+`earcut` ships its own type definitions from 3.1.0 on (3.0.x did not), and
+`@types/earcut` is now a deprecated empty stub that points there. The package
+declared `earcut ^3.0.0` and carried `@types/earcut` for the types, so the
+dev dependency is removed and the minimum `earcut` is raised to `^3.1.0`, which
+guarantees the bundled types. The lockfile already resolved 3.2.4, so installs
+from the lockfile are unchanged. Anyone who had pinned `earcut` to 3.0.x
+alongside this package will get a second, newer copy.
+
+### Fixed — all five ports: OBJ material identifiers remain distinct after sanitization (#423)
+
+OBJ/MTL export now reserves sanitized source names before assigning unique
+material identifiers. A colliding name gains `_<1-based material index>`,
+with an additional `_<n>` when that identifier is already used or reserved.
+Both `newmtl` and `usemtl` use the same resolved names. Non-conflicting
+names stay unchanged; comparisons remain case-sensitive. Blank names after
+trimming fall back to `default_material`, while punctuation is replaced with
+underscores as before.
+
+### Fixed — Python, TypeScript, Dart, .NET: PLY export preserves glTF material colors (#421)
+
+PLY exporters in these four ports previously read `baseColorFactor` from the
+material's top level rather than `pbrMetallicRoughness.baseColorFactor`.
+Consequently, colored geometry exported as the default gray RGBA in both ASCII
+and binary PLY. The exporters now read the nested glTF PBR color while retaining
+the fallback for materials without a usable color. C++ was already correct.
+
+### Changed — TypeScript: builder edges are stored in flat typed arrays (openskp#201)
+
+Both readers kept each definition's edges as `Map<id, [v1, v2]>`: a JS array
+plus a Map entry per edge, ~112 bytes for two vertex ids. They now go into an
+`EdgeStore` (`src/edge-store.ts`), the same move #208 made for vertices:
+endpoints in one `Uint32Array`, ids in insertion order, and an `Int32Array`
+index over the id span. Three id -> index choices were benchmarked
+(`npm run bench:edge-store`); the dense index is both the smallest at the id
+densities real files show (35-49 bytes per edge, 20% density on legacy files,
+50% on 2021+) and the fastest on the loop-reconstruction hot path (9.9 ns per
+endpoint read, against 16.3 ns for the Map of pairs). It falls back to a Map
+when ids are too sparse for a span-sized array to pay off. `reconstructLoopVertices`
+reads the one endpoint it needs (`v1(id)`/`v2(id)`) instead of allocating a
+tuple per edge use, and still accepts a plain Map. Output is unchanged: the
+hash of `parseSkp` and of `buildInstancedScene` is identical on 40 real files.
+On the 411 MB legacy file the walk ends with 122 MB less live heap, and the
+smallest heap that parses it drops from 2304 to 2048 MB.
+
+### Changed — tests: the legacy v3 / v7 / 2014 fixtures shrink from 1.6 MB to 8-12 KB and drop SketchUp's default-template images
+
+The three fixtures added with the pre-2014 fixes were real SketchUp saves, so each
+carried SketchUp's default template along with our test model: ~35 materials, 10
+with embedded JPEG textures (15 JPEG signatures in total), 1.6 MB apiece, copied
+into every language's test folder. Third-party image assets have no business in a
+test fixture. They are now re-saved from the lean `legacy_v6_synthetic.skp` (11 KB,
+no textures) at SketchUp 3, 7 and 2014 through the installed SketchUp library, so
+they hold only our own geometry plus the format's structural bytes. Nothing the
+tests prove is lost: against the pre-fix readers the lean files fail exactly as the
+old ones did (v7 "definition list misaligned", v3 "expected a string record"; 11 of 14
+TypeScript tests fail on the old reader either way). V3's inline-image path is now
+covered by `legacy_v3_textured.skp`, whose image is an 8x8 PNG this project
+generated. The model behind the three files now has 4 definitions and an
+`fbd-info` dictionary where the old v7/2014 pair had 3 definitions and `test-info`;
+expectations were updated to match. Note: removing the files from the tree does not
+remove them from git history.
+
+### Fixed — .NET: OBJ/MTL export retains SceneBuilder material colors and alpha (#422)
+
+The .NET SceneBuilder stores glTF `baseColorFactor` values as `double[]`,
+but the OBJ/MTL exporter only read `List<float>` and `List<object>`.
+As a result, exported materials were gray (`Kd 0.8 0.8 0.8`) and
+transparency was lost (`d 1.0`). The exporter now reads numeric
+channels from arrays and compatible lists, including `double[]` and
+`float[]`, while preserving the existing defaults for unsupported
+string values and colors with fewer than three channels. RGB-only
+factors remain opaque unless an alpha channel is supplied.
+
+### Fixed — all five legacy readers: SketchUp 3 files with fewer than two materials now parse
+
+A legacy file with zero or one material can't use the two-material bootstrap for
+its slot numbering, so the readers fall back to a probe that walks the model
+prefix with a throwaway base. That probe still read a layer count - which
+SketchUp 3 does not write (its layer records simply run until the
+definition-list anchor) - so it consumed the first layer record and rejected
+every such file with `implausible layer count in base probe`. The #407 fix had
+called this path "untouched and unverified"; a single-material V3 file saved
+by the installed SketchUp library now shows it was broken. V3 skips the count in
+the probe the same way the main walk does. New 4 KB fixture
+(`legacy_v3_textured.skp`): one face painted with a single material whose image
+is an 8x8 PNG generated by this project, so it also exercises V3's inline image
+in a file with no default-template content. The new test fails on the previous
+code in Python, TypeScript, .NET and Dart (C++ not rebuilt against the old code).
+
+### Fixed — TypeScript, .NET, Dart, C++: legacy dimensions anchored inside components no longer cut the root entity list short (openskp#412)
+
+A legacy (pre-2021) linear dimension stores, after each connection ref, a second
+entity ref and two ref lists - the instance paths of the anchored entity, i.e. the
+groups/components it lives in. On loose geometry those are ten zero bytes; anchored
+to geometry inside components they carry a ref per component. The four readers
+still skipped them as fixed 42/82-byte blocks (the Python reader got the real
+layout in #384), so the first path-carrying dimension left the cursor mid-record
+and the root entity list stopped there - with no error, because the root reader
+treats an unreadable item as the end of an over-declared list.
+
+Reported against a real SketchUp 2017 cabinet whose imports into the web viewer
+and FreeCAD were "missing random components": 75 of 96 root instances read, 1,338
+of 2,354 faces, 66 dimensions read as 1. All four readers now match SketchUp's own
+Model Info counts exactly on that file (96 root instances, 175 instances including
+nested, 2,354 faces, 5,671 edges, 66 dimensions). Tests use synthetic bytes - the
+real file is private - covering loose geometry, paths through nested components,
+and a path entry that is a whole newly serialized object (MFC writes an object in
+full the first time anything points at it). The parsed output of every existing
+TypeScript fixture is byte-identical before and after. Note for the FreeCAD
+add-on: its vendored copy of openskp predates #384, so it needs re-vendoring from
+a release that contains this fix.
+
+### Fixed — TypeScript, .NET, Dart, C++: the legacy readers get the pre-2014 fixes the Python reader already had (openskp#410)
+
+Three layout fixes found while chasing openskp#284 had only landed in Python;
+each port has its own independently written parser, so none of them benefited.
+Now ported, gated on the file's own version exactly as in Python:
+
+- **Instance GUID (#310)**: the trailing 16-byte GUID on `CComponentInstance` /
+  `CGroup` is read only for files at version 14 or later, not by the class's
+  reported schema (a v7 `CComponentInstance` reports schema 6 yet has none, and
+  `CGroup` reports schema 1 everywhere). The schema gate silently ate bytes from
+  the next sibling and could truncate a root scene to one instance without
+  raising. TypeScript, .NET and Dart; C++ already had it.
+- **`CAttributeNamed` trailer (#385)**: the trailing `u32` exists from v7; a
+  SketchUp 6 file has none, and reading it surfaced much later as
+  `back-ref to unwalked slot`. TypeScript, .NET and Dart; C++ already had it.
+- **SketchUp 3 layout (#407)**: all five readers now parse SketchUp 3 files
+  (see the Python entry below for the full list of layout differences).
+
+Each language gets the same synthetic fixtures and structural tests (parsed
+definitions, root-instance placement, face material, textures), with V3
+cross-checked against V6 from the same source; the new tests fail against the
+previous TypeScript, .NET and Dart readers. In TypeScript, whose full parsed
+output was hashed before and after, every existing fixture is byte-identical;
+the other ports' existing suites pass unchanged. Same honest limits as the Python entry:
+calibrated on one V3 file, and single-material V3 files are unverified.
+
+### Fixed — TypeScript: the legacy (pre-2021) reader no longer holds the whole model's entities until the end
+
+The legacy walk kept every face, loop, edge-use, edge and vertex of the
+model alive until it finished, and only then built each definition's
+geometry. A real 411 MB SketchUp 2020 file held 11.4 million slots (~3.5
+GB of live heap) before the first builder existed, and could not be parsed
+with a 4 GB heap. Each `CComponentDefinition` is now built as its record
+completes, and its entity objects are released right away (their slots
+keep a shared, value-less placeholder so later back-refs still resolve).
+On that file the parse fits in 2.5 GB and runs about three times faster;
+the parsed model and the instanced scene are identical on all 25 real
+files tested.
+### Fixed — Python: SketchUp 3 files parse (openskp#284's V3 signature)
+
+A SketchUp 3 `.skp` died on its very first material (`expected a string record`).
+Unlike the V6/V7 signatures, this wasn't one wrong field: V3's layout differs from
+every later era in about a dozen small ways, found by byte-tracing a real V3 file
+(a synthetic model saved down through SketchUp's own version export). All are gated
+on the header version being below 4: no attribute-container pointer on vertex /
+loop / edge-use / material / layer records; a 5-byte draw block; a 4-byte-shorter
+layer tail and a 13-byte definition base block; textures stored as a bare inline
+image (no preamble, no store-map slot); a fixed 129-byte thumbnail; no layer count
+before the layer records; no name string on instances. In V3 a face's leading
+pointer is its *front material*, not an attribute container, so painted faces now
+resolve their material. Not decoded: the draw-block flags (hidden/soft/smooth are
+reported unset) and anything SketchUp 3 can't store (attribute dictionaries,
+instance names).
+
+The first working parse was misleadingly *successful* - one definition of four, a
+phantom layer, zero root instances - so the new tests assert the parsed structure
+and cross-check it against the V6 fixture built from the same source, rather than
+only that nothing raises. Honest limits: calibrated on one file; V4 needs none of
+this (a real V4 file already parses); V3 files with a single material (the
+slot-base probe path) are untouched and unverified. The other four ports are
+updated in the entry below.
+
+### Fixed — Python: `import openskp` no longer fails where `mapbox_earcut` can't be installed (freecad-openskp#3)
+
+`mapbox_earcut` is a compiled dependency, and `_core` imported it at module
+top level, so `import openskp` itself died with `ModuleNotFoundError` in
+interpreters that can't install it - FreeCAD's bundled Python, for one, where
+two users hit it immediately on opening any `.skp`. Only `triangulate_face_3d`
+(the scene/mesh path) needs it; parsing, loops/edges, the writer and the editor
+don't. The import is now optional: that one path falls back to fan
+triangulation - only correct for convex outlines - and logs a one-time warning
+saying so, instead of the whole package failing to import. `pip install
+openskp` still installs `mapbox_earcut` as before, so normal installs are
+unchanged. Tests block the module in a fresh interpreter to reproduce the real
+import failure, and check the fallback and the warn-once behaviour.
+### Fixed — TypeScript: parsing a large SketchUp 2021+ file no longer builds the whole definitions tree at once
+
+`iterTopLevelLazy` streamed top-level records one at a time, but in real
+files the component definitions are not top-level: they sit under one
+`F901` > `7017` > `7117` chain, which held 100% of a 297 MB model.dat
+(1,203 `7C15` definitions, the largest 0.8 MB). That single record was
+built whole, so parsing a 70 MB `.skp` needed more than 3 GB of heap and
+crashed browser tabs. The three wrapper tags are now passed through, and
+each definition is its own streamed record. No consumer matches those
+tags, so the parsed model and the instanced scene are identical; on that
+file the parse now fits in 1-1.5 GB of heap and runs about twice as fast.
+
+### Added — C++: the model's saved view and the selected scene
+
+SketchUp reopens a file at the view it was saved with, whichever scene is
+selected and even when that scene was not updated. `SkpModel::camera` now
+carries that view (model.dat `FA01` > `34BC`, laid out like a scene camera:
+eye, target, up, field of view, parallel flag, visible height), and
+`Page::selected` marks the scene selected at save time (`6D62` beside the
+page list names it by the entity id each page carries in `6F54` > `DC05` >
+`DE05`). Verified against SketchUp 2026's own `active_view.camera` and
+`pages.selected_page` on a three-scene model; the `Untitled.skp` fixture and
+a synthetic page list cover them.
+### Added — C++: every style.xml item, the style description, watermarks, and the current style
+
+`Style` only carried the two face colors. It now also has `description`
+(the style's `desc` attribute) and `items`: every `<sty:item>` kept raw as
+`StyleItem {type, value}`, keyed by item id, so a caller can read the rest
+of a style's display settings (edge widths, X-ray opacity, section and
+selection colors, ...). Face colors also accept variant type 5, which
+older files use. `watermarks` lists the style's watermarks (item 5001)
+with their raw attributes and the image bytes from the SKP ZIP, whether
+the style names the image relative to its folder or from the ZIP root; a
+new `style_watermark.skp` fixture covers both. `folder`, `active`,
+`working_copy` and `modified` come from model.dat's style catalog, so a
+caller can tell the model's current style (and its "_1" working copy with
+edits not yet updated into it) from the other styles in the file. `docs/API_DESIGN.md` documents the shape for the other
+languages and the item id → `RenderingOptions` key table, confirmed
+against SketchUp 2026.
+
+### Fixed — all five ports: legacy textures that carry an attribute dictionary failed to parse (#396)
+
+A texture is an entity in its own right, so right after a material's
+"has texture" flag it opens with the standard entity preamble: an
+attribute-container reference and, from v17 on, the persistent-id mask.
+`texture_block` skipped a fixed 1/2-byte pad there, which is only right
+when the reference is null. Render plugins (Rayscaper, per the report)
+store a dictionary on the texture itself, so those files died with
+`texture size block misaligned` (C++) / `texture object is not a dib`
+(Python) - the same error text as the still-open V4/V5 signature in #284,
+though that one remains uninvestigated. All five readers now step back over
+the flag's high byte and call the existing preamble reader; for a texture
+without attributes this consumes exactly the same bytes as before.
+New Python regression test (`test_legacy_texture_attributes.py`) patches the
+writer to emit a real container on a texture - the byte shape of the
+reporter's private files - and fails with the reported error on the previous
+code.
+### Fixed — All languages: style face colors read from the wrong items, with R and B swapped
+
+`styles[].front_color` / `back_color` came from style.xml items 4000/4001,
+which are the background and sky colors, not face colors; the face colors
+are items 2002 (front) and 2003 (back). The values were also decoded as
+ARGB, but SketchUp stores them as signed-int32 ABGR (R in the low byte),
+so R and B came out swapped. Verified against SketchUp 2026's own
+`rendering_options` on a model with a custom style; the `Untitled.skp`
+fixture's back color now decodes to SketchUp's default (164, 178, 187).
+The synthetic Python test pins literal colors and adds 4000/4001 decoys.
+
+### Fixed — TypeScript: `EdgeFlagStore` could abort the process on descending edge ids (#393)
+
+`ensureSlot`'s re-base path (for an edge id below the current base) sized
+its backing array from the *current capacity* and always doubled it, even
+for a shift of 1. Edge ids aren't guaranteed ascending, and a descending
+run of ids each triggers a re-base - ~24 of them reached 512 MB and V8
+hard-aborted the process (`change_in_bytes < kMaxReasonableBytes`), which
+a caller can't catch. Now sizes from the span actually in use (tracked via
+a new `highSlot` high-water mark) and leaves proportional headroom below
+the new id, so a descending run re-bases `O(log n)` times instead of on
+every write and memory stays proportional to the id span. New tests cover
+100,000 descending ids, a single far jump below, and interleaved
+ascending/descending runs cross-checked against a plain `Map`.
+### Added — C++: model attribute dictionaries, instance entity IDs, and face layers (VFF)
+
+Three things a renderer importing `.skp` files needs to match what the
+SketchUp SDK reports, all read from records the VFF reader already walks:
+
+- `SkpModel::attribute_dictionaries` - the dictionaries attached to the
+  model itself (Ruby's `Sketchup::Model#attribute_dictionaries`), where
+  SketchUp (`GeoReference`, ...) and extensions keep model-wide settings.
+  Read from the model record's `F601 -> 8813 -> D007 -> DC05` container,
+  with the same decoder `Instance::attribute_dictionaries` uses, so values
+  keep their native types.
+- `Instance::id` - the placement's own TLV entity ID, i.e. the ID SketchUp
+  persists across sessions (`Sketchup::Entity#persistent_id`). Extensions
+  key per-instance data on it; checked against real files where it matches
+  the persistent IDs a SketchUp extension saved for those instances.
+- `Face::layer` - the name of the layer (tag) a face is on, resolved from
+  its `D207` layer reference the same way instance layers already are.
+  Faces on the default layer (Layer0) carry no reference and stay `""`.
+
+All three are VFF-only for now; legacy (pre-2021 MFC) files leave them
+empty/unset. New `parser_test.cpp` tests cover the model dictionaries on
+`SU_File.skp` (typed `GeoReference`, `GSU_ContributorsInfo`, `IfcGUIDs`
+values), unique instance IDs on `Untitled.skp`, and the legacy fallbacks.
+Face layers are verified on real files outside the fixture set - none of
+the current VFF fixtures has a face on a non-default layer.
+
+### Fixed — C++: legacy reader ports of two Python fixes (openskp#284, #390, #391)
+
+Two bugs in `legacy.cpp` that Python's `legacy.py` already had fixed
+(#310, #385), never ported:
+
+- `CAttributeNamed`'s trailing `u32` is a v7+ addition - a real SketchUp 6
+  file ends the record at the empty-key terminator with nothing after it.
+  Reading it unconditionally ate 4 bytes belonging to the next sibling's
+  own tag. Gated on `ver >= 7`, same as the Python fix.
+- The instance/group GUID read (`legacy_instance_has_guid`) was still
+  gated on the class's own reported schema number - `CGroup` reports
+  schema 1 on every version tested (v3 through 2025), so that gate was
+  always true and forced a phantom 16-byte read on *every* `CGroup` in
+  *every* pre-2014 file. Replaced with the same file-version gate
+  (`ver >= 14`) Python's #310 fix established; the now-dead
+  `class_schema` bookkeeping this schema check was the only reader of is
+  removed.
+
+Found while porting #385 to C++: the new `legacy_v6_synthetic.skp`
+fixture (a nested `CGroup` carrying an attribute dictionary, reused
+as-is from #385) tripped both bugs at once, since either one alone
+corrupts the same record. Full C++ suite (263 tests) passes with both
+fixes; `lowlevel_test.cpp`'s `legacy_instance_has_guid` unit test
+updated to assert the version gate instead of the disproven schema gate.
+
+### Fixed — C++: boolean and Length attribute values keep their types through write and read
+
+The C++ writer's `AttributeValue` only had `std::string` / `std::int32_t` /
+`double`, so a SketchUp boolean had to go out as an int32 and a `Length` as
+a plain double - Python's writer already emits both natively (`bool` →
+type 7, `create.Length` → type 12). Added `AttributeBool` and
+`AttributeLength` alternatives (wrapped, so a string literal or an integer
+can never convert into them) and write them as types 7 / 12.
+
+Reading kept neither: legacy type 7 decoded as `Integer`, type 12 and VFF
+`AF38` as `Float`, and VFF `AA38` - a native boolean the VFF decoder did not
+know - as `Null`. `AA38` is real: a SketchUp 2024 file with
+`face.set_attribute("d", "is_a_face", true)` stores `A438 { AA38 01 }`.
+`ParsedAttribute` gains `Kind::Boolean` (`integer` = 1/0) and
+`Kind::Length` (`number` = inches); `A938` / type 6 stay `Float`. Both new
+kinds stringify exactly as the integer / float they used to decode to, so
+`properties`, scene, JSON and IFC output are unchanged. Python, TypeScript,
+.NET and Dart readers are not touched here.
+### Fixed — Python: legacy definition names could fail to anchor when the GUID prefix runs shorter than expected
+
+`_read_definition` reads a 16-byte GUID immediately followed by the name
+string's marker; some files skew that fixed width. SketchUp 2020 files
+carrying 2 extra bytes ahead of the GUID were already handled by scanning
+forward. Reported (openskp#377, with an excellent, self-diagnosed writeup
+and a verified fix from the reporter): a definition imported from DWG in a
+SketchUp 2018 file skews the *other* way - the prefix runs shorter, so the
+marker sits a few bytes *before* the assumed position, which the
+forward-only scan couldn't find, aborting the whole parse. The scan is now
+symmetric (nearest offset first, in both directions), extracted into a
+directly unit-tested `_reanchor_on_string_marker` helper. Verified by the
+reporter against the real SketchUp SDK's own output (glTF bounding boxes
+matched on every axis) and their own real-file regression corpus, which is
+unaffected since the fallback only ever runs where the strict read would
+otherwise raise.
+
+TypeScript/.NET/Dart carry the identical forward-only scan (confirmed by
+inspection) and would hit the same failure mode on an equivalently-skewed
+file - not yet ported, tracked in openskp#285. C++'s legacy reader has no
+equivalent mechanism at all; unclear yet whether it needs one or already
+handles both files' layout some other way - needs its own look.
+### Fixed — Python: legacy V6 files with attribute dictionaries failed to parse
+
+Part of openskp#284's version-compatibility sweep: a SketchUp 6 file's
+`CAttributeNamed` record has no trailing field, unlike v7+ - but
+`_read_attr_named` read one unconditionally. On a file with any attribute
+dictionary (e.g. a nested group's custom attributes), that phantom
+4-byte read silently ate into the next sibling's own tag, which didn't
+raise there - it surfaced many reads later, deep in the object graph, as
+an unrelated `back-ref to unwalked slot N` error (the same
+misleading-error-site pattern as the V7/V8/2013 GUID bug fixed in #310,
+but a distinct cause: `CAttributeNamed`'s class is always learned from
+the unwalked pre-model region, so its schema is never observed and can't
+gate this the way the instance-GUID fix did). Gated the trailing read on
+`ar.ver >= 7` instead, confirmed against a real SketchUp-6-downgraded
+fixture and cross-checked for no regression on the existing v7/2014
+fixtures.
+
+### Changed — TypeScript: dropped Node 20 from CI/release after the vitest 5 bump
+
+Following up on the vitest 4→5 Dependabot bump (#366): vitest 5 requires
+Node `^22.12.0 || ^24.0.0 || >=26.0.0` and does not support Node 20 at
+all - `npm ci` on Node 20 already showed `npm warn EBADENGINE` for
+`vitest@5.0.1`, silently tolerated only because npm treats `engines`
+mismatches as non-fatal by default, not because it actually works by
+design. Node 20 itself [reached end-of-life on 2026-04-30](https://nodejs.org/en/about/previous-releases),
+so there's no real reason to keep it as a declared/tested target going
+forward. Removed `'20'` from `ci-typescript.yml`'s test matrix, bumped
+`deploy-pages.yml`/`release-typescript.yml` from Node 20 to 22 (both run
+`npm ci`, so they'd hit the same warning), and updated
+`packages/typescript/package.json`'s `engines.node` from `>=20` to
+`>=22.12.0` to match reality. Checked the actual test suite first: no
+`test.sequential`/`describe.sequential` usage, no mocking at all (so
+vitest 5's `clearMocks: true` default doesn't change anything here), and
+no separate vitest/vite config file (so the parent-directory config
+search change doesn't apply either) - the whole suite (446 tests) passes
+unchanged against vitest 5.0.1.
+
+### Added — Python: `add_text`/`add_construction_point` now work inside a component definition or group
+
+Requested (openskp#380): SketchUp's own Text and Construction Point tools
+can be used while editing a component/group in place, so the resulting
+entity belongs to that definition - `ComponentDefinitionBuilder` (the
+`with builder.add_component_definition(...)`/`add_group(...)` context)
+had no equivalent, only the root `SkpBuilder`. `add_text`/
+`add_construction_point` are now also available on
+`ComponentDefinitionBuilder`, writing into the definition's own entity
+stream (matching `add_face`'s existing per-definition scoping) rather
+than the root model's. The `CSkFont` record `add_text` needs is cached
+on the shared builder either way, so a definition-level and a root-level
+text still reuse one font record rather than writing (and
+back-referencing) a redundant second one. Verified against real
+SketchUp 2025 (Ruby console): a definition written with both an inline
+text and a construction point opens cleanly, with both entities correctly
+parented under that component/group, never leaking onto the root model.
+
+### Fixed — C++: VFF/legacy attribute dictionaries keep native types
+
+Python's `Instance.attribute_dictionaries` already returns the types
+SketchUp stored (`int`/`float`/`None`/3-tuple/nested list) and only
+stringifies for `properties` and the baked scene. The C++ reader decoded
+the same VFF tags (`A738` int32, `A938`/`AF38` float64, `B438`/`B538`
+point/vector, `AE38` array) then immediately formatted them as strings,
+so a file that saved `angle = -7` came back as `"-7"`. Legacy
+`CAttributeNamed` did the same, and never copied non-DC dictionaries onto
+the instance at all. `Instance::attribute_dictionaries` is now
+`ParsedAttrDictionaries` (a breaking C++ type change for callers that
+treated every value as a string — use `to_string()` / `kind`);
+scene/JSON/IFC still stringify every named dictionary (the reader does
+not skip dictionaries by name). Regression tests lock VFF
+integer/float/point/array decode and a writer round-trip of
+int32/double/string.
+### Fixed — `pip install -e ".[dev]"` and the web viewer's "Upload SKP" both broken on a fresh clone
+
+Reported (openskp#375): following this project's own documented setup
+steps failed twice. `pip install -e ".[dev]"` didn't pull in `flatbuffers`/
+`pillow`, so `pytest` hard-failed with `ModuleNotFoundError`/`ImportError`
+instead of running (or skipping) - `dev` now installs the same specifiers
+as the `fragments`/`textures` extras, so the documented one-line setup
+actually works. Separately, `examples/web-viewer`'s "Upload SKP" was
+completely non-functional on a clean checkout: `npm run build` never
+populated the (gitignored) `examples/web-viewer/dist/` the viewer loads
+from - `copy-dist.js` existed but had to be run as a second, undocumented
+manual step (only `deploy-pages.yml`'s own CI knew to call it) - fixed via
+a `postbuild` npm script. Even after that, the browser threw
+`Uncaught TypeError: Failed to resolve module specifier "flatbuffers"`:
+the viewer's `index.html` import map (added for `fflate`/`earcut`) was
+never updated when `flatbuffers` became a real dependency for Fragments
+export/import - added the missing entry. Verified all three fixes
+together in a real browser: the viewer now loads a sample file and
+renders it with zero console errors.
+### Fixed — legacy: zero-material v18 files with a custom layer ahead of Layer0
+
+Legacy files with fewer than two materials bootstrap the slot base by walking
+the layer list and treating the next object as a back-ref to the active layer.
+Some SketchUp 2018 saves list a custom tag first (`layer_count` = 1) and write
+Layer0 after a 16-byte colour-layer extension (12 zero bytes + u32). The
+reader consumed only the 21-byte colour tail, so the probe landed on padding
+and failed with `base probe: anchor resolved to` before any geometry. Colour
+`CLayer` records now skip that extension when it precedes another `CLayer`,
+and both the probe and the model walk keep reading `CLayer` records past the
+declared count (same trailing skip the walk already used for v20 separators).
+Python, TypeScript, .NET, Dart, and C++.
+
+### Added — C++: write construction lines/points inside component definitions
+
+`ComponentDefinitionBuilder` now has `add_construction_point` /
+`add_construction_line` with the same signatures as `SkpBuilder` (Python's
+writer is still root-level only). `open_existing()` replays both, including
+inside nested definitions that previously counted as "no replayable
+geometry" when they had no faces. Half-bounded lines (one end unset) are
+skipped with a warning — the public writer API is still fully finite or
+fully infinite.
+
+### Fixed — construction-line trailer calibration when the guide is last in a definition
+
+A `CConstructionLine` that is the last entity in a `CComponentDefinition`
+is followed by `nrel=0`, which looks like a null MFC tag. The v17
+calibrator preferred a 7-byte trailer on that weak match, swallowed three
+bytes of the definition tail, and then cached that 7 for every later
+guide in the file (this project's writer, and real SketchUp 2025, use 4).
+The strong-tag pass is unchanged; the null pass now prefers 4. Same
+change in Python's `legacy._read_constructionline`.
+### Added — Read VFF (2021+) construction lines/points (Python + C++)
+
+VFF files store guide lines under definition list `9113` → `6942` / `6A42`
+(same 8 doubles as classic `CConstructionLine`) and guide points under
+`9213` → `6C42` / `6D42`. Those tags are now containers in the TLV walker
+(`_core.CONTAINER_TAGS` / `tlv.cpp`), and the geometry collectors fill
+`Definition.construction_lines` / `.construction_points`. Ground-truthed
+against a SketchUp-authored VFF layout; tests lock the tag layout with
+synthetic TLV so the fixture does not have to carry a real document path
+or template.
+### Fixed — C++: face UV basis and pin scale now match Python / real SketchUp
+
+Python's writer already parameterized a face's texture matrix in SketchUp's
+normal-derived basis (`U = normalize(Z × n)`, `V = n × U`; horizontal `(X, Y)`,
+downward `(−X, +Y)`; tilt sine below `1e-3` stays on the world axes) and scaled
+`front_uv`/`back_uv` pins from tiles into texture-inches using the material's
+applied size before the fit. The C++ port still solved the matrix in a
+first-edge basis (`points[1] − points[0]`), which agreed with SketchUp only
+when that edge happened to run along `Z × n` and otherwise turned the mapping
+90° or 180° (a square listed from a different corner, every underside, a
+faceted curve of small quads). Its reader copies (`face_groups` / `edit` /
+`codegen`) used a `1e-9` snap and the `(X, −Y)` downward mirror, so a
+near-horizontal normal's float noise flipped the basis and every downward face
+read back upside-down. Pins were also left in tiles, so a material applied at
+anything other than 1 in per tile came out that many times too big. C++ now
+matches Python on all four copies of the basis, stores applied size per
+textured-material slot, and scales pins in both `SkpBuilder::add_face` and
+`ComponentDefinitionBuilder::add_face`. Regression tests lock the vertex-order
+matrix, the downward `(−X, +Y)` matrix, and a 10-inch tile's 5× scale.
+### Added — C++: named dictionaries on `CLayer`
+
+`SkpBuilder::add_layer` now accepts `LayerOptions::extra_dictionaries` and
+writes them as `CAttributeNamed` records on the layer. `parse()` copies
+every named dictionary on a legacy `CLayer` onto
+`Layer::attribute_dictionaries` (string maps, same contract as
+`Instance::attribute_dictionaries`). The reader does not special-case
+dictionary names. VFF layers still have no attribute slot, so this is
+empty there. `edit()` replays the dictionaries so a round-trip through
+the writer keeps them.
+
+### Added — Read a `.frag` file back (TypeScript, .NET, Dart, C++) - all 5 languages now
+
+Ports Python's `from_fragments()`/`read()` to TypeScript (`fromFragments()`,
+#362), .NET (`FragmentsExport.FromFragments()`/`ReadFragments()`, #363),
+Dart (`fromFragments()`/`readFragments()`, same package as the writer, #364),
+and C++ (`openskp::from_fragments()`/`read_fragments()`, #365) - closing out
+the last remaining cross-language gap tracked since the 1.3.0 synchronized
+release. Materials, shell/big-shell geometry (including the multi-shell case
+for oversized primitives), per-item name/guid/layer, and the
+spatial-structure tree - matching Python's own known gaps exactly
+(`positionMm`/`properties`/`attributeDictionaries` left at defaults, no
+UVs/stored normals, only `RepresentationClass.SHELL` read), not
+independently improved on. Verified via self-round-trip for all four (basic
+scene, both wire formats, real guids/`layer_hidden`, the multi-shell read
+path) - not yet tested against a real externally-produced `.frag` file the
+way Python's own read side was. See
+[docs/LANGUAGE_PARITY.md](docs/LANGUAGE_PARITY.md).
+
+### Fixed — Dart: odd material counts silently corrupted the Fragments materials vector
+
+Found while adding Dart's Fragments reader above - nothing previously read
+the materials vector back, so this went undetected. `Material` (6 bytes:
+r/g/b/a + renderedFaces + stroke) is the only struct in the Fragments schema
+whose size isn't a multiple of 4 bytes; `package:flat_buffers`'s
+`writeListOfStructs`+`endStructVector` writes struct elements first and the
+length-prefix uint32 last, so aligning that final uint32 write can insert
+padding between the length prefix and element 0 - invisible for every other
+struct type in this schema (all already 4-byte multiples regardless of
+count), but a real, silent corruption whenever the material count was odd
+- any real file with an odd number of distinct materials would have been
+affected, though export-only consumers (the only ones that existed before
+this fix) never noticed since nothing decoded the bytes back to check.
+Fixed by pre-padding to the correct alignment before the elements are
+written, closing the gap; regression test confirmed to fail without the fix
+and pass with it.
+
+### Fixed — C++: dangling-reference bug in the new Fragments JSON parser
+
+Found while writing C++'s Fragments reader above, in the new code itself
+rather than something pre-existing: `MinimalJsonParser` (a small
+dependency-free JSON reader, needed since this package takes on no JSON
+library beyond FlatBuffers/miniz) stored its input as a `const
+std::string&` member. The metadata-parsing call site passed
+`model->metadata()->str()` directly - a temporary `std::string` returned
+by value - which is destroyed at the end of that full expression, the
+instant the constructor returns; a reference *member* (unlike a local
+`const std::string&` variable) does nothing to extend a temporary's
+lifetime. Every subsequent read through that dangling reference was
+undefined behavior, which manifested here as `layer_hidden` silently
+coming back empty instead of crashing outright - exactly the kind of UB
+that doesn't reliably announce itself. Caught by the real round-trip
+test for that exact field, not by inspection. Fixed by having the parser
+own a copy (`std::string`, constructed by value and moved in) instead of
+referencing the caller's.
+
+## [1.3.0] — 2026-09-18 — synchronized release, all 5 languages
+
+> **Same version number across all 5 languages, not identical capability.**
+> This release folds `preview-python-v1.3.2` and `preview-cpp-v1.3.1` into
+> real, published `python-v1.3.0`/`cpp-v1.3.0` releases as-is — Python and
+> C++ carry real capability (Fragments reading, loose-edge/curve support,
+> IFC curve annotations, legacy pages/scenes reading) that TypeScript,
+> .NET, and Dart do not yet have. Rather than hold that already-tested work
+> back purely to keep every language byte-for-byte equal, it ships now,
+> honestly tracked as still-open in
+> [docs/LANGUAGE_PARITY.md](docs/LANGUAGE_PARITY.md) and
+> [issue #285](https://github.com/iamahsanmehmood/openskp/issues/285)
+> rather than silently implied as closed by the shared version number.
+> Everything below the sections tagged Python-only/C++-only IS aligned
+> across all 5 languages, verified directly against each language's
+> current `main` source (not just commit messages) before release.
+
+### Fixed — Fragments export crash on shells with more than 65535 triangles (all 5 languages)
+
+A single Fragments "shell" (triangulated mesh) can't exceed 65,535
+triangles in the real format - none of the 5 exporters split an oversized
+one, so a sufficiently large, densely-triangulated mesh crashed the
+export outright (Python: a loud `TypeError`; C++/TypeScript/.NET/Dart:
+silent index truncation/wrap, a worse failure mode with no error at all).
+Fixed identically across all 5 by splitting an oversized primitive's
+triangles into multiple shells, each an additional Fragments Sample
+referencing the same item/material/transform. Python #355, .NET #356,
+TypeScript #357, Dart #358, C++ #359.
+
+### Added — Writer support for section planes, dimensions, and leader text (all 5 languages)
+
+Section planes, linear dimensions with leader text, and construction
+lines/points are now writable from all 5 languages, not just readable.
+C++ #351, TypeScript #349, .NET #348, Dart #350.
+
+### Fixed — Construction line/point reader discarding parsed geometry (TypeScript, .NET, Dart)
+
+TypeScript #353, .NET #352, Dart #354.
+
+### Fixed — Overlapping face holes triangulated to an arbitrary, undefined triangle count (all 5 languages, #285)
+
+See the detailed root-cause writeup below (Python/.NET sections) - a real
+fixture with two overlapping circular holes had no well-defined
+triangulation; each independent earcut implementation now detects real
+hole-hole overlap and resolves it to a well-defined boundary before
+triangulating. C++ #343, TypeScript #340, Dart #341.
+
+### Added — Multiple attribute dictionaries, VFF per-layer-hidden flag, real per-instance GUID/name-resolution Fragments export (all 5 languages)
+
+Every attribute dictionary an instance carries is now exposed (not just
+SketchUp's own `dynamic_attributes`), the real per-layer visibility flag
+is read from VFF (2021+) files, and Fragments export uses real
+per-instance GUIDs/name-resolution/layer-hidden state at full
+cross-language parity. TypeScript #329/#332/#335/#338, .NET
+#328/#331/#334/#337, Dart #330/#333/#336/#339, C++ (folded into its own
+preview cycle, see below).
+
+### Added — Loose-edge grouping/layer on the public typed model (`Edge.layer`, `Edge.curve_id`, `Face.layer`, `loose_edge_runs()`)
+
+**Python-only.** TypeScript/.NET/Dart don't have this on the typed model,
+or the underlying edge-layer/curve-grouping read at all. C++ doesn't
+either, outside its own preview cycle. Tracked in
+[#285](https://github.com/iamahsanmehmood/openskp/issues/285). (`Edge.layer`, `Edge.curve_id`, `Face.layer`, `loose_edge_runs()`)
+
+`SkpFile.parse()`'s typed `Definition`/`Edge`/`Face` model had no way to read a face's or edge's own layer, or SketchUp's own `Edge#curve` grouping - only `build_scene()`/`build_instanced_scene()` could reach that data, and only internally, since both bake it straight into triangulated mesh output. A consumer building real B-rep geometry rather than a render mesh (exactly what the FreeCAD addon needs for loose-edge/structural-framing import) had no way to get there at all.
+
+Added `Edge.layer`/`Edge.curve_id` and `Face.layer` (all `Optional[int]`, `None` when the file has no override), and a new public `openskp.loose_edge_runs(definition)` function that groups a definition's loose edges (edges no face uses) into ordered `(edge_ids, vertex_ids, closed)` runs - the same file-driven grouping `build_scene()`'s `curve_sets` and `build_instanced_scene()`'s `curve_resources` already use, now exposed for typed-model consumers directly, returning raw ids rather than baked/triangulated coordinates.
+
+Also exports `InstancedCurveResource`/`LocalCurve` from the package's top level (`import openskp`) - added alongside `build_instanced_scene()`'s curve-resource support earlier but never actually added to `__init__.py`'s public exports.
+
+Verified by cross-validating against `build_instanced_scene()`'s own (already-tested) `curve_resources` on every fixture on hand: the same run count, in the same order, with matching coordinates, comes out of both the baked-mesh path and this new raw-typed-model path for the same definition.
+
+Python-only. TypeScript/.NET/Dart/C++ don't have this on the typed model, or the underlying edge-layer/curve-grouping read at all - tracked with the rest in [#285](https://github.com/iamahsanmehmood/openskp/issues/285).
+
+### Added — Loose-edge/curve support in `build_instanced_scene()` (structural framing, light-gauge steel)
+
+`build_scene()` gained loose-edge curve sets in the entry below (openskp#316) - `build_instanced_scene()` had no equivalent at all, so a definition made entirely of loose edges (a light-gauge-steel or timber-framing member drawn as a construction line rather than a solid - exactly how a structural model routinely represents studs, king studs, header jack studs) contributed nothing to the instanced scene whatsoever. Found by a real user testing the [Blender addon](https://github.com/iamahsanmehmood/blender-openskp) against a real structural-framing file: 93 of the file's 145 definitions were entirely or partly loose-edge, invisible on import.
+
+Two new types mirror the existing mesh-resource shape: `InstancedCurveResource` (a definition's loose-edge runs, local space, built once) and `LocalCurve` (one run's points/closed flag/layer/arc), referenced from `InstancedNode.curve_resource_id` the same way `mesh_resource_id` already works. The underlying curve-chaining and analytic-arc-recovery logic (`_order_curve`/`_chain_loose_edges`/`_solve_run_arc`) was extracted from `scene.py` into a new internal `_curves.py` module rather than duplicated - both paths need the exact same math, none of it baked-vs-instanced-specific.
+
+Verified against real fixture files by cross-validating both code paths against each other: flattening the instanced output (composing node transforms) has to reproduce `build_scene()`'s own `curve_sets` exactly, on every fixture on hand (`test_reproduces_build_scenes_curve_sets`), the same strategy the existing triangle-equivalence test already uses. That cross-check caught a real bug before it shipped: a definition with BOTH faces and loose edges resolved the loose edges' fallback layer from the *calling instance's* inherited layer instead of the definition's own dominant face layer (scene.py's `instantiate()` reassigns its local `parent_layer` from the definition's own faces before its loose-edge block runs - a step this port initially missed). Confirmed on `gondola_v20.skp`: run 12 onward resolved `'Layer0'` where the baked path correctly resolved `'Gondulas Laterais'`, fixed, then re-verified point-for-point across all fixtures.
+
+Python-only. TypeScript/.NET/Dart/C++ have neither `build_instanced_scene()`'s curve support nor `build_scene()`'s (from #316) - tracked in [#285](https://github.com/iamahsanmehmood/openskp/issues/285).
+
+### Added — Curve-only models reach the IFC: loose-edge runs as `IfcAnnotation`, proven arcs as `IfcIndexedPolyCurve`
+
+A drawing-style model - a facade elevation, a section outline - is loose edges only, with no faces anywhere. `build_scene()` had nothing to bake, so the IFC export came out as a spatial skeleton with no elements in it at all: real line work, present in the file, absent from the output.
+
+Both places the information was dropped are fixed. `legacy.py` and `_core.py` now surface four values they were reading and then discarding: the edge's own layer (VFF `D207`, the classic drawbase - the *only* layer signal a curve-only model carries, since it has no faces to carry one), the file's own `Edge#curve` grouping (`BB0B`, the classic `CCurve` pointer), the 14 doubles of a classic `CArcCurve` (center, normal, x-axis, start, end, y-axis), and each face's own layer - the classic walker parsed the face drawbase and copied only material/hidden out of it, so every face arrived on whichever layer it happened to inherit. `scene.py` chains loose edges into world-space runs along the file's own curves rather than by a vertex-adjacency heuristic, and `export/ifc.py` writes each run as an `IfcAnnotation` holding an `IfcGeometricCurveSet` in an `Annotation` sub-context, with the layer assignment carrying the curve, so the layer the author drew on survives into the file.
+
+A run that is provably one whole circular arc stays an arc instead of its tessellation. Three things have to hold before a run is called one - it is the entire curve, its frame is a circle and not an ellipse (`|normal × x_axis - y_axis|` within tolerance), and every vertex lies on that circle - and the result goes out as an `IfcIndexedPolyCurve` with `IfcArcIndex` segments. A run that fails any of the three keeps the chords the file stores; the real case is gondola's 16 non-uniformly-scaled arc frames out of 30, which are genuinely elliptical. That is a floor rather than a gap: IFC4 has no elliptical-arc expression in this shape, so the chords are the file's own evidence, and inventing something else would be worse than keeping them.
+
+The extra geometry is opt-out via `build_scene(include_curve_sets=False)`, measured at +5.7% of the IFC on one model carrying both solids and curves. On a curve-only model there is nothing to opt out of - the curve sets are the entire content.
+
+Known limit, asserted in the tests rather than left implicit: a closed full turn goes out as two half-turn segments, and a run whose arc cannot be closed that way is conservatively left as chords rather than guessed at.
+
+Python-only. TypeScript/.NET/Dart/C++ have neither these reads nor the annotation path - no `IfcAnnotation`, no `IfcArcIndex`, no edge-layer surfacing in any of the four - tracked with the rest in [#285](https://github.com/iamahsanmehmood/openskp/issues/285).
+
+### Fixed — Python: the IFC4 writer emitted STEP that a conforming reader rejects (360 problems across 10 files → 0)
+
+Four independent defects, each found by reading what a real reader said about a real export rather than by guessing, and each verified afterwards against `ifcopenshell` 0.8.5 `validate(express_rules=True)`, which type-checks every attribute against the schema. Re-exporting the same ten files with the four fixes reverted and then in place gives 360 problems → 0.
+
+- **Non-ASCII text went out as raw UTF-8.** ISO 10303-21's default character set is ISO 8859-1, so anything outside it has to be escaped as `\X2\<UTF-16BE uppercase hex>\X0\`. A real model with Chinese element names (楼梯间, 楼板, 外墙…) exported 35 raw non-ASCII characters and 0 escapes before, 0 and 19 after. The trap is that nothing complains: `ifcopenshell` opens the file happily and silently drops the characters, so the names come back missing their text and no diagnostic anywhere says so.
+- **`.TRUE.`/`.FALSE.` are IFC2x spellings** - IFC4 is `.T.`/`.F.`. Same class of error in two more places: `.READWRITE.` is not a valid `IfcChangeActionEnum` (`NOCHANGE` is), and `.STERADIANUNIT.` is not a valid `IfcUnitEnum` (`SOLIDANGLEUNIT` is - the *unit name* stays `.STERADIAN.`). These two spellings put at least two problems into every one of the ten files.
+- **Every product line was written with 9 attributes.** IFC entity types do not share one attribute count - `IfcDoor` declares 13, `IfcWall` 9 - so shorter types were over-long and longer ones lost their trailing attributes. `export/ifc_attr_counts.json` now carries the count per type, generated from the schema rather than typed by hand.
+- **`IfcTriangulatedFaceSet.Closed` was a hardcoded claim.** It is now computed: coordinates welded at 6dp, then every undirected edge has to be used by exactly two triangles. A mesh with a boundary is reported open, as is one with an edge used three times; the previous value asserted closure about meshes that were not closed.
+
+The same class of silent failure bit the arc work above, and is worth recording because it is exactly how a writer's bug survives: `IfcArcIndex` is a *defined type*, not an entity, so a standalone `#n=IFCARCINDEX(...)` line is a syntax error - and `ifcopenshell` 0.8.5 answers a syntax error by truncating the file at that line without a word, its `validate()` still reporting "0 problems", because the entities it never read cannot be wrong. The segment is therefore emitted inline, and a test opens the file with an actual reader and counts what came back.
+
+Python-only, and all four are worth checking in the other four ports' IFC writers - tracked in [#285](https://github.com/iamahsanmehmood/openskp/issues/285).
+
+### Fixed — Overlapping face holes triangulated to an arbitrary, undefined triangle count (#285)
+
+Root-caused the ".NET vs Python triangle/vertex-count divergence on a real file" item: a real fixture (`Untitled.skp`) has faces with two circular holes close enough together (centers 0.33" apart, radius 0.69" each — evidently one slotted/oval cutout recorded as two overlapping full circles) that they genuinely overlap. Feeding two overlapping rings to a hole-based earcut triangulator is undefined - there's no single well-defined triangulation of self-intersecting boundary input, so this project's own `mapbox_earcut` call and the independently-implemented .NET port each picked *some* triangle count for it, never the same one. It was never a case of one implementation needing to copy the other's number; neither was computing anything well-defined.
+
+**Python**: `build_scene()`/`buildInstancedScene()` now detect real hole-hole overlap (a shared boundary edge/point - a normal, common pattern - does not count; only genuine shared area does) and replace the overlapping holes with the boundary of their `shapely` union before triangulating, restoring a normal, well-defined hole shape. Verified against the geometric invariant that a valid triangulation of a polygon with h holes and n total boundary vertices always has exactly n - 2 + 2h triangles, and independently against the closed-form circle-circle intersection area formula. A no-op for the overwhelming common case of genuinely disjoint holes (confirmed: every other real fixture's scene-bake output is byte-for-byte unchanged).
+
+A first version of this fix computed the merged hole boundary correctly but added its new (synthetic, intersection-derived) vertices to a local copy of the vertex lookup instead of the shared dict the mesh-builder actually reads positions from - every triangle touching the merged hole boundary was silently dropped downstream (masked on the real fixture by an ID collision that let stale, unrelated vertex data through instead of erroring outright, which is what made this so easy to miss - a topology-only invariant check on the triangle *count* alone still passed, since 0 triangles trivially satisfies `n - 2 + 2h` for n=0). Caught by adding an independent closed-form area check and fixed before publishing this note.
+
+**.NET**: ported separately (`Triangulator.cs`), using a different strategy to avoid adding this package's first-ever external dependency - only when real hole overlap is detected, triangulates the outer boundary alone and discards any resulting triangle whose centroid falls inside any hole (the same "triangulate then filter" approach this project's own Python port used before its earcut migration). Produces a topologically-correct but not byte-identical result to Python's clean union-boundary approach (a coarser cut exactly at the hole boundary) - verified independently against the same closed-form area formula, not against Python's specific triangle count, since there's no single "correct" triangle-for-triangle answer for degenerate input, only a correct *area*.
+
+TypeScript/Dart/C++ not yet ported - each has its own independent earcut wrapper needing the same overlap-detection treatment; tracked in [issue #285](https://github.com/iamahsanmehmood/openskp/issues/285).
+
+### Fixed — Python: pre-2014 legacy files could silently drop most of the root scene, or crash deep in a nested definition (#284)
+
+`_read_instance`'s trailing-GUID read for `CComponentInstance`/`CGroup` was gated on the class's own reported `schema` number (`schema >= 5` implies a GUID), which doesn't hold: a v7 file's `CComponentInstance` reports schema 6 - well above that threshold - yet has no GUID at all. Forcing the 16-byte read anyway silently consumed bytes belonging to the start of the next sibling entity's own tag. Two symptoms turned out to share this one cause: a `"class-ref to non-class slot N (CAttributeNamed)"` crash deep inside a nested `CComponentDefinition` (the originally-reported bug), and - more dangerous, since it never raised - the root-level entity list's own over-declared-count tolerance silently swallowing the resulting corruption and truncating a real scene from 10+ root instances down to 1 with no error at all. Root-caused with a byte-level trace on a real V7 file (not committed, private project content) and fixed by gating the GUID read on the file's own version number instead of schema, then re-verified byte-for-byte against V7/V8/2013 real files and a clean synthetic fixture pair. `is_legacy` detection, `expected a string record` (v3), `texture object is not a dib` (v4), and `definition list misaligned` (v6) remain separate, unrelated pre-existing bugs, still open.
+
+### Added — Web viewer: WASM fast-preview path for files too large for the pure-JS parser
+
+`examples/web-viewer` bundles the C++ engine's WASM build (`wasm/openskp.js`/`openskp.wasm`) and offers it as an additional option on the existing large-file warning dialog - "Load fast preview (WASM)" alongside "Load anyway" and "Cancel". It hands the raw bytes to the native parser and renders the GLB it returns via Three.js's `GLTFLoader`, trading away layers, the properties inspector, and every export format (`parseSkpToGLB()`'s return value carries none of that metadata) for a load that actually finishes instead of freezing the tab.
+
+Verified on a real 41MB production file that the existing pure-JS path cannot load at all (`Array buffer allocation failed` partway through parsing, a real, reproducible failure - not a synthetic edge case): the WASM path loaded it successfully in 14.9s (1,497,547 faces, 2,696 mesh resources, 32 materials), rendered correctly. Confirmed the existing full-featured path is unaffected for files under the warning threshold.
+
+### Fixed — Web viewer: zooming out on a large model could clip the whole scene into nothing
+
+The camera's near/far clipping planes (`0.1`/`1000`) and OrbitControls' zoom distance were fixed constants sized for the small default sample model, with no `maxDistance` limit at all. A real building-scale model comfortably exceeds a 1000-unit far plane, so zooming out past that distance clipped the entire scene - it just vanished, with nothing to indicate why. `zoomToFit()` now computes near/far and `controls.minDistance`/`maxDistance` fresh from the loaded model's own bounding box on every load (also rescales fog density along with the far plane, so a large model doesn't fog out immediately either). Verified across a wide zoom range on a real 165MB production model: no clipping artifacts zoomed in close, and zooming out to the new (bounded) maximum keeps the model visible - small, correctly, at that distance - rather than clipped away. Confirmed the small default sample model's appearance is unaffected.
+
+### Fixed — `to_instanced_glb()` was accidentally quadratic in mesh-resource count (not a WASM-specific issue)
+
+`make_model()`'s shared binary buffer was grown via `append_values()`
+calling `buffer.reserve(buffer.size() + delta)` once per primitive per
+attribute array (positions/normals/uvs/indices) - `std::vector::reserve()`
+has no obligation to over-allocate beyond what's asked, so a size that only
+ever grows by "just enough" forces a full reallocation-and-copy of
+everything appended so far, every single call. On a scene with many mesh
+resources this turned amortized-O(1) appends into O(resource count²)
+copying - **39,016ms → 485ms (an 80x speedup) at 10,000 resources, and
+713s → 12.6s (56.6x) at 65,000**, real numbers from a synthetic 125MB file,
+fixed by reserving the true final buffer size once, upfront (byte-identical
+output, confirmed on the same file before/after).
+
+This corrects a wrong conclusion from the memory-ceiling fix entry just
+below: profiling (not just black-box timing) found the real hot path was
+`to_instanced_glb()` itself, not the legacy parser - the earlier "WASM is
+12-13x slower than native" claim compared WASM's full parse+build+GLB
+pipeline against a native benchmark that never called `to_instanced_glb()`
+at all. Once compared correctly, this bug affected native and WASM
+equally; there was no WASM-specific slowdown. See
+[issue #305](https://github.com/iamahsanmehmood/openskp/issues/305) for
+the full corrected investigation.
+
+### Fixed — C++ WASM build hit an internal memory ceiling well below what a browser tab actually allows
+
+The `OPENSKP_BUILD_WASM` target set `-sALLOW_MEMORY_GROWTH=1` with no explicit
+`-sMAXIMUM_MEMORY`. Without one, the WASM heap hit an internal allocation
+failure - caught generically and surfaced as a misleading `legacy .skp parse
+failed` error, with the real exception type lost - well before a browser's
+own ~4GB ceiling would actually be reached. Confirmed directly: a synthetic
+125MB file with 65,000 component definitions failed outright under the old
+config; adding an explicit `-sMAXIMUM_MEMORY=4GB` (plus a 256MB
+`-sINITIAL_MEMORY` to avoid repeated grow-and-copy on real files) removed the
+failure. See [issue #305](https://github.com/iamahsanmehmood/openskp/issues/305)
+for the fuller investigation, including a separate, still-open WASM-vs-native
+performance gap this fix does not address.
+
+### Fixed — Cross-language codegen textured material round-trip
+
+`to_*_code()` now preserves both `applied_width` and material `opacity` when regenerating textured materials across all 5 language ports (Python, TypeScript, .NET, Dart, C++).
+
+### Changed — TypeScript writer memory
+
+`ArchiveWriter` keeps the archive in a growable `Uint8Array` instead of a
+`number[]`, and `SkpBuilder.toBytes()` assembles the file into one exact-size
+buffer instead of a second `number[]` plus a final copy. A `number[]` costs
+about 9 bytes of heap per file byte, so a 62 MB write peaked at ~2.1 GB of
+transient heap and took a browser tab down; it now peaks at ~0.2 GB. Output is
+byte-identical. No public API change (`_internal.GrowableBytes` is exposed for
+tests).
+
+## [preview-cpp-v1.3.0] — 2026-09-10 — C++ only, GitHub-only pre-release
+
+> **Folded into the real [1.3.0](#130--2026-09-18--synchronized-release-all-5-languages)
+> release above** (2026-09-18), as-is - not held back for cross-language
+> parity, which is instead tracked honestly in
+> [docs/LANGUAGE_PARITY.md](docs/LANGUAGE_PARITY.md) and
+> [issue #285](https://github.com/iamahsanmehmood/openskp/issues/285).
+
+### Added — C++: Direct SketchUp → Fragments (.frag) export
+
+New `openskp::to_fragments()` / `openskp::export_fragments()`
+(`fragments_export.cpp`), porting Python's `openskp.export.fragments`
+line-for-line: real nested spatial hierarchy, per-item GUIDs (the source
+file's real per-instance SketchUp GUID on VFF/2021+ files, a stable
+synthetic one otherwise), non-unit scale/mirrored instances baked into
+geometry. Verified against the real `@thatopen/fragments` runtime, not just
+this project's own reader — including two real production files (2,239 and
+14,694 items), both with every GUID confirmed distinct and non-empty and
+`mesh_resources` counts matching Python's own output on the same files
+exactly (987/987 and 9,614/9,614).
+
+Roughly 5-9x faster end to end than the equivalent Python pipeline on the
+same real files (parse + scene build + export): ~9.6s vs ~84s on a 14MB
+file, ~97s vs ~500s on a 173MB file.
+
+**Known gaps, stated honestly:**
+- Attribute dictionary values decode as strings only — no `Point3d`/
+  `Vector3d`/`Length`/nested-list support, matching this port's existing
+  string-only property handling elsewhere. See
+  [LANGUAGE_PARITY.md](docs/LANGUAGE_PARITY.md).
+- Same Fragments-format caveats as Python's own implementation: no native
+  per-layer visibility field (carried via a `Model.metadata` JSON sidecar
+  instead), `Model.guid` unpopulated.
+
+### Added — C++: multiple attribute dictionaries per entity
+
+`Instance::attribute_dictionaries` / `InstancedNode::attribute_dictionaries`
+now expose every attribute dictionary an instance carries, keyed by the
+dictionary's own declared name — not just SketchUp's own
+`dynamic_attributes`. Fixes a real bug found while building the Fragments
+port: the previous single-dictionary attribute reader flattened every
+dictionary's entries into one map regardless of source, so a third-party
+plugin's own dictionary (e.g. a steel-detailing tool's own named
+dictionary) silently mixed into `Instance::properties`, and the baked
+(`build_scene`) name-resolution path had no attribute-dict-override
+fallback at all. Both `instanced_scene.cpp` and `scene.cpp` now resolve
+display names the same way Python's `instanced_scene.py`/`scene.py` do:
+attribute-dict override → instance's own name → definition's own name
+(unless auto-generated) → internal index fallback.
+
+### Fixed — C++: 4 correctness issues in IFC export
+
+Ports Python's `1.3.0` IFC fixes to `ifc_export.cpp`, verified against a
+real production file (steel-detailing plugin data included) as well as
+new unit tests mirroring Python's own (`packages/python/tests/test_ifc.py`).
+
+- **Units and axis convention** — `to_ifc()`/`export_ifc()` always declared
+  the length unit as millimetres but defaulted their coordinate scale to
+  `METRES_TO_INCHES` — every coordinate was written inch-scaled but
+  labeled millimetre, off by ~25.4x in any IFC consumer that respects the
+  unit declaration. Default scale is now `METRES_TO_MM` (1000.0). Vertex
+  positions (baked in glTF's Y-up convention for GLB export) are now
+  converted back to IFC/SketchUp's Z-up convention instead of being
+  written through raw — the previous behavior exported buildings rotated
+  ~90 degrees and mirrored.
+- **Real instance names and layer visibility** — elements were named
+  after `GlbPrimitive::geom_name` (an internal mesh-lookup key, e.g.
+  `"mesh_3115_ROOT__Component_6205261_Layer0"`) instead of the real
+  SketchUp instance name. Now uses `MeshMetadata::name`. Also switches
+  the IFC layer assignment from `IFCPRESENTATIONLAYERASSIGNMENT` to
+  `IFCPRESENTATIONLAYERWITHSTYLE`, which can actually carry a layer's
+  on/off state (`LayerOn`) — new `Scene::layer_hidden` field, threaded
+  through from the parser's existing per-layer hidden state (legacy
+  pre-2021 files only; VFF files always read visible here, a separate,
+  open gap — see [LANGUAGE_PARITY.md](docs/LANGUAGE_PARITY.md)).
+- **Plugin attribute dictionaries surfaced as element names and IFC
+  properties** — `build_scene()` (`scene.cpp`) gained the same
+  attribute-dict-override name-resolution fallback `instanced_scene.cpp`
+  already had, plus a deferred mesh backfill mechanism (mirroring
+  Python's `path_updates`) so each mesh's real per-instance name,
+  properties, and attribute dictionaries are known by the time `to_ifc()`
+  reads them — new `MeshMetadata::attribute_dictionaries` /
+  `InstanceNode::attribute_dictionaries` fields. Each dictionary becomes
+  its own `Pset_<dict-name>` in IFC output, separate from
+  `Pset_CustomProperties`. This also closes a pre-existing, previously
+  documented gap: `mesh_index[...].properties` was never populated at
+  all in the C++ baked path before this fix.
+- **Opt-in full-path keyword classification** — `classify_element()`/
+  `to_ifc()`/`export_ifc()` gain `classify_using_full_path` (default
+  `false`, so existing callers see no behavior change): when a name/layer
+  match both miss, fall back to matching the full ancestor-path string.
+
+Also fixes a latent bug this work surfaced: `dxf_export.hpp` and
+`ifc_export.hpp` each declared their own `METRES_TO_INCHES` constant in
+the same `openskp` namespace — a redefinition error in any translation
+unit including both. Moved to a single definition in `model.hpp`. The
+`openskp.hpp` umbrella header was also missing `fragments_export.hpp`
+and `ifc_export.hpp` entirely — both now included.
+
+### Added — C++: read the real per-layer hidden flag from VFF (2021+) files
+
+Ports Python's VFF layer-hidden fix to `geometry.cpp`'s `collect_layers()`.
+VFF-format files previously derived a layer's visibility only from
+`Layer_<name>`-prefixed materials, which carry no hidden/visible bit of
+their own — every VFF layer's hidden state silently defaulted to visible
+regardless of the file's actual Tags panel state, which also meant the
+IFC exporter's `IFCPRESENTATIONLAYERWITHSTYLE.LayerOn` (above) always
+reported visible for VFF files.
+
+The real flag lives right alongside the already-parsed layer id/name:
+each layer's `8C3C` node carries an `8E3C` single-byte sibling (`1` =
+hidden, `0` = visible). Verified against two real production files: the
+same cladding/sheeting-layer + label-layer hidden pattern Python found
+on its own file showed up independently on a different file here (5 of
+30 layers correctly flagged hidden, all cladding/sheeting/label layers).
+3 new unit tests exercise `collect_layers()` directly against hand-built
+TLV node trees.
+
+### Fixed — C++: `model.layers` now in source-file order, not alphabetical
+
+`RawParsed::layer_colors` is a `std::map` (sorted by key), so every
+consumer of `model.layers` previously saw layers alphabetized rather
+than in the order they actually appear in the source file (material.xml
+archive-entry order for VFF, slot-scan order for legacy) - Python's own
+`layer_colors` is a plain dict, which preserves insertion order
+natively, so this was C++-only behavior, not a cross-language
+difference in the underlying data. New `RawParsed::layer_order`
+(a `std::vector<std::string>`, populated at every layer-insertion site
+in `core.cpp`/`legacy.cpp`) is what `model.cpp`'s layer-building loop
+now iterates. Verified byte-for-byte identical order to Python's own
+output on the same real production file (30 layers, non-alphabetical).
+
+### Added — C++: read pages/scenes for legacy (pre-2021) files
+
+Ports Python's `legacy._scan_pages` (narrow scope) to `legacy.cpp`'s new
+`scan_pages_for_layers`. Legacy (pre-2021 MFC) `.skp` files had no page/
+scene reading code at all in C++ - `SkpModel.pages` was only ever
+populated for the VFF path, matching a gap Python itself only closed
+recently.
+
+CViewPage's full record also embeds a camera, an optional thumbnail, a
+font, and (for any of several independently-optional capture flags
+beyond hidden-layers) an entire Style sub-object of undocumented size.
+Scoped down deliberately, matching Python exactly: only the flag
+combination capturing nothing, or only hidden-layers, is supported;
+anything else is silently skipped rather than guessed at, so an
+unsupported page is simply absent from `model.pages` instead of
+producing wrong data. Runs as an independent scan over the file tail
+(from where the main entity walk stops) rather than part of the
+sequential archive read, to avoid needing to fully bound each page's
+opaque tail.
+
+Also exposes `LegacySlotEntry`/`LegacySlotTable`/`scan_pages_for_layers`
+via `internal.hpp` (`struct V` moved out of `legacy.cpp`'s own anonymous
+namespace to make this possible without duplicating it) so this feature
+is unit-testable the same way VFF's `parse_pages`/`parse_dimensions`
+already are - previously, legacy.cpp's internals were only reachable
+through real fixture files. 2 new unit tests exercise
+`scan_pages_for_layers` directly against hand-built byte records
+mirroring Python's own `test_scan_pages_legacy_synthetic` test exactly
+(three candidate pages, one with an unsupported flag combination
+correctly rejected).
+
+**Known gap, stated honestly:** not exercised against a real file that
+actually contains a legacy scene - none of the committed fixtures or
+the real production files available while building this had one (5
+real files smoke-tested: no crash, no false positives, all correctly
+report zero pages since none of them have any). Ground truth for the
+byte layout itself was already established by Python's own
+implementation, ground-truthed against real v17-native SketchUp saves;
+this port carries that over faithfully rather than re-deriving it.
+
+### Added — C++: read construction lines/points (legacy only)
+
+Ports Python's `legacy._read_constructionline`/`_read_constructionpoint`
+reading side to `legacy.cpp` (writer/`create.py`'s side is out of scope
+here, per this round's own priority - see `docs/LANGUAGE_PARITY.md`'s
+still-open "Writer: construction lines/points" row). Both entity types
+were already being parsed (needed for archive slot-sync) but their
+fields were read and immediately discarded - new `ConstructionLine`/
+`ConstructionPoint` model types and `Definition::construction_lines`/
+`.construction_points` fields now surface them, matching Python's own
+`ConstructionLine`/`ConstructionPoint` dataclasses field-for-field.
+
+A bounded `CConstructionLine` stores a point + normalized direction +
+two signed distance parameters along that direction marking the
+segment's start/end - translated into the same start/end/direction
+shape `Sketchup::ConstructionLine`'s own Ruby API exposes. An unbounded
+line uses a large-magnitude sentinel (start/end come back unset,
+matching the real API returning `nil`). A `CConstructionPoint` stores
+its position plus a second, always-zero 3-double block and a trailing
+byte with no corresponding Ruby property - left unexposed, matching
+Python exactly.
+
+Verified against a real committed fixture (`capilla_quiroz_v17.skp`): 7
+real construction points, every coordinate byte-for-byte identical to
+Python's own parse of the same file. No construction lines were
+available in any fixture or real production file to verify against -
+stated honestly in `docs/LANGUAGE_PARITY.md` rather than glossed over.
+
+### Fixed — `attribute_dictionaries` missing from GLB/JSON metadata export
+
+`json_export.cpp`'s `instance_node_to_json`/`mesh_metadata_to_json`
+already had access to `attribute_dictionaries` (correctly resolved by
+`build_scene()`, added earlier in this same GitHub-only phase) but never
+wrote it into the JSON output — only the IFC exporter surfaced this data
+(as `Pset_<dict-name>` properties). Both functions now include an
+`attribute_dictionaries` key alongside `properties`, matching the same
+fix ported to Python's `export/glb.py`, `export/json_export.py`, and
+`export/instanced_glb.py` - see
+[§ 1.3.0](#130--2026-09-09--python-only-github-only-pre-release).
+Verified against real plugin data on `Untitled.skp` (`steelframer-dict`,
+45 entries); full suite green (217/217).
+
+## [preview-python-v1.3.0] — 2026-09-09 — Python only, GitHub-only pre-release
+
+> **Folded into the real [1.3.0](#130--2026-09-18--synchronized-release-all-5-languages)
+> release above** (2026-09-18), as-is - not held back for cross-language
+> parity, which is instead tracked honestly in
+> [docs/LANGUAGE_PARITY.md](docs/LANGUAGE_PARITY.md). Everything in this
+> section is Python-only unless stated otherwise.
+
+### Added — Direct SketchUp → Fragments (.frag) export
+
+New `openskp.export.fragments` module (`to_fragments(scene, *, raw=False)` /
+`export(scene, output_path, *, raw=False)`) writes ThatOpen's public
+Fragments/FlatBuffers format straight from an `InstancedScene`, with no IFC
+intermediate — real nested spatial hierarchy (matching the source file's own
+component nesting, not a flat list), IfcImporter-compatible display names,
+per-item GUIDs (the source file's real per-instance SketchUp GUID on VFF/2021+
+files, a stable synthetic one on legacy files), and non-unit scale/mirrored
+instances baked correctly into geometry (Fragments' own `Transform` struct has
+no scale field). New optional dependency group: `pip install openskp[fragments]`
+(`flatbuffers>=24.0`), vendored FlatBuffers bindings under `_fragments_fb/`.
+Verified against the real `@thatopen/fragments` runtime, not just this
+project's own reader, including a production-scale real file (12,338 items).
+
+**Known gaps, stated honestly:**
+- No other language has this yet. A community TypeScript port is open as
+  [PR #276](https://github.com/iamahsanmehmood/openskp/pull/276) but its
+  required lint check is currently failing — not mergeable as-is. .NET, Dart,
+  and C++ have no Fragments work started at all.
+- The Fragments format itself has no native visibility field. Per-layer
+  hidden state is carried via a `Model.metadata` JSON sidecar — a convention
+  this project defined, not part of the public ThatOpen schema. Any other
+  consumer of the `.frag` file needs to know to read it.
+- `Model.guid` (the single model-level identifier, distinct from each item's
+  own per-instance guid) is still an unpopulated placeholder.
+
+### Changed — Face triangulation: Shapely replaced with earcut
+
+Two-part performance and correctness change to `triangulate_face_3d`:
+a convex, hole-free face now triangulates via a direct fan (zero fidelity
+change, 10–44% faster on real fixtures); every other face now triangulates
+via `mapbox_earcut` instead of Shapely's Delaunay-plus-centroid-containment-
+filter approach (42–73% faster on top of the fan fast path). This is also a
+real correctness fix, not just speed: Shapely's centroid-containment filter
+was found under-covering a real concave 27-vertex face by roughly 10.5% of
+its area, confirmed against an independent shoelace-formula ground truth.
+New mandatory dependency: `mapbox_earcut>=1.0`.
+
+### Fixed — 4 correctness issues in IFC export
+
+- **Units and axis convention** — coordinates were written inch-scaled but
+  labeled as millimetres (~25.4× off), and the axis convention reused
+  glTF's Y-up values directly instead of converting to IFC/SketchUp's Z-up
+  — a real export came out rotated ~90° and mirrored. Found by diffing
+  against SketchUp's own native IFC export.
+- **Real instance names and layer visibility** — `to_ifc()` previously named
+  elements after internal mesh-lookup keys instead of the real instance
+  name, and used `IfcPresentationLayerAssignment` (no on/off state) instead
+  of `IfcPresentationLayerWithStyle` (carries `LayerOn`). New
+  `Scene.layer_hidden` field. Legacy files now get correct on/off state in
+  IFC output; VFF (2021+) files still always report visible in this
+  specific export path — the VFF hidden-flag read added below was not yet
+  wired into the IFC exporter, tracked as an open follow-up.
+- **Plugin attribute dictionaries surfaced as element names and IFC
+  properties** — `build_scene`/`build_instanced_scene` now extract every
+  attribute dictionary an instance carries (not just `dynamic_attributes`),
+  and use `name`/`label`/`code` (priority order) for the display name when
+  present. Each dictionary becomes its own `Pset_<dict-name>` in IFC output.
+  Targets real steel-detailing plugin data (`fbd-einfo`/`fbd-profile`/
+  `fbd-profile-cords`) that previously had no way to reach the exported
+  model at all.
+- **Opt-in full-path keyword classification** — `classify_element()`/
+  `to_ifc()` gain `classify_using_full_path` (default `False`, so existing
+  callers see no behavior change): when a name/layer match both miss, fall
+  back to matching the full ancestor-path string.
+
+### Added — Read the real per-layer hidden flag from VFF (2021+) files
+
+New `8E3C` single-byte sibling tag read on each layer's `8C3C` node.
+Previously VFF layer visibility was inferred only from `Layer_<name>`-
+prefixed materials, which carry no hidden bit at all — every VFF layer
+always read as visible regardless of its real state in the source file.
+
+### Added — `layer_hidden` in both GLB exporters' metadata sidecars
+
+`export/glb.py` and `export/instanced_glb.py` now surface
+`Scene.layer_hidden` / `InstancedScene.layer_hidden` in their `_metadata.json`
+output, so a consumer can apply the source file's real default layer
+visibility without re-deriving it.
+
+### Added — Read pages/scenes for legacy (pre-2021) files
+
+`legacy._scan_pages` populates `Page.name`/`.hidden_layers` for legacy MFC
+files — previously only the VFF (2021+) reader path populated `SkpModel.pages`
+at all. Scoped narrowly and deliberately: only pages whose capture flags are
+"nothing" or "hidden layers only" are supported; a page with a fuller capture
+(camera, style, shadow info — the common case for a hand-arranged scene) is
+silently skipped rather than guessed at, so it's simply absent from
+`model.pages` instead of producing wrong data.
+
+### Added — Write section planes
+
+`SkpBuilder.add_section_plane(point, normal)`, ground-truthed against real
+v17-native SketchUp saves and verified by opening the written file in live
+SketchUp (correct plane readback and visual render).
+
+### Added — Read and write construction lines/points
+
+`legacy._read_constructionline`/`_read_constructionpoint` now retain their
+fields instead of discarding them (`Definition.construction_lines`/
+`.construction_points`); writer gains `add_construction_line`/
+`add_construction_point` (root-level only). Ground-truthed against real
+SketchUp saves; a missing 4-byte trailer bug (previously rejected by real
+SketchUp as "unexpected file format") was found and fixed during that
+verification.
+
+### Fixed — large real files could exhaust all available memory or stall for 16+ minutes
+
+Two independent bugs, both confirmed against a real 359MB/95,363-definition
+production file that had crashed a 40GB development machine:
+- The TLV parser's `iter_top_level_lazy` already streamed ordinary top-level
+  records one at a time, but a file whose definitions are nearly all nested
+  under one dominant `F901`→`7017`→`7117` wrapper (rather than spread across
+  many top-level records) forced the *entire* wrapper's subtree to be
+  materialized in memory before any of it could be processed and released.
+  Extended the same streaming principle one level deeper via a new
+  `_unwrap_definitions_container()` helper.
+- `triangulate_face_3d`'s fallback path did an O(V) linear nearest-vertex
+  scan per triangle corner, making triangulation of any large, non-trivial
+  face effectively O(V²). Replaced with an O(1) reverse-coordinate-lookup
+  dict built once per face.
+
+Combined, the real trigger file now completes in ~773s at a peak of ~12.5GB
+RSS instead of crashing outright. Fixes
+[#264](https://github.com/iamahsanmehmood/openskp/issues/264).
+
+### Fixed — files the writer produced could not be SAVED by SketchUp (Python writer)
+
+Every section's writer (materials, layers, definitions, root geometry) handed out persistent IDs
+from 1 again, so a material, a definition and a root instance could all carry pid 1, and the header's
+pid counter — a 32-bit field the writer treated as 16-bit — only grew by the material and layer count.
+SketchUp loads such a file, renumbers the duplicates, and then `SUModelSaveToFile` fails with
+`SU_ERROR_SERIALIZATION` once the model is big enough or a definition happens to come first: a real
+7 MB export opened fine in SketchUp Web and every attempt to save it ended in "Save failed". Measured
+with the SDK: a 1-face definition followed by a 3-face one is enough. Pids now run in one sequence
+across sections, continuing from the scaffold's counter, and the counter is written as the u32 it is,
+with the last pid handed out. Real exports of 7 MB and 27 MB re-save through the SDK.
+
+### Added — face-me components in the writer (Python)
+
+`add_component_definition(name, always_faces_camera=True, shadows_face_sun=True)` sets SketchUp's
+component-behavior byte the reader already decoded (bit 0 / bit 1 of byte −9 in the definition's
+43-byte gap), so a 2D person or cut-out tree written with openskp turns toward the camera in
+SketchUp instead of standing still. `openskp.edit` replays a source file's flags when re-saving.
+
+### Fixed — `front_uv`/`back_uv` pins land where SketchUp draws them, on any face and at any applied size (Python writer)
+
+Two defects in the writer's texture positioning, invisible to its own reader tests because every
+test square happened to be axis-aligned and every test material 1 inch per tile:
+
+- **Basis.** The per-face matrix was solved in a basis built from the face's *first edge*
+  (`points[1] - points[0]`, and the normal crossed with it). Real SketchUp — and this project's own
+  reader, calibrated against SDK-authored files — express and invert it in a basis derived from the
+  **normal alone** (`U = normalize(Z × n)`, `W = n × U`; `(X, ±Y)` for a horizontal face). The two agree
+  exactly when the first edge runs along `Z × n`, which every existing test face did; otherwise the
+  texture came out turned by the angle between them. A horizontal face listed from another corner
+  arrived in SketchUp rotated 90° or 180°; a curved surface of many small quads, each with its own
+  first edge, shattered. `_uv_matrix_for_face` now uses `_face_groups.face_uv_basis`.
+- **Scale.** SketchUp stores the matrix in *inches of texture space* and divides by the material's
+  applied width/height when it reads a face's UV back (`compute_face_uv` already did the same). The
+  pins a caller gives are in tiles of the image, and were fitted as-is, so a material applied at
+  2 m per tile (78.74 in) came out 78.74× too big on every positioned face. `add_face` (root and
+  definition builders) now scales pins by the applied size recorded at `add_texture_material` time;
+  `openskp.edit` and `to_python_code` write the source's real applied size again instead of forcing
+  `applied_height=1.0` to dodge the double division.
+
+- **Vertical tolerance and the downward basis (reader and writer).** `face_uv_basis` treated a
+  normal as vertical only within 1e-9 of it, and gave a face looking down the basis `(X, −Y)`. Real
+  SketchUp, measured with the SDK on faces tilted from 1e-10 to 1e-2 looking up and down, keeps the
+  world axes while the sine of the tilt is below 1e-3, and turns the basis 180° for a downward face:
+  `(−X, +Y)`. A horizontal face whose stored normal carries float noise, and every underside of a
+  model, read back (and were written) turned. `VERTICAL_TOLERANCE = 1e-3` in `_face_groups`.
+
+Measured through the SDK's own `SUMeshHelperGetFrontSTQCoords` (skp2dae) on 11 orientations before and
+after; new tests pin the invariant — what you pin is what the reader hands back at that point, on
+six orientations and vertex orders, and at applied size 10 — plus a real-SketchUp oracle test for the
+rotated vertex order (`TestRealSketchUpOracle`, needs the SDK DLL).
+
+### Fixed — `attribute_dictionaries` missing from GLB/JSON metadata export
+
+Every attribute dictionary an instance carries (not just SketchUp's own
+`dynamic_attributes`, which `properties` is scoped to exclusively per
+[#254](https://github.com/iamahsanmehmood/openskp/issues/254)) was already
+correctly resolved by `build_scene()`/`build_instanced_scene()`, but was
+never written into `export/glb.py`, `export/json_export.py`, or
+`export/instanced_glb.py`. Only the IFC exporter surfaced this data (as
+`Pset_<dict-name>` properties) — a consumer reading GLB/JSON metadata
+instead of the derived `.ifc` (e.g. a third-party plugin's own named
+dictionary, such as a steel-detailing tool's `steelframer-dict`) silently
+never saw it. `_instance_node_to_dict`/`mesh_index` in all three export
+modules now include an `attribute_dictionaries` key alongside the existing
+`properties` key, keyed by each dictionary's own declared name. Verified
+against real plugin data on `Untitled.skp` (`steelframer-dict`, 45
+entries); no output shape change for models with no extra dictionaries
+(`attribute_dictionaries` is simply `{}`). Same fix ported to C++, see
+[§ preview-cpp-v1.3.0](#preview-cpp-v130--2026-09-10--c-only-github-only-pre-release).
+
+### Added — Read a `.frag` file back (`openskp.export.fragments.read`/`from_fragments`)
+
+The mirror of this release's own `to_fragments`/`export`: parses a real
+`.frag` file straight into an `InstancedScene`, OpenSKP's 6th input format
+alongside `.skp`. Any file works, not just this project's own encoder's
+output — ThatOpen's real `IfcImporter` output, or anyone else's — and
+rides every other export this project already has (GLB, OBJ, STL, PLY,
+DXF, IFC4, JSON, `.skp` itself via the writer) for free, once parsed.
+
+Verified three ways: round-trips this project's own output exactly (world-
+space vertex positions across a real `.skp`-derived scene match to the
+last bit, not just object/vertex counts); reads a real ThatOpen-produced
+production file cleanly (a genuine IFC-derived building, 5,751 nodes /
+100,332 vertices, not a synthetic fixture) — re-exporting that file
+through this same module and loading the result back through the actual
+`@thatopen/fragments` runtime preserves real IFC GUIDs and category
+names; and, independently of any pre-existing fixture, converts real IFC
+source files (a Revit-exported wall, and a real ~8.6 MB structural model)
+through ThatOpen's own actual `IfcImporter` and reads the freshly-produced
+`.frag` output straight into an `InstancedScene` — correct spatial
+hierarchy, GUIDs, and geometry counts, with `CIRCLE_EXTRUSION` samples
+(present in the structural model) skipped with a warning as documented.
+A smaller real ThatOpen fixture (MIT-licensed, from their own
+`resources/frags/`) is committed at
+`tests/fixtures/thatopen_small_test.frag` for CI.
+
+**Known gaps, stated honestly:**
+- No UVs or stored vertex normals anywhere in the schema — every
+  reconstructed primitive gets an all-zero UV band, and normals are
+  rebuilt as flat per-face (correct for a hard-edged shell, not the
+  original smooth-shading groups). Not a gap in this reader — the format
+  itself never had anywhere to keep either.
+- A purely organizational (non-geometry) node's own local transform was
+  never serialized on export — only geometry-bearing items' full WORLD
+  transforms survive. Reconstructed wrapper nodes get an identity matrix;
+  since every geometry leaf's own matrix is its full world transform
+  directly, the composed placement is still exactly correct, it just
+  can't recover the original per-level transform split.
+- `RepresentationClass.CIRCLE_EXTRUSION` (round profiles — rebar, pipes)
+  has no reader yet, only `SHELL`. A real `IfcImporter`-produced file can
+  contain these; such samples are skipped with a warning, not silently
+  misread as shells.
+
+### Fixed — `.frag` reader crashed on real ThatOpen-produced files (wrong shell lookup)
+
+`from_fragments` resolved each sample's geometry via `Representation`'s
+own position in the `Representations` vector, treating that position as
+the index into `Meshes.Shells`. That's only true of this project's own
+writer, which happens to always keep the two equal — `Representation.Id()`
+is the actual `Shells` index, and a real ThatOpen `IfcImporter`-produced
+file does not keep it equal to the representation's vector position.
+Surfaced as an `IndexError` reading a `.frag` file freshly converted from
+a real structural IFC model via ThatOpen's own `IfcImporter` (not caught
+by any prior test, since every previous fixture — including this
+project's own writer's output — happened not to exercise the divergence).
+Fixed by following `Representation.Id()`, matching the real reader's own
+`meshes.shells(repr.id!, ...)` (`Utils/edit/fetch-functions.ts` in
+`@thatopen/fragments`). Regression test patches a representation's
+`Id()` in place to diverge from its vector position and confirms the
+correct (not merely non-crashing) shell comes back.
+
+## [1.2.0] — 2026-09-04
+
+### Added — Full attribute-dictionary support in the writer, Python; groups gain attributes, all 5 languages
+
+The writer's custom attribute dictionaries (`attributes`/`attribute_dict_name` on
+`add_component_definition`, `add_instance`, and `add_face`) previously only accepted `str`/`int`/
+`float` values, silently rejected `bool`, and were unavailable on groups at all. Python's writer
+now supports every value type the reader already decoded: `None`, `bool`, `int`, `float`, `str`,
+new `Point3d`/`Vector3d` wrapper types (a position/direction, distinct from a plain 3-element
+array), `Length` (a distance, written distinctly from a plain float), `Timestamp`, and nestable
+lists of any of these. An entity can now also carry **multiple** named attribute dictionaries at
+once via a new `attribute_dicts=[(name, entries), ...]` parameter alongside the existing
+single-dict shorthand. Dictionary names are no longer discarded on read, on both the legacy and
+modern (VFF) parsing paths — `Instance.attribute_dictionaries` exposes every dictionary by name
+and real (non-stringified) value type, while `Instance.properties` keeps its existing
+`dynamic_attributes`-only, stringified view for backward compatibility. A new explicit
+`with builder.definitions():` / `with builder.instances():` phase API also improves the error
+message when geometry is added in the wrong order relative to material/layer/definition setup.
+
+**Groups can now carry attributes too, in all 5 languages** (`add_group`/`add_group_instance`
+gain the same `attributes`/`attribute_dict_name` parameters `add_instance` already had) — a group
+only gets a real attribute container when one is actually given, matching how faces already work,
+rather than always writing a null pointer as before. Real production files routinely have
+attributed groups (SketchUp's own Dynamic Components, and third-party tools that build assemblies
+as groups rather than component instances), and previously any attributes attached to a group were
+silently discarded on write. TypeScript/.NET/Dart/C++ get this same group-attribute support at
+parity with what `add_instance` already offered there (a single dictionary at a time) — the
+multi-dictionary `attribute_dicts` list above stays Python-only for now.
+
+### Added — Applied texture size and material opacity, all 5 languages
+
+`add_texture_material`/`write_textured_material` gained `applied_width` (alongside the existing
+`applied_height`) — real SketchUp writes a texture's tile size in both axes, and a texture applied
+without explicit positioning now carries a real mapping in both dimensions instead of just one.
+`add_material`/`add_texture_material` also gained `opacity` (`0.0` fully transparent, `1.0` fully
+opaque), round-tripping correctly through the reader's own `Material.transparency` field.
+Originally contributed for Python; ported to TypeScript, .NET, Dart, and C++ with matching
+behavior in every language.
+
+### Added — SketchUp Image entity writer support (`add_image`), all 5 languages
+
+Places a genuine `CImage` entity — the object SketchUp creates via File → Import → Image — rather
+than just a textured face; consumers that give images special billboard/cutout treatment can now
+tell the two apart via `Definition.is_image`. Also fixes a matching legacy-reader gap: `CImage`
+records were already parsed but never surfaced as placed instances, and `is_image` was hardcoded
+`false` for every legacy (pre-2021) file. Along the way, found and fixed a real texture-corruption
+bug: `write_textured_material`'s applied-height defaulted to a corrupted internal sentinel value
+whenever a caller omitted it, which the read-side UV formula divides by even for an explicitly
+pinned mapping — not just default-projected faces as first assumed. The default now correctly
+resolves to `1.0` in every language, matching applied width's existing default.
+
+### Added — Writer support for linear dimensions and leader text (Python); VFF scene/dimension parsing ported to all 5 languages
+
+`add_dimension` writes a "free" linear dimension between two explicit points (anchoring a
+dimension to specific geometry is not yet supported — tracked as a known follow-up). `add_text`
+writes a leader text label anchored at a point, with the label and connecting leader line
+positioned in world space, matching how real, human-drawn leader texts are structured (SketchUp's
+own SDK-generated texts are screen-space only). Both are Python-only for now. Separately, parsing
+of VFF (2021+) scenes ("pages" — name, camera, projection, hidden-layer overrides, surfaced as
+`SkpModel.pages`) and linear dimensions (world-space endpoints, resolved through a placed
+instance's transform when a dimension is anchored to geometry inside one) is ported from Python to
+TypeScript, .NET, Dart, and C++.
+
+### Added — Instancing-preserving scene output, all 5 languages
+
+**Instancing-preserving scene output.** A new `buildInstancedScene()` /
+`build_instanced_scene()` / `BuildInstancedScene()` keeps the instancing
+SketchUp already recorded, instead of baking it out the way
+`buildScene()` does. Each distinct definition is triangulated once, in its
+own local space, and every placement becomes a node carrying the transform
+that puts it there — so output scales with `unique geometry + instance
+transforms` rather than `definition geometry x placement count`. A
+companion `toInstancedGLB()` / `to_instanced_glb()` / `ToInstancedGlb()`
+writes glTF 2.0/GLB in which many nodes reference one mesh, so a
+definition's vertex and index buffers are written once rather than once
+per placement — Python's `openskp.export.instanced_glb`, TypeScript's
+`toInstancedGLB`, .NET's `InstancedGlbExport.ToInstancedGlb` /
+`.ExportInstancedGlb`, Dart's `toInstancedGlb`, and C++'s
+`to_instanced_glb` all share the same shape. It landed in TypeScript
+first, then was ported to Python, .NET, Dart, and C++ — each cross-checked
+against TypeScript's own already-verified output the same way the
+SKP-to-code generator below was.
+
+This is lossless instancing preservation, not mesh decimation: no
+vertices are removed, merged, quantised or approximated, and no new
+dependencies are introduced. The triangles are exactly the ones
+`buildScene()` produces. The test suite asserts that directly, by
+flattening the instanced result and comparing it against the baked one on
+the repository's real `.skp` fixtures, in every language.
+
+On a synthetic scene of one 24-face component repeated 1,000 times
+(TypeScript benchmark; the underlying algorithm is identical across
+languages), the geometry buffers are 1,000x smaller (3,562 KB to 3.6 KB),
+the exported GLB is 48x smaller, and the build is 46x faster. Run
+`npm run bench:instanced` in `packages/typescript` to reproduce.
+
+`parseSkp()`/`parse()`, `buildScene()`/`build_scene()` and
+`toGLB()`/`export_glb` are unchanged in behaviour, return type and output
+in every language. See
+[Choosing an API](packages/typescript/README.md#choosing-an-api).
+
+### Added — SKP-to-code generator, all 5 languages
+
+`openskp.to_python_code()` / `toTypeScriptCode()` / `Codegen.ToCSharpCode()`
+/ `toDartCode()` / `to_cpp_code()` walks a parsed `SkpModel` and emits
+human-readable, re-runnable source that calls that same language's own
+writer API to rebuild an equivalent file — a faithful transcript of API
+calls, not a serialized dump. Handles materials (solid and textured, with
+explicit `front_uv`/`back_uv` pins computed for every textured face, even
+ones that originally used default projection), layers, component/group
+definitions built in dependency order, faces (holes, auto-triangulation
+for near-planar real-world faces), and instances (transform,
+instance-level paint, instance-level name — including a genuinely empty
+name, which is different from an omitted one). See
+[Generating code from a file](docs/DEVELOPER_GUIDE.md#generating-code-from-a-file).
+
+Building and testing this against a real, large file (`jeff.skp`: 2713
+definitions, 113643 faces, 2581/2713 painted instances) surfaced three
+pre-existing bugs shared by every language's existing
+`open_existing`/`edit.*` replay path, fixed there too:
+
+- **Instance-level paint silently dropped.** SketchUp lets you paint a
+  whole component/group instance once instead of every internal face;
+  every language's replay path never passed the instance's own `material`
+  option when rebuilding.
+- **Instance names silently replaced.** A genuinely empty stored instance
+  name was converted to the writer's "omitted" sentinel before calling
+  `add_instance`, defeating the writer's own correct
+  name-defaults-to-definition-name fallback and baking in the wrong name.
+- **Textured materials replayed corrupted.** Every replay path called
+  `add_texture_material` without `applied_height`, leaving in place the
+  library's internal corrupted-sentinel default (already fixed in the
+  writer itself for `add_image`, but the replay callers were never
+  updated).
+
+A fourth bug, found while building the new codegen and then also present
+in the existing replay logic: blindly sampling the first 3 vertices for a
+UV correspondence can pick a collinear triple on real "flat" geometry,
+which the writer's UV solver correctly rejects — fixed via a
+non-collinear-triple search helper in both the new codegen and the
+existing replay logic.
+
+### Added — TypeScript performance and API surface improvements
+
+- Vertex coordinates now stored in a flat `Float64Array` with an id→index
+  mapping instead of `Map<number, [x, y, z]>` — 1.6x lower memory on real
+  files, chosen after benchmarking against a sorted-array alternative that
+  saved more memory but cost ~35% on the hot lookup path.
+- Edge display flags (hidden/soft/smooth) now stored in a `Uint8Array`
+  instead of `Map<number, number>` — roughly 30x less memory per edge.
+- `isDrawableEdge(edge)` and an opt-in `respectEdgeVisibility` option on
+  the scene builders, for consumers who want SketchUp's own
+  hidden/soft/smooth edge semantics respected rather than every edge
+  drawn.
+- GLB export narrows glTF indices to `UNSIGNED_SHORT` where a primitive's
+  vertex count allows it (all 266 primitives across this repo's fixtures
+  qualify today), instead of always writing 4-byte `UNSIGNED_INT` — about
+  8% smaller GLB files, 13% smaller for the instanced exporter. Purely an
+  encoding choice at the export boundary; in-memory arrays are unchanged.
+- `extractThumbnail(buffer)` returns the preview image already embedded in
+  a `.skp` file without parsing geometry; `SkpScene.bounds`/
+  `InstancedScene.bounds` expose the model's axis-aligned extent
+  (`min`/`max`/`size`/`center`) without sweeping every position by hand.
+
+### Fixed — Six legacy MFC reader gaps found sweeping real engineering files, ported to all 5 languages
+
+Found by a contributor sweeping a round-trip harness over real projects (Python first, then
+ported to TypeScript, .NET, Dart, and C++): textured colour-by-layer (`CLayer` can carry a full
+texture, not just flat RGBA); `CDimensionLinear`'s trailer read structurally instead of as a fixed
+165-byte skip, since each connection-point reference is 2 or 6 bytes depending on where the
+archive crosses its own big-tag-escape boundary; forward-tolerant references for `CRelationship`
+and text-leader attachments, since annotations routinely serialize before the geometry they label;
+a `CImage` reader (previously missing entirely — any legacy file with a dropped-in image was
+rejected outright); attribute value types `0x11` (Point3d) and `0x0C` (Length); and the
+"burned" store-map-index mechanism itself — SketchUp maps some connection points into the archive's
+object table without serializing bytes for them, silently offsetting every later back-reference,
+now translated through a dedicated burn-band mechanism rather than shifting already-registered
+slots in place (an earlier fix attempt could strand a slot value captured earlier in the same
+read). Also includes a self-calibrating trailer width for `CConstructionLine` (varies by SketchUp's
+writing build, not cleanly by version) and a v20 layer-list null-separator fix — a real,
+previously-miscounted fixture file gained its second layer as a result. Verified on a 186-file real
+corpus (up from 0/2 passing on the two originally-failing repro files) and cross-checked
+per-language against Python's own parse output on large real files.
+
+### Fixed
+
+- **`CoEdge.orientation` was inverted in several readers.** Documented
+  everywhere as `+1` = same direction as the edge, `-1` = reversed, but
+  Python, TypeScript, .NET, and Dart passed SketchUp's raw storage bit
+  straight through instead (`0`/`1`, the opposite sense) in at least one
+  of their two parsing paths. Any consumer following the documented
+  contract got backwards orientation. C++ already had this fixed.
+- **Legacy Dynamic Component attributes were silently never found.** The
+  lookup compared each attribute container's *class name* (always the
+  same string) against the dictionary's own name instead of comparing the
+  dictionary's actual declared name — the comparison could never succeed,
+  so `Instance.properties` silently came back empty on every legacy
+  (pre-2021) file that genuinely had Dynamic Component data. Fixed in
+  Python, TypeScript, .NET, and Dart; C++ already did this correctly.
+- **Material transparency was dropped from glTF/GLB scene export**, in
+  every language — exported materials were hardcoded fully opaque with no
+  `alphaMode` declared. Translucent materials now export with `BLEND`;
+  textured cutout materials (foliage, fences, signage) with `MASK`. .NET's
+  fix goes one layer deeper: the legacy binary reader itself was
+  discarding the color record's alpha byte during parsing.
+- **XML entity decoding in material/style names** (TypeScript, C++) — a
+  name containing `&amp;`/`&lt;`/etc. from the file's internal XML
+  metadata came through un-decoded.
+- **A TLV header-scan off-by-one silently dropped a record whose 6-byte
+  header exactly filled the remaining buffer space** — a real, valid
+  record, not corrupt data. Present in both the general recursive parser
+  and the flat top-level scanner behind lazy iteration over large files,
+  in Python, Dart, and .NET (TypeScript and C++ already had the correct
+  comparison). Could drop a trailing top-level definition on a real file,
+  not just a nested child node.
+- **A SketchUp-2020 filler-recovery heuristic ignored its caller's
+  plausibility limit** (Python) — every call site shared one hardcoded
+  ceiling instead of the tighter, call-site-specific limit every other
+  language already used, so byte-garbage could occasionally win the
+  search over the correct candidate on a real v20 file.
+- **An empty component/group definition name was fabricated into a
+  placeholder** (`"Definition123"`/`"Def123"`) on `open_existing()`/
+  `to_*_code()` replay, in all 5 languages — SketchUp Groups are
+  internally unnamed component definitions, so this is common in real
+  files, not an edge case. The definition's real (empty) name now
+  survives the round trip unchanged.
+- **`classify_element()`'s IFC export only matched keywords against a
+  component's own name**, so real files whose components keep SketchUp's
+  default names (`Component#109415`) exported as almost entirely generic
+  `IfcBuildingElementProxy`, losing semantic typing. Now falls back to the
+  layer/tag name when the component name doesn't match anything, and
+  accepts an optional custom classifier callback for callers who want
+  full control. All 5 languages.
+- **Every entry in `Scene.mesh_index` got the same, wrong `name`** — the
+  outermost ancestor instance's own name, cascading down to every mesh
+  beneath it — instead of each mesh's own, correctly-nested name. Caused
+  by matching an instance's properties/name onto `mesh_index` by a
+  *substring* of its path rather than an exact match; since a shallow
+  instance's path is always a string prefix of every descendant's path
+  too, the shallowest instance's write always "won" for its entire
+  subtree. Fixed in Python, TypeScript, .NET, and Dart (also a genuine
+  performance win for .NET, replacing an O(instances × meshes) scan with
+  an O(1)-per-instance lookup — measured at ~73 minutes on a real
+  323,856-instance file). C++ never had this bug.
+- **A SketchUp-2020 filler-recovery heuristic that only checked a byte's
+  low bit could misdetect a value that happened to be a multiple of
+  256** — ported from an existing TypeScript fix to .NET, Dart, and C++
+  (Python was independently already correct, via a differently-shaped
+  fix).
+- **GLB export silently merged differently-textured materials that
+  happened to average to the same flat color**, and none of Python's,
+  .NET's, Dart's, or C++'s GLB writers embedded texture images at all
+  (`toGLB()` exported color-only materials even for a textured source
+  file) — ported from an existing TypeScript fix to all four.
+
+### Performance
+
+- Python's TLV parser (`_core.parse_tlv_recursive`) no longer builds a
+  `dict` per record or copies a leaf's payload bytes eagerly — tag bytes
+  are read via a lookup table instead of `.hex().upper()`, and a leaf's
+  payload is resolved lazily (only when actually read) and cached. Was
+  measured consuming 98% of parse time on a real 305 MB/1644-material
+  production file.
+
+### Security
+
+- Bumped `vitest` (1.6.1 → 3.2.7) and `vite-node` (1.6.1 → 6.0.0) in the
+  TypeScript package, resolving 6 flagged vulnerabilities (1 critical: the
+  Vitest UI server allowed arbitrary file read/execute).
+
+### Changed
+
+- **Python now requires 3.10+** (was 3.9+); 3.9 reached its own upstream
+  end-of-life. Existing 3.9 installations are unaffected — `pip`'s
+  resolver caps them at the last version that declared 3.9 support; only
+  future releases require 3.10+.
+- The writer now validates every `material`/`back_material`/`layer`
+  argument against handles the same builder actually issued, in all 5
+  languages, and raises immediately on a mismatch (e.g. a layer handle
+  passed where a material was expected) instead of silently accepting it.
+  Found via a real user bug report: a plain argument-order slip produced
+  a `.skp` file that round-tripped fine through this library's own reader
+  but real SketchUp rejected outright as corrupt.
+- Routine dependency maintenance (numpy, Pillow, pytest-cov,
+  `typescript-eslint`, eslint).
+
+### Removed
+
+- Dead `packages/python/src/openskp/geometry.py` module — its entire
+  geometry-extraction pipeline had zero live callers; the actual live
+  path has always been `_core.py`'s separately-named equivalent.
+
+## [1.1.0] — 2026-08-20
+
+**Write support, now in all five languages.** OpenSKP can *create* new
+`.skp` files from scratch, not just parse existing ones — a genuine,
+from-scratch binary writer for the legacy MFC `CArchive` format (SketchUp
+2013–2020), built by inverting the existing reader's own decoding logic
+rather than wrapping any SDK. Landed in Python first (previously the
+`[Unreleased]` entry on this file); this release ports the identical
+feature set — geometry, materials, layers, component definitions and
+groups (including nesting), circular/arc curves, freeform polylines,
+faces with holes, auto-triangulation, custom attributes, and the
+`open_existing()`/edit path — to TypeScript, .NET, Dart, and C++.
+TypeScript, .NET, and Dart are each verified byte-identical to Python's
+own already-SDK-validated output on the same input; C++ (no local
+compiler available in this project's environment) is verified structurally
+- every embedded byte constant cross-checked against Python's real
+values - plus its own full test suite passing in CI across GCC, Clang,
+and MSVC. See [Write capabilities](docs/DEVELOPER_GUIDE.md#write-capabilities) in
+the Developer Guide for the full picture and the naming convention each
+language follows.
+
+The entry point per language:
+
+| Language | Start building | Edit an existing file |
+|---|---|---|
+| Python | `openskp.create()` | `openskp.open_existing()` |
+| TypeScript | `create()` | `openExisting()` |
+| .NET | `SkpCreate.NewFile()` | `SkpEdit.OpenExisting()` |
+| Dart | `create()` | `openExisting()` |
+| C++ | `openskp::create()` | `openskp::open_existing()` |
+
+Every other method follows each language's own naming convention on top
+of the same underlying API shape (`add_face`/`addFace`/`AddFace`,
+`add_material`/`addMaterial`/`AddMaterial`, and so on) — see the table in
+[Write capabilities](docs/DEVELOPER_GUIDE.md#write-capabilities) for the
+complete mapping, including where component-definition scoping differs
+(Python's `with` context manager vs. TypeScript/Dart's callback-based
+`addComponentDefinition(name, (def) => {...})` vs. .NET's `using`
+block vs. C++'s explicit `.close()`).
+
+### Added — writer, ported to TypeScript/.NET/Dart/C++
+
+- `openskp.create()` / `SkpBuilder` — build faces (planar, including
+  concave polygons and non-manifold shared edges) directly from vertex
+  coordinates, with automatic vertex/edge sharing wherever coordinates
+  coincide exactly.
+- Solid-color and image-textured materials (`add_material`,
+  `add_texture_material` — PNG and JPEG, detected from the file's own
+  magic bytes), assignable independently to a face's front and back side.
+- Named layers (`add_layer`).
+- Reusable component definitions with multiple independently-positioned
+  instances (`add_component_definition`, `add_instance`), and groups
+  (`add_group`, which place themselves automatically on close rather than
+  needing a separate placement call).
+- Nested definitions — a component definition can contain instances of
+  another, already-built definition inside its own body
+  (`ComponentDefinitionBuilder.add_instance`), the same assembly-of-parts
+  nesting real SketchUp supports, to any depth. A nested placement can
+  also be a *group* rather than a component instance
+  (`ComponentDefinitionBuilder.add_group_instance`) — this format has no
+  way to declare one definition's body inside another's, so the group's
+  own geometry still has to be built with a normal
+  `add_component_definition` first, then placed here.
+- Explicit texture positioning (`add_face`'s `front_uv`/`back_uv`) —
+  scale, rotate, shear, and offset a face's texture independently per
+  side instead of the default planar projection, given 3 world-point/UV
+  correspondences. Works on a face of any orientation, tilted or not.
+- Per-face/per-edge hidden, soft, and smooth flags.
+- Custom key/value attribute dictionaries (`attributes` on
+  `add_component_definition`, `add_instance`, and `add_face`) — the same
+  mechanism SketchUp's own "dynamic component" attributes use. Values may
+  be `str`, `int`, or `float`; not yet supported on groups, since ground
+  truth shows a group's own attribute pointer is always null unlike a
+  component instance's.
+- Circular faces (`add_circle` on `SkpBuilder`/`ComponentDefinitionBuilder`)
+  — a genuine, editable-by-radius SketchUp arc/circle entity (`CArcCurve`),
+  not `num_segments` disconnected straight edges that merely trace that
+  shape. Every edge in the tessellation shares one real curve backref,
+  confirmed via the SDK's own `SUEdgeGetCurve`/`SUCurveGetType` to resolve
+  to a single, correctly-typed arc entity.
+- Partial (open) arcs (`add_arc`) — the same genuine `CArcCurve` entity as
+  `add_circle`, but a chain of edges with no face, swept between
+  caller-given `start_angle`/`end_angle` (radians). Confirmed via the SDK
+  that the written endpoint coordinates land exactly where the requested
+  sweep says they should, not just that "some curve object" exists.
+- Freeform polyline curves (`add_polyline`) — an arbitrary chain of
+  straight edges (open or `closed`) grouped into one genuine `CCurve`
+  entity, distinct from `CArcCurve`'s own geometric frame: just a type
+  tag and an edge count, ground-truth-derived from SDK-authored open and
+  closed polylines of several edge counts. Confirmed via the SDK that
+  every edge shares the same curve object, typed as `SUCurveType_Simple`
+  (not `ArcCurve`), with the correct edge count.
+- Every file now opens to the standard "Iso" view (parallel projection,
+  looking at the origin) instead of the blank scaffold's own arbitrary
+  default camera.
+- No SketchUp SDK dependency at import, write, or any other runtime path.
+  The bundled blank-document scaffold this module splices geometry into
+  is disclosed plainly as SDK-authored boilerplate (Trimble's own
+  built-in empty-document bytes, not anyone's creative work) in the
+  module's own docstring — the writer logic itself (the entity encoding,
+  the object-graph protocol, the tail-reference renumbering) is 100%
+  independently reverse-engineered.
+- `openskp.open_existing()` (`openskp.edit` module) — load an *existing*
+  legacy-format `.skp` file and rebuild it as a new `SkpBuilder`, so more
+  geometry can be added before saving. Real SketchUp itself never patches
+  a file in place (it fully re-serializes on every save), so this works
+  by fully parsing the source with this project's own reader and
+  replaying everything it understood — materials, layers, every
+  component definition, all root-level geometry/instances — back through
+  the writer's own API, rather than touching the original bytes at all.
+  Round-trip-validated against real, non-writer-authored architectural
+  models (not just files this project's own writer produced), confirming
+  face/instance/definition counts and the real SDK's own acceptance of
+  the rebuilt file. Returns a list of warnings for anything the source
+  file had that couldn't be faithfully reproduced (a projected texture,
+  a colorized material's tint, and several others — see the module's
+  own docstring for the complete, itemized list) rather than silently
+  dropping it.
+- `rotation=(axis, angle_radians)` on `add_instance`/`add_group`/
+  `add_group_instance` — a convenience alternative to hand-deriving a
+  `matrix3x3` rotation matrix for the common case of a pure rotation
+  (Rodrigues' rotation formula). Confirmed against the real SDK's own
+  `SUComponentInstanceGetTransform` to match SketchUp's transform
+  convention exactly, not just "some rotation was applied."
+- `add_face(..., auto_triangulate=True)` — a non-coplanar polygon (a
+  tessellated curved surface's warped "quad," the case that previously
+  had to be hand-split into triangles before calling `add_face` at all)
+  is now fan-triangulated into real, always-planar faces automatically
+  instead of raising, the same silent fallback real SketchUp's own UI
+  applies when you draw a not-quite-flat face. Off by default — existing
+  strict-planarity behavior is unchanged unless opted into.
+- `add_face(..., holes=[...])` — cut one or more independent closed
+  polygons out of a face (a window opening in a wall, say) as real
+  additional loops in the same `CFace` record, not a separate,
+  unconnected geometry hack. Ground-truth-derived from an SDK-authored
+  window-in-a-wall face: a hole loop is structurally identical to the
+  boundary loop except one flag byte, and its winding direction doesn't
+  matter (confirmed via the SDK's own geometry-input API accepting
+  either, and independently by writing raw bytes both ways). Confirmed
+  against the real SDK that the hole's area is genuinely subtracted
+  (`SUFaceGetArea`), not just structurally present.
+  `openskp.open_existing()` now replays a multi-loop face faithfully
+  instead of skipping it.
+- `SkpBuilder.materials_by_name`/`layers_by_name` — every material/layer
+  registered so far, by name, always kept up to date as a side effect of
+  `add_material`/`add_texture_material`/`add_layer` (previously a private,
+  undocumented implementation detail). `openskp.open_existing()` now
+  also returns a third value, `definitions` (component definition name →
+  its builder), so a caller can reuse the source file's own materials,
+  layers, and component definitions on new geometry — e.g.
+  `builder.add_face(pts, material=builder.materials_by_name["Walnut"])`
+  or `builder.add_instance(definitions["Wheel"], translation=...)` —
+  without reaching into a private attribute. Registering a genuinely NEW
+  material/layer/definition/group on the returned builder still isn't
+  possible (the file format's own ordering requirement is already
+  satisfied by the time replay finishes writing root-level geometry);
+  that limitation is now documented and tested rather than just
+  discovered by trial and error.
+- `hidden=True` on `add_instance`/`add_group`/`add_group_instance` — hides
+  that specific placement (its contents still exist in the file), the
+  same drawbase bit `add_face`'s own `hidden` already used. `color=`/
+  `hidden=` on `add_layer` — the layer's own color and default
+  visibility, both already exposed on the read side as `Layer.color_r/g/
+  b`/`Layer.hidden` but previously fixed at a hardcoded default on write.
+  All three confirmed against the real SDK (`SUDrawingElementGetHidden`,
+  `SULayerGetVisibility`). `openskp.open_existing()` now replays both
+  faithfully instead of warning that they were dropped.
+
+### Fixed
+
+- Calling `add_face`/`add_instance` on the root builder while a component
+  definition was still open (its `with` block not yet exited) silently
+  produced a corrupted file instead of raising — found while testing
+  group nesting, unrelated to it otherwise. Now raises immediately.
+- `write_face` validated texture-positioning correspondences and
+  attribute values only partway through writing a face's bytes - a
+  caller that caught the resulting `SkpWriteError` and kept building
+  (exactly what `open_existing()`'s replay does when skipping one
+  unsupported face) was left with orphaned, uncounted edges silently
+  corrupting everything written afterward, with no error surfaced until
+  the file failed to fully parse. Both checks now run before any bytes
+  are written.
+- `write_textured_material`'s placeholder average-color always had a
+  fully-opaque alpha byte, which `legacy.py`'s reader treats as one of
+  its two signals that a material is a colorized (tinted) variant - every
+  plain (non-colorized) texture this writer created was silently
+  misreported as colorized when read back. Found via `open_existing()`
+  round-tripping the writer's own output.
+- **A large model (total archive-slot count crossing 32,767) produced a
+  corrupted file real SketchUp rejected outright.** An archive slot of
+  exactly `0x7FFF` (32767) is unrepresentable in the format's short
+  2-byte reference form no matter which encoding would otherwise apply -
+  it's byte-identical to either the big-tag escape marker or the
+  new-class-declaration marker, both of which `legacy.py`'s reader
+  checks before it ever considers "this is just a normal reference" -
+  confirmed by tracing the actual read dispatch order, not just the
+  protocol table. `_backref`/`_new_of_known_class` used an off-by-one
+  `<= 0x7FFF` boundary that let slot 32767 through in the ambiguous short
+  form; `_shift_ref` (used to renumber a handful of fixed pointers in the
+  blank scaffold's tail region when new slots are inserted) additionally
+  had no escape-widening at all, silently wrapping any shifted reference
+  past that boundary back into the wrong slot. Reverting the fix
+  reproduces the exact reported symptom: real SketchUp's SDK rejects the
+  file outright (`SUModelCreateFromFile` error), and — more seriously —
+  this project's own reader doesn't error either, it silently drops
+  roughly 40% of a 5,000-face reproduction's faces with no error
+  surfaced at all. Found while reviewing a large-model (31,966-face)
+  export failure report from a downstream project (IngeTrazo) building a
+  `.skp` exporter on this writer; independently re-derived and verified
+  rather than taken on faith, including a before/after real-SketchUp-SDK
+  comparison on the exact failure shape.
+
+### Validation
+
+Every capability above is verified against the real SketchUp SDK
+(`SketchUpAPI.dll` used strictly as a local, offline validation oracle —
+never a runtime dependency), not just against OpenSKP's own reader —
+several silent-failure fields (drawbase padding, loop flags, attribute
+container requirements) only show up as `SU_ERROR_MODEL_INVALID` in real
+SketchUp despite parsing cleanly through this project's own code. A
+combined "kitchen sink" test exercises every feature together in one
+file (materials, layers, textures, definitions, instances, groups,
+concave/non-manifold geometry) and is checked at scale (hundreds of
+entities) as a regression guard.
+
+### Explicitly out of scope for this first pass
+
+- Declaring a group's geometry inline nested inside another definition's
+  own body, the way `add_group` self-places at the root level - this
+  format has no mechanism for one definition's declaration to live inside
+  another's, so a nested group's geometry has to be built separately
+  first (see `add_group_instance` above).
+- Writing the modern VFF (2021+) container - every language's writer
+  only ever produces the legacy MFC format, the same restriction
+  `open_existing()` places on its own source file.
+
+### Fixed — TypeScript
+
+- `retryCountAfterV20Filler`'s byte-at-a-time zero-padding scan
+  misidentified a v20 filler-record count that was an exact multiple of
+  256 (its own low byte is `0x00`, indistinguishable from padding to
+  that scan), misaligning every read after it. Rewritten to probe whole
+  u32s at 4-byte strides instead of inspecting individual bytes, which
+  can't be fooled by a zero low byte the same way. Follow-up to a review
+  note on #155; thanks to [Marco Sumari](https://github.com/tuxiasumari)
+  for tracking it down. (#192)
+
+### Added — TypeScript
+
+- `toGLB(scene, { textures: true })` — embed the scene's texture images
+  in the GLB export and point each textured material's
+  `baseColorTexture` at them, opt-in since it can multiply the exported
+  file's size. Off by default, output byte-identical to before. Also
+  fixes material identity: materials were previously deduplicated by
+  colour alone, silently merging two different textures that happened to
+  average to the same RGB - the texture is now part of the dedup key too.
+  Thanks to [Thomaz Yuji Baba](https://github.com/thomazyujibaba). (#193)
+
+## [1.0.0] — 2026-08-13
+
+First stable release. All five language ports (Python, TypeScript, Dart,
+C# / .NET, C++) now carry full feature parity: parsing (geometry,
+materials, layers, dynamic properties, metadata) and native, dependency-light
+export to GLB, JSON, Wavefront OBJ/MTL, STL, PLY, DXF (3DFACE and AutoCAD
+Polyface Mesh), and IFC4 (BIM) — verified against real-world `.skp` fixtures
+and, for DXF specifically, against real desktop AutoCAD rather than lenient
+readers alone.
+
+### Added
+
+- **All 5 languages**: native Wavefront OBJ exporter (`to_obj`/`toOBJ`/
+  `toObj`/`ToObj`, plus a file-writing counterpart in each language —
+  Python's is `openskp.export.obj.export()`, the other four are
+  `exportOBJ`/`exportObj`/`ExportObj`). InvariantCulture/classic-C-locale
+  formatting is enforced everywhere to guarantee dot decimal separators
+  regardless of the host OS locale.
+- **All 5 languages**: native STL exporter, both ASCII (`.stl`) and
+  little-endian binary (`_bin.stl`), with an optional `scale` multiplier
+  (default 1.0 for metres, 1000.0 for mm, matching what slicers like Cura/
+  PrusaSlicer/Bambu Studio expect). Verified byte-identical output (9,368,084
+  bytes, 187,360 triangles) across languages on the same real fixture.
+- **All 5 languages**: native PLY exporter (Polygon File Format), both ASCII
+  and little-endian binary, carrying vertex positions, normals, UV
+  coordinates, and RGBA vertex colors. C++'s binary writer uses
+  architecture-independent bitwise shifts rather than relying on host
+  endianness. Verified byte-identical output (9,316,015 bytes, 187,360
+  triangles) across languages on the same real fixture.
+- **All 5 languages**: rich Wavefront OBJ/MTL extension — a companion
+  `.mtl` material-library writer (`to_mtl`/`toMTL`/`toMtl`/`ToMtl`) emitting
+  `newmtl`/`Ka`/`Kd`/`Ks`/`Ns`/`d`/`illum` records plus `map_Kd` texture
+  references, with `to_obj` gaining an optional `mtl_filename` parameter to
+  link the two via `mtllib`. The `.obj` writer itself gained `vt` (UV) and
+  `vn` (normal) records, upgrading it from a positions-only debug dump to a
+  properly textured/shaded mesh format.
+- **All 5 languages**: native 3D DXF exporter, targeting AutoCAD R2000
+  (`AC1015`) compliance — full HEADER/CLASSES/TABLES/BLOCKS/OBJECTS
+  scaffold, `LAYER` table entries with ACI color codes, and entity output in
+  either `3DFACE` mode or AutoCAD Polyface Mesh mode (`POLYLINE` type 64 +
+  `VERTEX` + `SEQEND`). Polyface is now the default mode (previously
+  `3dface`), since it's the form AutoCAD itself generates for triangulated
+  meshes. See Fixed below — the exporter's real-world compatibility with
+  desktop AutoCAD required a second, much deeper pass beyond what made
+  lenient DXF readers (`ezdxf`) accept it.
+- **All 5 languages**: native IFC4 (BIM) exporter — ISO-10303-21 STEP ASCII
+  output with a full `IfcProject → IfcSite → IfcBuilding → IfcBuildingStorey
+  → IfcProduct` spatial hierarchy, `IfcTriangulatedFaceSet` tessellated
+  geometry, best-effort element classification (walls/doors/windows/slabs/
+  columns/beams/roofs, defaulting to `IfcBuildingElementProxy`), dynamic
+  properties via `IfcPropertySet`/`IfcRelDefinesByProperties`, material
+  colors via `IfcColourRgb`/`IfcSurfaceStyleRendering`, and layer
+  preservation via `IfcPresentationLayerAssignment`. Validated with
+  `IfcOpenShell` against two real-world files, including a 26.94 MB / 101,692-
+  property export.
+- **Web viewer**: the single "Export GLB" button is now an "Export Model"
+  dropdown covering every format the library supports — JSON, IFC4, DXF
+  (both Polyface Mesh and 3DFACE), PLY, STL, GLB, and OBJ. All formats share
+  one `downloadFile()` helper (Blob + object URL, revoked after use), and
+  exported filenames now derive from the uploaded `.skp`'s own name instead
+  of a fixed stem.
+
+- **Dart**: `toGlb(Scene)`/`exportGlb(Scene, path)` - binary glTF 2.0
+  (GLB) export, matching Python's and C++'s `to_glb`/`export_glb` pair
+  (same scope as the .NET entry below). A from-scratch writer with no new
+  dependency - `dart:convert`'s built-in `jsonEncode` covers the JSON
+  chunk directly, no custom serializer needed (simpler than .NET's port,
+  which had to hand-roll one since `netstandard2.0` has no built-in JSON
+  support). Same TEXCOORD_0 correction as .NET's port relative to the
+  TypeScript reference. `exportGlb` doesn't create missing parent
+  directories, matching C++/.NET's `export_glb`/`ExportGlb`. One
+  Dart-specific wrinkle: `GlbPrimitive`'s fields are `List<double>`
+  (64-bit) here, but the binary accessor data is float32 - min/max
+  bounds are now read back from the already-written float32 buffer
+  rather than computed from the raw doubles, so they match what's
+  actually in the accessor. Verified against the real fixture: chunk
+  headers, mesh/material counts, and decoded UV values all confirmed
+  correct, byte-for-byte identical (after accounting for float32
+  rounding) to the already cross-verified Python/TypeScript/C#/.NET
+  output on the same file.
+- **.NET**: `GlbExport.ToGlb(Scene)`/`GlbExport.ExportGlb(Scene, path)` -
+  binary glTF 2.0 (GLB) export, matching Python's and C++'s
+  `to_glb`/`export_glb` pair (TypeScript only has the bytes-returning
+  variant). A from-scratch writer with no new dependency, matching how
+  this project has stayed dependency-light everywhere except C++'s
+  bundled TinyGLTF - `netstandard2.0` has no built-in JSON support, so
+  this also adds a small internal `MiniJson` serializer (reflection-based,
+  just enough to cover the object graphs this writer builds; not a
+  general-purpose JSON library). Ported from the TypeScript reference
+  implementation's `toGLB()`, with one correction: TS's own `toGLB()`
+  still doesn't write `TEXCOORD_0` despite `GlbPrimitive.uvs` existing
+  there too (tracked as a separate follow-up) - .NET's writer includes it
+  from the start. `ExportGlb` doesn't create missing parent directories,
+  matching C++'s `export_glb` (the other language with this same pair).
+  Verified against a real fixture: magic/chunk headers, mesh/material
+  counts, and decoded UV values all confirmed correct, with the UV values
+  byte-for-byte identical to the already cross-verified Python/TypeScript/
+  C#/Dart output on the same file.
+- **Python**: `export.json_export.to_dict()`'s output gained a top-level
+  `root` key with the model's implicit top-level definition (matching
+  `SkpModel.root`) - previously only `definitions` (the numeric-ID-keyed
+  component/group definitions) was included, so the JSON export silently
+  omitted any geometry/instances placed directly in the model rather than
+  inside a component.
+
+- **TypeScript**: `Face` gained `uvProjected`/`uvProjectedBack` fields.
+  The legacy MFC reader already decoded these bits internally
+  (`front_projected`/`back_projected` on the `CFaceTextureCoords` record)
+  but discarded them instead of exposing them, same gap Python closed in
+  #61. A PROJECTED texture (e.g. the Add Location terrain drape) has UVs
+  that run in the projection plane's frame, not the face frame - callers
+  need to know this to render it correctly. VFF/modern files don't carry
+  this flag at all, so it correctly defaults to `false` there, matching
+  Python's precedent.
+- **Dart**: `Face` gained `uvProjected`/`uvProjectedBack` fields, same fix
+  and same rationale as the TypeScript entry above.
+- **.NET**: `Face` gained `UvProjected`/`UvProjectedBack` properties, same
+  fix and same rationale as the TypeScript/Dart entries above.
+- **C++**: `Face` gained `uv_projected`/`uv_projected_back` fields, same
+  rationale as the TypeScript/Dart/.NET entries above. See the Fixed
+  section for why this needed more than exposing two bits.
+
+- **Python**: `scene.GlbPrimitive` gained a `uvs` field with real per-vertex
+  texture coordinates, computed from each source face's `uv_transform` (or
+  the default face-plane projection when a face has none) — see
+  `Face.uv_transform`'s docstring for the formula. Vertices are now split
+  where two faces sharing a position disagree on UV, since indexed glTF
+  meshes need position/normal/uv aligned per vertex. Fixes #62 for Python;
+  other languages exposing the same `GlbPrimitive` shape are being ported
+  separately. Faces with `uv_projected` set (terrain-drape textures) still
+  use the face-plane formula, since the real projection-plane basis isn't
+  captured anywhere in the parsed data yet — their UVs are approximate.
+- **.NET**: `Scene.GlbPrimitive` gained a `Uvs` field, same fix as the
+  Python entry above and the exact issue #62 was filed against (its
+  `GlbPrimitive` snippet). Verified numerically identical to Python's
+  output (to float precision) on the same real fixture.
+- **TypeScript**: `GlbPrimitive` gained a `uvs` field, same fix as the
+  Python/.NET entries above. Verified numerically identical to both on the
+  same real fixture.
+- **C++**: `GlbPrimitive` gained a `uvs` field, same fix as the other three
+  ports. Unlike those, C++'s `to_glb`/`export_glb` write real `.glb` files
+  directly from this struct, so this PR also wires a `TEXCOORD_0` accessor
+  into the actual glTF output - exported files now carry real texture
+  coordinates, not just the in-memory struct. C++ also uniquely models
+  front/back materials as separate primitives; the back-side primitive
+  (when present) uses `uv_transform_back` with the same face-plane basis
+  as the front, per the documented recipe - this path has no cross-language
+  reference to verify against, since no other port models back materials
+  at all.
+- **Dart**: `GlbPrimitive` gained a `uvs` field, same fix as the other
+  ports. This closes out #62 across every language whose scene-baking
+  layer exposes `GlbPrimitive` - Python, .NET, TypeScript, C++, and now
+  Dart all compute numerically identical UV values (to float precision) on
+  the same real fixture. Dart has no `.glb` file writer yet (tracked
+  separately), so this reaches the `GlbPrimitive` data shape only, same as
+  the Python/.NET/TypeScript entries above.
+- **Python**: `export.glb.export()` - the actual `.glb` file writer, a
+  separate legacy pipeline from `scene.py`'s `build_scene()` - now writes
+  real per-vertex UV coordinates too, closing the same gap as above for
+  Python's literal exported files (matching what C++'s PR already did for
+  its own file writer). Faces are now grouped into one mesh per resolved
+  color per definition, same as `scene.py`, since a single trimesh mesh
+  can only carry one material - previously this pipeline put every face
+  of a definition into one mesh with a flat per-face color array,
+  regardless of how many distinct materials were mixed in (confirmed on a
+  real fixture: 2 of 3 definitions mix colors). Verified numerically
+  identical UV output to `scene.py`'s on three real files (both legacy
+  MFC and modern VFF format).
+
+- **C++**: public `to_glb(const Scene&)` and `export_glb(const Scene&, path)`
+  APIs for in-memory and file-based binary glTF 2.0 export. The implementation
+  uses privately bundled TinyGLTF 2.9.7, validates scene geometry and PBR data,
+  and keeps TinyGLTF out of installed headers and consumer link interfaces.
+
+### Fixed
+
+- **All 5 languages**: the DXF exporter produced files that `ezdxf.readfile()`
+  (and even `ezdxf`'s own `.audit()`) accepted without complaint, but real
+  desktop AutoCAD rejected outright — first with "Invalid or incomplete DXF
+  input", later with "Did not receive PlotStyleName" once the more obvious
+  problems were fixed. `ezdxf` is too lenient to catch what AutoCAD enforces
+  internally, and there's no public, comprehensive list of those rules, so
+  this was tracked down using real desktop AutoCAD as the only reliable
+  oracle, then cross-checked against what real `ezdxf` itself emits for
+  equivalent structures. Five distinct root causes, byte-verified against a
+  real `ezdxf`-generated file confirmed to open cleanly in AutoCAD:
+  1. An incomplete HEADER/CLASSES/TABLES/BLOCKS/OBJECTS scaffold — a
+     near-empty `CLASSES` table, a fabricated `VPORT` record, and a stripped
+     `OBJECTS` dictionary tree missing `MATERIAL`/`MLINESTYLE`/
+     `MLEADERSTYLE` records and a second `LAYOUT` record — all boilerplate
+     AutoCAD requires but lenient readers never check.
+  2. Every dynamically-generated `LAYER` record was missing group `370`
+     (lineweight) and `390` (PlotStyleName handle); AutoCAD rejects the
+     whole `TABLES` section without them once a drawing uses a Named plot
+     style table. Also dropped group `420` (24-bit true color), an R2004+
+     field real `ezdxf` never emits for R2000/AC1015 — ACI (`62`) is the
+     only color mechanism R2000 supports.
+  3. Polyface `POLYLINE`/`VERTEX`/`SEQEND` structure had three mismatches
+     against real `ezdxf`'s own polyface output: face-record `VERTEX`
+     entries were missing color (`62`) and dummy `0/0/0` coordinates while
+     carrying a subclass marker they shouldn't have, and `SEQEND`'s owner
+     (`330`) pointed at Model_Space instead of its parent `POLYLINE`'s own
+     handle. This is exactly why `3dface` mode opened fine while `polyface`
+     mode was rejected, despite sharing the same scaffold.
+  4. TypeScript, Dart, C#, and C++ never substituted the `$HANDSEED`
+     placeholder — every file these four exporters ever produced shipped
+     the literal text `__HANDSEED__` instead of a real hex value.
+  5. Unbounded layer names could exceed AutoCAD's documented limits; added a
+     defensive 255-character cap with a collision-safe hash suffix on
+     truncation.
+
+  Dynamic handles now start at `0x691`, matching the reference file's own
+  first entity handle, keeping every handle in an export globally unique.
+  Both `3dface` and `polyface` output confirmed opening cleanly in real
+  desktop AutoCAD after this fix (C++ mirrors the same verified structure
+  but could not be locally compiled/run in the environment this was fixed
+  in — CI is the correctness gate there).
+- **Python**: `export.dxf.export()` didn't set `newline=''` when opening the
+  output file on Windows, so `open()`'s universal-newline translation turned
+  every `\r\n` the writer emitted into `\r\r\n` (double carriage returns),
+  which CAD viewers rejected. Explicit 3DFACE output was affected before the
+  fix above even applied.
+- **TypeScript**: `toGLB()` never wrote a `TEXCOORD_0` accessor, despite
+  `GlbPrimitive.uvs` existing on its data model since #65 - real UV data
+  was computed but the actual exported `.glb` bytes never carried it.
+  Found while using `toGLB()` as the structural reference for porting GLB
+  export to .NET and Dart (both new writers included `TEXCOORD_0` from
+  the start rather than reproducing this gap). Same shape as the gap
+  already fixed for Python's `export/glb.py` (#68) and C++'s `glb.cpp`
+  (#66). No test coverage existed for `toGLB()` before now, which is how
+  this went unnoticed - added real coverage, including a real-fixture
+  round-trip test that decodes every primitive's `TEXCOORD_0` back out of
+  the binary chunk and confirms it matches the source `GlbPrimitive.uvs`
+  exactly.
+- **C++**: `Face.uv_transform`/`uv_transform_back` were never populated for
+  *any* legacy MFC (SketchUp 2013–2020) file - every legacy face's UV
+  silently fell back to the default (non-positioned) face-plane
+  projection, even when the SketchUp author had explicitly positioned or
+  photo-fitted a texture. Root cause: `CFace`'s attribute container (the
+  MFC record that holds its `CFaceTextureCoords` mapping, alongside any
+  other attribute dictionaries) was being read - correctly advancing the
+  archive cursor - and then discarded, never linked back to the face.
+  Found while investigating a smaller, originally-scoped task (exposing
+  the already-decoded PROJECTED-texture bit); turned out the bit lived in
+  a record that was never reachable at all. Fixed by capturing the
+  attribute container's slot on `CFace`, capturing attribute-container
+  children as they're read (previously discarded there too), and
+  resolving both when building each face. Verified against a real fixture
+  the count of faces with a real `uv_transform` now matches Python's
+  independently-verified count exactly (32) - previously this would have
+  been 0 for every legacy file, always.
+- **Python**: `export.glb.export()` crashed on any file with a textured
+  material - the metadata JSON sidecar it writes tried to embed each
+  material's raw texture image bytes directly, which was never
+  JSON-serializable, so `json.dump` raised `TypeError`. There was no
+  existing test coverage for this function, which is how this went
+  uncaught. Now stripped before serialization - the `.glb` file itself
+  carries the actual texture data, a JSON metadata file was never the
+  right place for it.
+- **Python, TypeScript, Dart, C++**: `Material.color`'s alpha channel was
+  silently discarded when parsing legacy MFC (SketchUp 2013–2020) files —
+  each language read the material's real 4-byte RGBA record but only kept
+  the first three bytes, always reporting a hardcoded alpha regardless of
+  what the file actually stored. .NET already read the real byte correctly;
+  the other four now match it. Verified empirically across 2,060 materials
+  in 13 real production files that this byte is always 255 in practice, but
+  reading the real value is more correct than assuming a constant. The VFF
+  (2021+) material record has no alpha attribute at all in any language —
+  that path correctly continues to default to 255, since there's no real
+  data to read there.
+
+### Changed
+
+- **Python**: `SkpModel.definitions` no longer contains an entry keyed by
+  the string `"ROOT"`. The implicit top-level model (the file's directly
+  placed, non-componentized geometry and instances) now has its own
+  dedicated `SkpModel.root` field, matching TypeScript/.NET/Dart/C++'s
+  `root`/`Root` exactly. Previously `definitions` was typed
+  `Dict[int, Definition]` but silently held one non-`int` key at
+  runtime — any code iterating `model.definitions.values()` to sum
+  geometry across the whole file (not just named components) needs to
+  also include `model.root` now, the same way the other four languages'
+  own callers already do. `len(model.definitions)` is now the count of
+  real named component/group definitions only, one lower than before.
+
+### Removed
+
+- **Python**: `SkpModel.scene_hierarchy` and `SkpModel.mesh_index` —
+  dead fields that `parse()` never populated (always empty). Leftover
+  from an earlier design; the real, populated versions of both concepts
+  live on the separate `Scene` class returned by `build_scene()`, which
+  is the pattern this project uses consistently everywhere else (a plain
+  `parse()` stays light; a scene bake is opt-in and heavier). Any code
+  reading these two fields was always seeing an empty list/dict — this
+  removal cannot change observed behavior for a correctly-written
+  caller, only surface a clear `AttributeError` instead of silently
+  succeeding with fake-empty data for one that assumed they were real.
+
+## [0.3.0] — C++ only — 2026-08-07
+
+### Added
+
+- **C++ package** — new independent C++17 port covering both modern
+  VFF/ZIP (2021+) and legacy MFC (SketchUp 2013–2020) containers, at
+  parity with the other four languages: geometry, components, layers,
+  materials/textures, styles, dynamic properties, image entities,
+  `parse()`/`build_scene()` scene baking, and observability hooks
+  (progress/log callbacks). Installable CMake package with static and
+  shared library builds, cross-platform CI (Linux/macOS/Windows,
+  GCC/Clang/MSVC), and a test suite cross-validated against the same
+  real fixture files already used by the Python/TypeScript/.NET/Dart
+  ports. GLB export was not yet included in this initial release — see
+  `[Unreleased]` above. Contributed by
+  [Thomas Loockx](https://github.com/thomasloockx). Closes #29.
+
+## [0.3.1] — TypeScript only — 2026-07-30
+
+### Fixed
+
+- **TypeScript**: `packages/typescript/README.md` — the published npm page
+  was still showing the pre-implementation placeholder README ("Under
+  active development... coming soon", planned-features list, no working
+  examples), unchanged since before the TypeScript port was actually
+  written. Rewritten to describe the real, working package: accurate
+  `parse()`/`buildScene()`/`toGLB()`/`toJSON()` quick start, observability
+  options, and the known large-file memory limitation — each snippet
+  checked against the actual exported types. Python, .NET, and Dart's
+  READMEs were audited at the same time and found already accurate; only
+  TypeScript needed this fix, which is why this release doesn't bump the
+  other three languages' versions.
+
+## [0.3.0] — 2026-07-29
+
+All additions below are backwards-compatible (new defaulted dataclass
+fields only; no existing field or behaviour removed) unless noted under
+"Changed".
+
+### Added
+
+- **.NET package** — built from scratch: full VFF (2021+) parsing at
+  parity with the other three languages (geometry, components, layers,
+  materials/textures, styles, dynamic properties, image entities), plus
+  full legacy MFC (SketchUp 2013–2020) support. Not yet released to
+  NuGet.
+- **Dart package** — built from scratch: same full VFF + legacy MFC
+  parity as .NET. Not yet released to pub.dev.
+- **All four languages**: opt-in scene baking — `build_scene()` /
+  `buildScene()` / `BuildScene()` — resolves the *entire* placed
+  instance tree to world-space, triangulates every face, and groups
+  results into GLB-ready mesh primitives (`Scene`/`GlbPrimitive`).
+  Deliberately kept separate from `parse()`/`Open()` (which stays light —
+  raw per-definition geometry, no scene-graph resolution) since baking a
+  file that reuses a handful of definitions across many instances can
+  produce far more data than the file's raw geometry. TypeScript already
+  had this; ported to Python, .NET, and Dart this round, each re-parsing
+  independently rather than sharing a prior `parse()` call's data. .NET
+  and Dart's triangulation uses a faithful port of
+  [earcut](https://github.com/mapbox/earcut) (the same algorithm
+  TypeScript already used) rather than a from-scratch alternative.
+- **All four languages**: **memory fix for large real-world files.**
+  Files with 100,000+ component definitions previously required
+  materializing the *entire* file's TLV tree in memory before extraction
+  could begin; peak memory now scales with the size of the single
+  largest top-level record instead of the whole file, via a lazy,
+  streaming top-level iterator
+  (`iter_top_level_lazy`/`iterTopLevelLazy`/`IterTopLevelLazy`) built on
+  a cheap flat-header pre-scan. No change to any tag's decoding logic —
+  purely an orchestration change. Verified against real production files
+  up to 620 MB. .NET additionally needed `ChunkedBuffer` (a
+  multi-segment buffer) plus widening TLV offsets from `int` to `long`,
+  since the CLR's array/`MemoryStream` types have a hard ~2.1 GB ceiling
+  that a decompressed `model.dat` can exceed. See
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#memory-architecture) for
+  the full explanation, and
+  [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md#performance) for
+  verified per-language numbers — including TypeScript's remaining,
+  currently-open memory ceiling on very large files, documented honestly
+  rather than glossed over.
+- **All four languages**: **observability** — opt-in progress reporting
+  and structured, location-carrying parse errors, silent by default.
+  Python uses the standard `logging` module
+  (`logging.getLogger("openskp")`); TypeScript/.NET/Dart use an explicit
+  options object with `onProgress`/`onLog` callbacks
+  (`IProgress<T>`-based in .NET). A new `SkpParseError`/`SkpParseException`
+  in every language carries `stage`/`recordIndex`/`totalRecords`/`tag`/
+  `definitionId`, with the original failure always preserved (`__cause__`
+  / `.cause` / `InnerException`). Full reference:
+  [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md).
+- **TypeScript**: `model.root` — the implicit top-level definition
+  (geometry/instances placed directly in the model, not inside any
+  component/group) is now exposed on `parse()`'s result, matching .NET
+  and Dart's `Root`/`root`. Previously dropped entirely from `parseSkp()`
+  — the only way to reach it was the much heavier `buildScene()` call.
+  Purely additive; `model.definitions` is unchanged.
+- **Documentation**: [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md)
+  (new) and [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) (new) —
+  detailed, cross-language, verified against actual source and real
+  files rather than aspirational. `docs/ARCHITECTURE.md` and
+  `docs/API_DESIGN.md` rewritten to match current reality (all four
+  languages available, not "planned"). README rewritten: accurate
+  per-language quick starts (the previous Python example referenced
+  methods — `model.export_glb()`, `openskp.binary.VffReader` — that
+  don't exist in the current package).
+
+### Fixed
+
+- **`examples/web-viewer`**: the web viewer called `parseSkp()` and read
+  triangulated mesh data (`_glbPrimitives`/`meshIndex`/`_gltfMaterials`)
+  directly off the result — the shape `parseSkp()` returned before the
+  scene-baking split above. Every model would parse "successfully" but
+  silently render zero meshes. Fixed to call the new `buildScene()`
+  alongside `parseSkp()`.
+- **Python**: `openskp.export.obj.export()` and
+  `openskp.export.json_export`'s `scene_hierarchy` output both silently
+  depended on `SkpModel.mesh_index`/`SkpModel.scene_hierarchy` — dataclass
+  fields `parse()` never populates, always empty. `obj.export()` always
+  wrote a near-empty `.obj` file; `json_export`'s `scene_hierarchy` key
+  always serialized as `[]`, even though the rest of the JSON output was
+  correct. Fixed: `obj.export()` now takes a built `Scene` (from
+  `build_scene()`) and writes real geometry from its `glb_primitives`;
+  `json_export.to_dict()`/`.export()` now accept an optional `scene=`
+  parameter and use `Scene.scene_hierarchy`'s real, resolved instance tree
+  when provided (`scene_hierarchy` is `None`, not a misleading `[]`, when
+  omitted). This is a breaking signature change for `obj.export()`
+  (previously `export(model, output_path)`, now
+  `export(scene, output_path)`).
+
+### Known limitations (not yet fixed)
+
+- **Python**: `model.definitions` mixes real (integer-keyed) definitions
+  with an implicit root entry under a `'ROOT'` **string key**, unlike
+  TypeScript/.NET/Dart's separate `.root`/`.Root` property. Tracked as a
+  follow-up; not changed yet since existing consumers may rely on the
+  current shape.
+- **TypeScript**: `parseSkp()`'s memory use scales significantly worse
+  than the other three languages on very large files — see "memory fix"
+  above. A 113 MB file needs 8–16 GB of Node heap; a 294 MB file fails
+  even at 16 GB. Root-caused to V8's per-object overhead on millions of
+  small geometry objects; a more compact internal representation is
+  tracked as follow-up work.
+- **GLB/OBJ/JSON export**: Python ships complete disk-writing exporters
+  (`openskp.export.glb`/`obj`/`json_export`); TypeScript ships a complete
+  in-memory GLB serializer (`toGLB()`) but no OBJ/JSON export yet; .NET
+  and Dart expose the same triangulated scene data via `buildScene()` but
+  a consumer needs to serialize it themselves.
+
+- **Python**: `Material.id` and `SkpModel.materials_by_id` — expose the TLV
+  material IDs that `Face.material_id` references, so callers can resolve a
+  face's material (colour/transparency) from the public API. Previously the
+  join existed only inside the internal exporter.
+- **Python**: `Instance.material_id` — the material painted onto a component
+  instance itself (SketchUp's "paint the component", the same `D007`/`D107`
+  structure faces use). Faces with no material of their own inherit it;
+  consumers can now resolve that inheritance like the official SDK does.
+- **Python**: texture extraction — `Material.texture` (`Texture` dataclass:
+  `filename`, tile `width`/`height` in inches, raw image `data` bytes,
+  `save()` helper). Images are read from the material's folder inside the
+  embedded ZIP, with a sibling fallback when the stored image name differs
+  from `textureFilename`.
+- **Python**: colourized materials — `Material.colorized` /
+  `colorize_type`, and shared-texture resolution so a colourized copy
+  (SketchUp's `[Name]1`, `type="2"`) resolves the image bytes it borrows
+  from its source material's folder instead of returning `None`.
+- **Python**: per-face texture mapping — `Face.uv_transform` /
+  `uv_transform_back` (the 3×3 matrix a positioned / photo-fitted texture
+  stores per face; SketchUp's texture pins). Includes the decoded recipe to
+  turn it into UVs (plane basis from the normal, then
+  `[x, y, 1] @ inv(M) / tile`), calibrated against SDK-exported ground
+  truth to < 0.001 UV error, including projective (4-pin distorted)
+  mappings.
+- **Python**: `Face.back_material_id` — the material of a face's BACK side
+  (the `AF0D` child of the face node). A face painted only on its back is
+  common when the author paints the visible side of a downward-facing cap;
+  without this field such faces looked unpainted.
+- **Python**: `Edge.soft` / `smooth` / `hidden` — per-edge display flags
+  decoded from the edge's `D307` byte, so viewers/exporters can hide facet
+  lines of curved surfaces while keeping author-drawn coplanar edges.
+- **Python**: styles — `SkpModel.styles` (`Style`: name, `front_color`,
+  `back_color` RGB) parsed from `styles/*/style.xml` (signed-int32 ARGB
+  items 4000/4001). Viewers need them to shade unpainted faces the way
+  SketchUp does.
+- **Python**: `Definition.always_faces_camera` — SketchUp's "always face
+  camera" component behavior (2D people / tree cut-outs), decoded from the
+  definition's behavior block (`581B` → sub-TLV `5D1B == 1`; its companion
+  `5E1B` is "shadows face sun"). Consumers can now render such instances
+  as billboards, like SketchUp does.
+- **Python**: Image entities — a picture placed in the model as an object
+  now parses: its placement wraps a standard instance node inside the
+  image-specific `9013`/`401F` containers (previously opaque, so the image
+  definition looked "never placed"), and `Definition.is_image` flags the
+  single-quad definition backing it (TLV kind `8315 == 2`). Real-world
+  case: photo cut-out statues/animals placed as images imported with no
+  geometry at all.
+
+### Fixed
+
+- **Python**: entity names (materials, layers, definitions, instances,
+  dynamic properties) now decode as **UTF-8** instead of ASCII-with-ignore.
+  Dropping the non-ASCII bytes silently corrupted any accented name
+  ("cópia" → "cpia", "Diseño" → "Diseo") and — critically — broke the
+  material-name join between the TLV stream and the XML material files,
+  leaving those materials unresolvable from geometry.
+
+### Changed
+
+- **Python** — ⚠️ **`Material.transparency` value change.** The `trans`
+  attribute in `material.xml` is a *transparency* (0 = opaque, 1 = fully
+  transparent), not an opacity, and only applies when `useTrans="1"`. The
+  parser now exposes the resulting **opacity** as `1 - trans` (and `1.0`
+  when `useTrans` is off). This corrects two prior behaviours — most
+  materials previously read as 50% transparent (the parser default) and
+  some as fully invisible (`trans="0"`) — but it also means
+  `Material.transparency` returns **different numeric values for the same
+  file** after this release: most materials move `0.5 → 1.0`, and genuinely
+  translucent ones invert (e.g. SketchUp's "Translucent Glass Blue", 70%
+  opacity, now reads `0.7` instead of `0.3`). **Audit any code that reads
+  `Material.transparency` directly before upgrading.** Validated against
+  SketchUp's own library materials.
+
+## [0.2.0] — 2026-06-18
+
+### Added
+
+- SketchUp 2025 support
+- Materials rendering support
+- Older SKP version fixes
+
+### Changed
+
+- Package version bumps
+
+## [0.1.0] — 2026-06-18
+
+### Added
+
+- **Python package** (`openskp`) — first public release
+  - Parse SketchUp 2021+ (VFF format) binary files
+  - Extract 3D geometry: vertices, edges, faces with full topology
+  - Extract component definitions and instance hierarchy
+  - Extract layers/tags with RGB colors
+  - Extract materials with color and transparency
+  - Extract dynamic component properties (key-value pairs)
+  - Export to GLB (binary glTF 2.0) via `trimesh`
+  - Export to Wavefront OBJ (text format)
+  - Export full metadata to JSON
+  - CLI entry point: `openskp model.skp`
+- **TypeScript package** — type definitions and stubs (implementation coming)
+- **Dart package** — placeholder (planned for future release)
+- **Documentation**
+  - Reverse-engineered binary format specification (`docs/BINARY_FORMAT.md`)
+  - Architecture overview (`docs/ARCHITECTURE.md`)
+  - Cross-platform API design (`docs/API_DESIGN.md`)
+- **CI/CD**
+  - GitHub Actions for Python (test matrix: 3.9–3.12 × Linux/Windows/macOS)
+  - GitHub Actions for TypeScript
+  - PyPI release workflow
+
+[0.3.1]: https://github.com/iamahsanmehmood/openskp/compare/typescript-v0.3.0...typescript-v0.3.1
+[0.3.0]: https://github.com/iamahsanmehmood/openskp/compare/python-v0.2.0...python-v0.3.0
+[0.2.0]: https://github.com/iamahsanmehmood/openskp/compare/python-v0.1.0...python-v0.2.0
+[0.1.0]: https://github.com/iamahsanmehmood/openskp/releases/tag/python-v0.1.0

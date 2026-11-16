@@ -1,0 +1,610 @@
+#include <algorithm>
+#include <cmath>
+#include <gtest/gtest.h>
+#include <limits>
+#include <set>
+
+#include <openskp/openskp.hpp>
+
+#include "test_helpers.hpp"
+
+namespace openskp {
+namespace {
+
+TEST(Parser, ComponentGuidMatchesAcrossClassicAndVffContainers) {
+  for (const char* filename : {"nesting_2017.skp", "nesting_2020.skp", "nesting_2021.skp"}) {
+    SCOPED_TRACE(filename);
+    const auto model = SkpFile::open(test::fixture(filename)).parse();
+    std::size_t shelves = 0;
+    for (const auto& pair : model.definitions) {
+      if (pair.second.name == "Shelf") {
+        EXPECT_EQ(pair.second.guid, "1614E9C58C0B40338881DDE62E6E2D80");
+        ++shelves;
+      }
+    }
+    EXPECT_EQ(shelves, 1u);
+    std::size_t references = 0;
+    const auto verify = [&](const Definition& definition) {
+      for (const auto& instance : definition.instances) {
+        if (!instance.ref_idx) continue;
+        EXPECT_EQ(model.definitions.count(*instance.ref_idx), 1u);
+        ++references;
+      }
+    };
+    verify(model.root());
+    for (const auto& pair : model.definitions) verify(pair.second);
+    EXPECT_GT(references, 0u);
+    if (std::string(filename) == "nesting_2021.skp") {
+      ASSERT_EQ(model.root().instances.size(), 1u);
+      // Real 6819 UUIDs may identify the instance, while 6719 identifies its
+      // definition. Normalize the UUID without changing numeric reference resolution.
+      EXPECT_EQ(model.root().instances[0].guid, "0BFF75653E97458E9B7238A6E9CF1A99");
+    }
+  }
+}
+
+void ExpectConnectedNormalizedLoops(const Definition& definition) {
+  for (const auto& [face_id, face] : definition.faces) {
+    (void)face_id;
+    for (const auto& loop : face.loops) {
+      ASSERT_FALSE(loop.empty());
+      for (std::size_t i = 0; i < loop.size(); ++i) {
+        const auto& use = loop[i];
+        const auto& next_use = loop[(i + 1) % loop.size()];
+        EXPECT_TRUE(use.orientation == 1 || use.orientation == -1);
+        const auto& edge = definition.edges.at(use.edge_id);
+        const auto& next_edge = definition.edges.at(next_use.edge_id);
+        const EntityId end = use.orientation == 1 ? edge.v2_id : edge.v1_id;
+        const EntityId next_start = next_use.orientation == 1 ? next_edge.v1_id : next_edge.v2_id;
+        EXPECT_EQ(end, next_start);
+      }
+    }
+  }
+}
+
+// Style watermarks (style.xml item 5001): the "<MODEL SPACE>" separator is
+// skipped, attributes are entity-decoded, and the image bytes come from the
+// ZIP entry the watermark names. The fixture is SU_File.skp with one
+// watermark and a 1x1 PNG added to both of its styles: the style names its
+// image relative to its own folder ("./logo.png"), the current style's "_1"
+// working copy from the ZIP root ("watermarks/Logo.png"), as SketchUp writes.
+TEST(Parser, StyleWatermarks) {
+  auto model = SkpFile::open(test::fixture("style_watermark.skp")).parse();
+  ASSERT_EQ(model.styles.size(), 2u);
+  for (const auto& style : model.styles) {
+    ASSERT_EQ(style.watermarks.size(), 1u);
+    const auto& w = style.watermarks[0];
+    EXPECT_EQ(w.name, "Logo & Co");
+    EXPECT_EQ(w.image_path, style.working_copy ? "watermarks/Logo.png" : "./logo.png");
+    EXPECT_EQ(w.file_name, "logo.png");
+    EXPECT_EQ(w.attributes.count("name"), 0u);
+    EXPECT_EQ(w.attributes.at("position"), "2");
+    EXPECT_EQ(w.attributes.at("alphaScale"), "0.75");
+    EXPECT_EQ(w.attributes.at("scale"), "0.3");
+    EXPECT_EQ(w.attributes.at("background"), "1");
+    ASSERT_TRUE(w.image.has_value());
+    ASSERT_EQ(w.image->size(), 70u);
+    EXPECT_EQ((*w.image)[1], 'P');  // PNG signature
+    EXPECT_EQ((*w.image)[2], 'N');
+    EXPECT_EQ((*w.image)[3], 'G');
+  }
+}
+
+TEST(Parser, ModernUntitled) {
+  auto model = SkpFile::open(test::fixture("Untitled.skp")).parse();
+  EXPECT_EQ(model.version, "{25.0.575}");
+  ASSERT_TRUE(model.units.has_value());
+  EXPECT_EQ(*model.units, "Millimeter");
+  EXPECT_EQ(model.layers.size(), 14);
+  EXPECT_EQ(model.materials.size(), 15);
+  EXPECT_EQ(model.definitions.size(), 46);
+
+  // Exact FILE order, not alphabetical/map-keyed - openskp#285 had flagged
+  // "model.layers is alphabetical (map-keyed) instead of file order" as an
+  // open C++ gap; source-level + real-fixture verification (2026-09-16)
+  // found model.cpp's build already iterates RawParsed::layer_order (a
+  // std::vector populated in encounter order, not a sorted map) - this
+  // was already correct, just untested against real ground truth. Cross-
+  // checked byte-for-byte against Python's own layer order for the
+  // identical fixture.
+  const std::vector<std::string> expected_layer_order{
+      "Layer0",       "BottomPlate",  "TopPlate",           "Stud",
+      "Nog",          "KingStud",     "HeaderJackStud",     "HeaderPlate1",
+      "HeaderPlate2", "SillPlate1",   "VerticalHeaderStud", "generic_frame",
+      "dimension",    "Hat Sections",
+  };
+  std::vector<std::string> actual_layer_order;
+  for (const auto& layer : model.layers) actual_layer_order.push_back(layer.name);
+  EXPECT_EQ(actual_layer_order, expected_layer_order);
+  // None of this fixture's layers are actually hidden in its own Tags
+  // panel (confirmed against Python's own parse of the identical file) -
+  // collect_layers itself already reads the real 8E3C flag (openskp#285),
+  // this fixture's own data just happens to have none set.
+  for (const auto& layer : model.layers) EXPECT_FALSE(layer.hidden);
+
+  const auto& definition = model.definitions.at(66);
+  EXPECT_EQ(definition.name, "Group200#2");
+  EXPECT_EQ(definition.guid.size(), 32);
+  EXPECT_EQ(definition.vertices.size(), 136);
+  EXPECT_EQ(definition.edges.size(), 158);
+  EXPECT_EQ(definition.faces.size(), 26);
+  EXPECT_FALSE(definition.is_image);
+  EXPECT_FALSE(definition.always_faces_camera);
+
+  const auto& edge = definition.edges.begin()->second;
+  EXPECT_FALSE(edge.soft);
+  EXPECT_FALSE(edge.smooth);
+  EXPECT_FALSE(edge.hidden);
+
+  const auto& face = definition.faces.begin()->second;
+  ASSERT_FALSE(face.loops.empty());
+  ASSERT_FALSE(face.loops[0].empty());
+  EXPECT_TRUE(face.normal.has_value());
+  EXPECT_FALSE(face.back_material_id.has_value());
+  EXPECT_FALSE(face.uv_transform.has_value());
+  EXPECT_FALSE(face.uv_transform_back.has_value());
+  // Real data: every face in this fixture is visible - D307's flag byte
+  // reads the plain baseline (0x06) throughout.
+  for (const auto& [face_id, f] : definition.faces) {
+    EXPECT_FALSE(f.hidden);
+  }
+  ExpectConnectedNormalizedLoops(definition);
+
+  auto* joined_material = model.material_by_id(26180);
+  ASSERT_NE(joined_material, nullptr);
+  EXPECT_EQ(joined_material->name, "*");
+  EXPECT_EQ(joined_material->id, 26180);
+  const auto material_in_list =
+      std::find_if(model.materials.begin(), model.materials.end(),
+                   [](const Material& value) { return value.name == "*"; });
+  ASSERT_NE(material_in_list, model.materials.end());
+  EXPECT_EQ(joined_material, &*material_in_list);
+
+  const auto layer_material =
+      std::find_if(model.materials.begin(), model.materials.end(),
+                   [](const Material& value) { return value.name == "Layer_Layer0"; });
+  ASSERT_NE(layer_material, model.materials.end());
+  EXPECT_DOUBLE_EQ(layer_material->transparency, 1.0);
+  EXPECT_FALSE(layer_material->id.has_value());
+  EXPECT_FALSE(layer_material->texture.has_value());
+  EXPECT_FALSE(layer_material->colorized);
+  EXPECT_EQ(layer_material->colorize_type, 0);
+
+  ASSERT_EQ(model.styles.size(), 2);
+  EXPECT_EQ(model.styles[0].name, "[Construction Documentation Style]");
+  EXPECT_EQ(model.styles[0].front_color, (Color3{255, 255, 255}));
+  EXPECT_EQ(model.styles[0].back_color, (Color3{164, 178, 187}));
+  EXPECT_EQ(model.styles[0].description, "[Default face colors. Profile Edges. White background.]");
+  // Every style.xml item is kept raw, keyed by SketchUp's item id.
+  EXPECT_EQ(model.styles[0].items.size(), 58u);
+  ASSERT_TRUE(model.styles[0].items.count(1007));
+  EXPECT_EQ(model.styles[0].items.at(1007).type, 4);
+  EXPECT_EQ(model.styles[0].items.at(1007).value, "2");
+  ASSERT_TRUE(model.styles[0].items.count(2008));
+  EXPECT_EQ(model.styles[0].items.at(2008).type, 7);
+  EXPECT_EQ(model.styles[0].items.at(2008).value, "0.65000000000000002");
+  // Item 5001 lists no watermarks here (only the "<MODEL SPACE>" separator).
+  EXPECT_TRUE(model.styles[0].watermarks.empty());
+  // The current style is stored twice; model.dat's style catalog (0602 >
+  // 7869) names it and its "_1" working copy.
+  EXPECT_EQ(model.styles[0].folder, "[Construction Documentation Style]");
+  EXPECT_TRUE(model.styles[0].active);
+  EXPECT_FALSE(model.styles[0].working_copy);
+  EXPECT_EQ(model.styles[1].folder, "[Construction Documentation Style]_1");
+  EXPECT_FALSE(model.styles[1].active);
+  EXPECT_TRUE(model.styles[1].working_copy);
+
+  // The view the model was saved with (FA01 > 34BC), independent of scenes.
+  ASSERT_TRUE(model.camera.has_value());
+  EXPECT_NEAR(model.camera->eye[0], 452.09, 0.01);
+  EXPECT_NEAR(model.camera->eye[1], -974.12, 0.01);
+  EXPECT_NEAR(model.camera->eye[2], 367.93, 0.01);
+  EXPECT_NEAR(model.camera->target[0], 226.24, 0.01);
+  EXPECT_FALSE(model.camera->parallel);
+  EXPECT_DOUBLE_EQ(model.camera->fov, 35.0);
+
+  // Instance layer/properties (item 17): populated from each instance's
+  // own D207 (layer override)/DC05 (dynamic properties) TLV children -
+  // C++ was already correct here (the reference the other 4 languages
+  // were ported to match). Cross-checked directly against Python's/
+  // Dart's/.NET's independent parses of this same fixture.
+  const auto batten =
+      std::find_if(model.root().instances.begin(), model.root().instances.end(),
+                   [](const Instance& i) { return i.name == "BattenHatSection_1"; });
+  ASSERT_NE(batten, model.root().instances.end());
+  EXPECT_EQ(batten->layer, "Hat Sections");
+
+  const auto w1 = std::find_if(model.root().instances.begin(), model.root().instances.end(),
+                               [](const Instance& i) { return i.name == "W1"; });
+  ASSERT_NE(w1, model.root().instances.end());
+  // "generator"/"profile" live under this SteelFramer-authored file's own
+  // "steelframer-dict" dictionary, not SketchUp's "dynamic_attributes" -
+  // properties (the backward-compatible dynamic_attributes-only view) is
+  // correctly empty for this instance; attribute_dictionaries exposes
+  // every dictionary by its own name (openskp#254).
+  EXPECT_TRUE(w1->properties.empty());
+  const auto& steelframer = w1->attribute_dictionaries.at("steelframer-dict");
+  EXPECT_EQ(steelframer.at("generator"), "SteelFramer::Engine::PanelGenerator");
+  EXPECT_EQ(steelframer.at("profile"), "362S200-43");
+}
+
+TEST(Parser, ModernRootOnly) {
+  auto file = SkpFile::open(test::fixture("SU_File.skp"));
+  auto model = file.parse();
+  EXPECT_EQ(model.version, "{25.0.575}");
+  EXPECT_TRUE(model.definitions.empty());
+  EXPECT_EQ(model.root().name, "ROOT_MODEL");
+  ASSERT_EQ(model.layers.size(), 1);
+  EXPECT_EQ(model.layers[0].name, "Layer0");
+  ASSERT_EQ(model.materials.size(), 1);
+  EXPECT_EQ(model.materials[0].name, "Layer_Layer0");
+
+  auto scene = file.build_scene();
+  EXPECT_EQ(scene.scene_hierarchy.name, "ROOT");
+  EXPECT_EQ(scene.scene_hierarchy.definition_name, "ROOT_MODEL");
+  ASSERT_EQ(scene.mesh_index.size(), 1);
+  EXPECT_EQ(scene.mesh_index.begin()->second.definition_name, "ROOT_MODEL");
+}
+
+TEST(Parser, ModernModelAttributeDictionaries) {
+  const auto model = SkpFile::open(test::fixture("SU_File.skp")).parse();
+  // Dictionaries on the model itself, not on anything placed in it - these
+  // are where SketchUp and extensions keep model-wide settings.
+  const auto& geo = model.attribute_dictionaries.at("GeoReference");
+  EXPECT_EQ(geo.at("LocationSource"), "Manual");
+  EXPECT_EQ(geo.at("Latitude").kind, ParsedAttribute::Kind::Float);
+  EXPECT_NEAR(geo.at("Latitude").number, 40.0183, 1e-4);
+  EXPECT_EQ(geo.at("UsesGeoReferencing").kind, ParsedAttribute::Kind::Boolean);
+  EXPECT_EQ(geo.at("UsesGeoReferencing").integer, 0);
+  EXPECT_EQ(model.attribute_dictionaries.at("GSU_ContributorsInfo").at("VersionKey").integer, 1000);
+  EXPECT_EQ(model.attribute_dictionaries.at("IfcGUIDs").at("ModelGUID"), "0Fvty1LOz2pP0l6Q3tLacy");
+}
+
+TEST(Parser, LegacyModelAttributeDictionariesAreEmpty) {
+  const auto model = SkpFile::open(test::fixture("capilla_quiroz_v17.skp")).parse();
+  EXPECT_TRUE(model.attribute_dictionaries.empty());
+}
+
+TEST(Parser, ModernInstancesCarryUniqueEntityIds) {
+  const auto model = SkpFile::open(test::fixture("Untitled.skp")).parse();
+  const auto& root_instances = model.root().instances;
+  const auto w1 = std::find_if(root_instances.begin(), root_instances.end(),
+                               [](const Instance& i) { return i.name == "W1"; });
+  ASSERT_NE(w1, root_instances.end());
+  EXPECT_EQ(w1->id, EntityId{26135});
+
+  std::set<EntityId> ids;
+  auto collect = [&](const Definition& definition) {
+    for (const auto& instance : definition.instances) {
+      ASSERT_TRUE(instance.id.has_value()) << instance.name;
+      EXPECT_TRUE(ids.insert(*instance.id).second) << "duplicate id " << *instance.id;
+    }
+  };
+  collect(model.root());
+  for (const auto& [definition_id, definition] : model.definitions) {
+    (void)definition_id;
+    collect(definition);
+  }
+  EXPECT_EQ(ids.size(), 46u);
+}
+
+TEST(Parser, LegacyInstancesExposeNativePersistentIds) {
+  const auto model = SkpFile::open(test::fixture("gondola_v20.skp")).parse();
+  for (const auto& [definition_id, definition] : model.definitions) {
+    (void)definition_id;
+    for (const auto& instance : definition.instances) {
+      ASSERT_TRUE(instance.id.has_value());
+      EXPECT_GT(*instance.id, 0);
+    }
+  }
+  for (const auto& instance : model.root().instances) {
+    ASSERT_TRUE(instance.id.has_value());
+    EXPECT_GT(*instance.id, 0);
+  }
+}
+
+TEST(Parser, CoedgeOrientationsAreNormalizedAndConnected) {
+  const auto model = SkpFile::open(test::fixture("coedge_orientation_regression.skp")).parse();
+  ExpectConnectedNormalizedLoops(model.root());
+  for (const auto& [definition_id, definition] : model.definitions) {
+    (void)definition_id;
+    ExpectConnectedNormalizedLoops(definition);
+  }
+}
+
+TEST(Parser, LegacyMatchesReference) {
+  auto file = SkpFile::open(test::fixture("capilla_quiroz_v17.skp"));
+  auto model = file.parse();
+  EXPECT_EQ(model.version, "{17.0.18899}");
+  // Legacy (pre-2021 MFC) files carry no meta/meta.dat container, so there
+  // is no known source for the model's unit-system string.
+  EXPECT_FALSE(model.units.has_value());
+  // Legacy instances now carry their already-parsed CAttributeContainer
+  // through to the public model (previously read off the wire, correctly
+  // advancing the cursor, then discarded). This fixture (a plain chapel
+  // model) has no Dynamic Component data on any instance - confirmed by
+  // direct inspection before writing the fix - so this proves the
+  // plumbing doesn't crash or silently drop instances, not the
+  // dynamic_attributes dictionary lookup itself (which has no legacy
+  // fixture available to exercise end-to-end).
+  for (const auto& kv : model.definitions) {
+    for (const auto& inst : kv.second.instances) EXPECT_TRUE(inst.properties.empty());
+  }
+  for (const auto& inst : model.root().instances) EXPECT_TRUE(inst.properties.empty());
+  ASSERT_EQ(model.definitions.size(), 2);
+
+  const auto& puerta = model.definitions.at(40);
+  EXPECT_EQ(puerta.name, "puerta");
+  EXPECT_EQ(puerta.faces.size(), 24);
+  EXPECT_EQ(puerta.edges.size(), 95);
+  EXPECT_EQ(puerta.vertices.size(), 64);
+  EXPECT_NEAR(puerta.vertices.at(45).x, 60.671292283583, 1e-9);
+  EXPECT_NEAR(puerta.vertices.at(45).y, 8.526512829121202e-14, 1e-18);
+  EXPECT_NEAR(puerta.vertices.at(45).z, 109.03580700984524, 1e-9);
+  ExpectConnectedNormalizedLoops(puerta);
+
+  const auto& grada = model.definitions.at(395);
+  EXPECT_EQ(grada.name, "grada");
+  EXPECT_EQ(grada.faces.size(), 11);
+  EXPECT_EQ(grada.edges.size(), 30);
+  EXPECT_EQ(grada.vertices.size(), 20);
+
+  // Construction (guide) points - real data on this fixture, all on the
+  // root definition. No construction lines on this particular file.
+  // Cross-checked byte-for-byte against Python's own parse of the same
+  // fixture.
+  EXPECT_TRUE(model.root().construction_lines.empty());
+  ASSERT_EQ(model.root().construction_points.size(), 7);
+  EXPECT_NEAR(model.root().construction_points[0].position[0], -44.69836289477159, 1e-9);
+  EXPECT_NEAR(model.root().construction_points[0].position[1], 125.87449928268785, 1e-9);
+  EXPECT_NEAR(model.root().construction_points[0].position[2], 90.15748031496064, 1e-9);
+  EXPECT_NEAR(model.root().construction_points[6].position[0], 183.8551286073387, 1e-9);
+  EXPECT_NEAR(model.root().construction_points[6].position[1], 125.95096929693227, 1e-9);
+  EXPECT_NEAR(model.root().construction_points[6].position[2], 90.15748031496064, 1e-9);
+
+  const std::set<std::string> expected_materials{
+      "*1",
+      "[0037_SandyBrown]",
+      "[0048_PaleGoldenrod]",
+      "[0050_LemonChiffon]",
+      "[0062_YellowGreen]",
+      "[0064_Chartreuse]",
+      "[0069_LimeGreen]",
+      "[0070_SpringGreen]",
+      "[0097_DeepSkyBlue]",
+      "[0102_RoyalBlue]",
+      "[Color G03]",
+      "[Polished Concrete New]",
+      "[Polished Concrete Old]",
+      "[Roofing Tile Spanish]",
+      "[Translucent Glass Blue]",
+      "[Translucent Glass Safety]",
+  };
+  ASSERT_EQ(model.materials.size(), expected_materials.size());
+  for (const auto& material : model.materials) {
+    EXPECT_TRUE(expected_materials.count(material.name));
+  }
+
+  ASSERT_EQ(model.layers.size(), 1);
+  EXPECT_EQ(model.layers[0].name, "Layer0");
+  EXPECT_FALSE(model.layers[0].hidden);
+
+  Vec3 minimum{std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+               std::numeric_limits<double>::infinity()};
+  Vec3 maximum{-std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
+               -std::numeric_limits<double>::infinity()};
+  for (const auto& [id, definition] : model.definitions) {
+    for (const auto& [vertex_id, vertex] : definition.vertices) {
+      minimum[0] = std::min(minimum[0], vertex.x);
+      minimum[1] = std::min(minimum[1], vertex.y);
+      minimum[2] = std::min(minimum[2], vertex.z);
+      maximum[0] = std::max(maximum[0], vertex.x);
+      maximum[1] = std::max(maximum[1], vertex.y);
+      maximum[2] = std::max(maximum[2], vertex.z);
+    }
+  }
+  EXPECT_NEAR(minimum[0], 0, 0.01);
+  EXPECT_NEAR(minimum[1], 0, 0.01);
+  EXPECT_NEAR(minimum[2], 0, 0.01);
+  EXPECT_NEAR(maximum[0], 77.402, 0.01);
+  EXPECT_NEAR(maximum[1], 51.969, 0.01);
+  EXPECT_NEAR(maximum[2], 133.071, 0.01);
+  EXPECT_EQ(model.root().instances.size(), 3);
+  for (const auto& inst : model.root().instances) {
+    EXPECT_FALSE(inst.hidden);
+  }
+  for (const auto& [face_id, f] : puerta.faces) {
+    EXPECT_FALSE(f.hidden);
+  }
+  for (const auto& [face_id, f] : grada.faces) {
+    EXPECT_FALSE(f.hidden);
+  }
+
+  // Regression: CFace's attribute container (which carries any positioned/
+  // photo-fitted CFaceTextureCoords record) was read and then silently
+  // discarded, so uv_transform never got populated for legacy files at
+  // all - every legacy face fell back to the default face-plane
+  // projection even when the SketchUp author had explicitly positioned a
+  // texture. 32 matches Python's independently-verified count of faces
+  // with a real uv_transform on this exact fixture (0 have uv_projected -
+  // this file has no PROJECTED/terrain-drape textures).
+  int with_uv_transform = 0, with_uv_projected = 0;
+  auto count_uv = [&](const Definition& d) {
+    for (const auto& [face_id, face] : d.faces) {
+      if (face.uv_transform.has_value()) ++with_uv_transform;
+      if (face.uv_projected) ++with_uv_projected;
+    }
+  };
+  count_uv(model.root());
+  for (const auto& [id, definition] : model.definitions) count_uv(definition);
+  EXPECT_EQ(with_uv_transform, 32);
+  EXPECT_EQ(with_uv_projected, 0);
+
+  auto scene = file.build_scene();
+  EXPECT_EQ(scene.glb_primitives.size(), 21);
+  EXPECT_EQ(scene.mesh_index.size(), 21);
+  EXPECT_EQ(scene.gltf_materials.size(), 13);
+  EXPECT_EQ(scene.scene_hierarchy.children.size(), 3);
+
+  std::multiset<std::string> placed_definitions;
+  for (const auto& child : scene.scene_hierarchy.children) {
+    placed_definitions.insert(child.definition_name);
+  }
+  EXPECT_EQ(placed_definitions, (std::multiset<std::string>{"grada", "grada", "puerta"}));
+
+  for (const auto& primitive : scene.glb_primitives) {
+    EXPECT_EQ(primitive.positions.size(), primitive.normals.size());
+    EXPECT_EQ(primitive.uvs.size(), primitive.positions.size() / 3 * 2);
+    for (auto value : primitive.uvs) EXPECT_TRUE(std::isfinite(value));
+    EXPECT_EQ(primitive.indices.size() % 3, 0);
+    for (auto index : primitive.indices) EXPECT_LT(index, primitive.positions.size() / 3);
+  }
+}
+
+TEST(Parser, ModernSceneMatchesReference) {
+  auto scene = SkpFile::open(test::fixture("Untitled.skp")).build_scene();
+  EXPECT_EQ(scene.scene_hierarchy.name, "ROOT");
+  EXPECT_EQ(scene.scene_hierarchy.definition_name, "ROOT_MODEL");
+  EXPECT_FALSE(scene.scene_hierarchy.children.empty());
+  EXPECT_EQ(scene.mesh_index.size(), 43);
+  EXPECT_EQ(scene.glb_primitives.size(), 43);
+  for (const auto& [name, metadata] : scene.mesh_index) {
+    EXPECT_FALSE(name.empty());
+    EXPECT_FALSE(metadata.layer.empty());
+  }
+}
+
+TEST(Parser, InvalidInputs) {
+  try {
+    SkpFile::from_buffer(ByteBuffer(200, 'A')).parse();
+    FAIL() << "expected a structured parse error";
+  } catch (const SkpParseError& error) {
+    ASSERT_TRUE(error.stage().has_value());
+    EXPECT_EQ(*error.stage(), ParseStage::header);
+  }
+
+  ByteBuffer missing_zip(32);
+  missing_zip[0] = 0xff;
+  missing_zip[1] = 0xfe;
+  missing_zip[2] = 0xff;
+  missing_zip[3] = 0x0e;
+  try {
+    parse_skp(missing_zip);
+    FAIL() << "expected a missing ZIP error";
+  } catch (const SkpParseError& error) {
+    ASSERT_TRUE(error.stage().has_value());
+    EXPECT_EQ(*error.stage(), ParseStage::zip_extract);
+  }
+
+  ByteBuffer truncated_zip = missing_zip;
+  truncated_zip[16] = 'P';
+  truncated_zip[17] = 'K';
+  truncated_zip[18] = 3;
+  truncated_zip[19] = 4;
+  EXPECT_THROW(parse_skp(truncated_zip), SkpParseError);
+  EXPECT_THROW(SkpFile::open("not-skp.txt"), std::filesystem::filesystem_error);
+}
+
+TEST(Parser, MaterialsByIdMap) {
+  auto model = SkpFile::open(test::fixture("Untitled.skp")).parse();
+  auto by_id = model.materials_by_id();
+  EXPECT_FALSE(by_id.empty());
+  for (const auto& [id, mat] : by_id) {
+    ASSERT_NE(mat, nullptr);
+    EXPECT_TRUE(mat->id.has_value());
+    EXPECT_EQ(*mat->id, id);
+    EXPECT_EQ(model.material_by_id(id), mat);
+  }
+
+  const auto& const_model = model;
+  auto const_by_id = const_model.materials_by_id();
+  EXPECT_EQ(const_by_id.size(), by_id.size());
+  for (const auto& [id, mat] : const_by_id) {
+    ASSERT_NE(mat, nullptr);
+    EXPECT_TRUE(mat->id.has_value());
+    EXPECT_EQ(*mat->id, id);
+    EXPECT_EQ(const_model.material_by_id(id), mat);
+  }
+}
+
+TEST(Parser, MeshIndexPropertiesArePopulated) {
+  // openskp#285 had flagged "mesh_index[...].properties is never
+  // populated" as an open C++ gap; source-level + real-fixture
+  // verification (2026-09-16) found scene.cpp's build_scene already
+  // backfills MeshMetadata::properties/attribute_dictionaries from the
+  // same path_updates mechanism the instance tree itself uses (see the
+  // "Apply the deferred backfill" comment in scene.cpp) - this was
+  // already correct, just untested against real ground truth.
+  auto scene = SkpFile::open(test::fixture("Untitled.skp")).build_scene();
+  ASSERT_FALSE(scene.mesh_index.empty());
+  std::size_t with_props = 0;
+  for (const auto& [name, meta] : scene.mesh_index) {
+    if (!meta.properties.empty() || !meta.attribute_dictionaries.empty()) ++with_props;
+  }
+  // Not every mesh's owning instance carries Dynamic Component data on
+  // this real file, but the overwhelming majority do - a regression that
+  // silently dropped the backfill (leaving every MeshMetadata blank)
+  // would fail this outright.
+  EXPECT_GT(with_props, scene.mesh_index.size() / 2);
+}
+
+TEST(Parser, StreamingDefinitionsPreservesGeometryAndHierarchy) {
+  auto skp = SkpFile::open(test::fixture("Untitled.skp"));
+  auto model = skp.parse();
+  EXPECT_EQ(model.definitions.size(), 46);
+  EXPECT_EQ(model.layers.size(), 14);
+  EXPECT_EQ(model.materials.size(), 15);
+  EXPECT_EQ(model.dimensions.size(), 13);
+
+  auto scene = skp.build_instanced_scene();
+  EXPECT_FALSE(scene.mesh_resources.empty());
+  EXPECT_EQ(scene.scene_hierarchy.name, "ROOT");
+  EXPECT_FALSE(scene.scene_hierarchy.children.empty());
+  EXPECT_EQ(scene.gltf_materials.size(), 8);
+
+  std::size_t total_faces = 0;
+  for (const auto& res : scene.mesh_resources) {
+    for (const auto& prim : res.primitives) {
+      total_faces += prim.indices.size() / 3;
+    }
+  }
+  // 16883, not the long-pinned 16949: this fixture is the same real file
+  // openskp#285's overlapping-hole-triangulation fix targets (two
+  // ~0.69"-radius circular holes 0.33in apart on several definitions).
+  // 16949 was earcut_2d's pre-fix, undefined-behavior-for-self-
+  // intersecting-input count; the fix (see triangulator_test.cpp's
+  // OverlappingHolesMatchIndependentAnalyticalCircleUnionArea) changed it
+  // to the new, actually-well-defined value - a real, intentional
+  // behavior change, not a regression.
+  EXPECT_EQ(total_faces, 16883u);
+}
+
+// legacy_annotations.skp was generated with Python's own create() API
+// (add_face + add_section_plane + add_text + add_dimension) and its
+// values cross-checked against Python's own reader as ground truth -
+// shared with the equivalent .NET/TypeScript fixes' own fixture
+// (openskp#285). Confirms C++'s CSectionPlane reader already carries
+// plane/name/label/hidden correctly (unlike TypeScript's own
+// readSectionPlane, which discarded all four entirely until fixed) -
+// had no dedicated coverage anywhere before this, added alongside that
+// investigation.
+TEST(Parser, LegacySectionPlaneTextDimension) {
+  auto model = SkpFile::open(test::fixture("legacy_annotations.skp")).parse();
+
+  ASSERT_EQ(model.root().section_planes.size(), 1u);
+  const auto& sp = model.root().section_planes[0];
+  EXPECT_NEAR(sp.plane[0], 0.0, 1e-6);
+  EXPECT_NEAR(sp.plane[1], 0.0, 1e-6);
+  EXPECT_NEAR(sp.plane[2], 1.0, 1e-6);
+  EXPECT_NEAR(sp.plane[3], -30.0, 1e-6);
+  EXPECT_FALSE(sp.hidden);
+
+  ASSERT_EQ(model.root().texts.size(), 1u);
+  EXPECT_EQ(model.root().texts[0].text, "Hello");
+  EXPECT_FALSE(model.root().texts[0].hidden);
+
+  EXPECT_EQ(model.root().dimensions.size(), 1u);
+}
+
+}  // namespace
+}  // namespace openskp

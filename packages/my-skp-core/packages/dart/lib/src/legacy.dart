@@ -1,0 +1,2556 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'core.dart';
+import 'errors.dart';
+import 'geometry.dart';
+import 'legacy_pages.dart';
+import 'model.dart';
+import 'observability.dart';
+import 'tlv.dart';
+
+/// Legacy (classic MFC) SketchUp .skp parser - SketchUp 2013-2020 era.
+///
+/// Pre-2021 .skp files are not VFF/ZIP containers: after the same UTF-16
+/// header records, the body is one uncompressed MFC CArchive object stream
+/// with a single global 1-based store map. This module walks that stream
+/// and adapts the result to the same RawParsed shape the VFF path produces
+/// (core.dart), so Parser handles both eras transparently.
+///
+/// Ported line-for-line from openskp/legacy.py (via the already-verified
+/// TypeScript and C# ports). See that module's docstring for the full list
+/// of format details that differ from the public 2017 format notes.
+class LegacyParseError implements Exception {
+  final String message;
+  LegacyParseError(this.message);
+  @override
+  String toString() => 'LegacyParseError: $message';
+}
+
+const List<int> _strMarker = [0xFF, 0xFE, 0xFF];
+
+bool _bytesEqualAt(Uint8List a, int aOff, List<int> b) {
+  if (aOff + b.length > a.length) return false;
+  for (int i = 0; i < b.length; i++) {
+    if (a[aOff + i] != b[i]) return false;
+  }
+  return true;
+}
+
+int _findBytes(Uint8List data, List<int> needle, [int start = 0, int? end]) {
+  final e = end ?? data.length;
+  final limit = e - needle.length;
+  for (int i = start < 0 ? 0 : start; i <= limit; i++) {
+    bool ok = true;
+    for (int j = 0; j < needle.length; j++) {
+      if (data[i + j] != needle[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return i;
+  }
+  return -1;
+}
+
+/// Search for a byte pattern where null entries are wildcards.
+int _findPattern(Uint8List data, List<int?> pattern,
+    [int start = 0, int? end]) {
+  final e = end ?? data.length;
+  final limit = e - pattern.length;
+  for (int i = start < 0 ? 0 : start; i <= limit; i++) {
+    bool ok = true;
+    for (int j = 0; j < pattern.length; j++) {
+      final want = pattern[j];
+      if (want != null && data[i + j] != want) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return i;
+  }
+  return -1;
+}
+
+bool _matchesAscii(Uint8List data, int offset, String str) {
+  if (offset + str.length > data.length) return false;
+  for (int i = 0; i < str.length; i++) {
+    if (data[offset + i] != str.codeUnitAt(i)) return false;
+  }
+  return true;
+}
+
+/// SketchUp 2020 (v20) writes an extra, undocumented record ahead of some
+/// counts that v17 does not have, which leaves the reader a few bytes early
+/// and makes it read garbage as the count. The filler is an empty UTF-16
+/// string record followed by zero padding:
+///
+///   <ff fe ff> <u8 0>        empty string
+///   <zero padding>           runs up to the real count
+///
+/// Rather than hard-code an offset (the number of bytes before the marker
+/// differs per call site), locate the marker in the short window ahead,
+/// then take the first non-zero u32 that follows the padding. Only the
+/// EMPTY-string form counts as filler: a real string here would mean
+/// genuine data, and moving the cursor past it would corrupt the parse.
+///
+/// This only ever runs after a count came back implausible (or zero), so
+/// files that were already parsing (v17, and the VFF path) never reach it.
+///
+/// [countPos] is the offset the count was read FROM (i.e. r.pos - 4).
+/// Returns the corrected count, or null when this is not the v20 layout.
+/// Widest zero padding seen between the v20 filler's empty string and the
+/// count that follows it (9 and 13 bytes occur in real files; the ceiling
+/// leaves room without letting the probe wander into unrelated records).
+const int _maxV20FillerPad = 29;
+
+/// Locates the count that follows a v20 filler record, given the offset the
+/// bad count was read from. Pure byte logic, exported for tests; see
+/// [retryCountAfterV20Filler] for how it is used.
+///
+/// Returns the count and the offset just past it, or null when the bytes do
+/// not match the filler layout.
+({int count, int next})? findCountAfterV20Filler(
+  Uint8List data,
+  int countPos,
+  int limit, [
+  Archive? ar,
+]) {
+  int markerAt = -1;
+  for (int i = countPos; i < countPos + 12 && i + 4 <= data.length; i++) {
+    if (data[i] == 0xFF && data[i + 1] == 0xFE && data[i + 2] == 0xFF) {
+      markerAt = i;
+      break;
+    }
+  }
+  if (markerAt < 0) return null;
+  if (data[markerAt + 3] != 0) return null; // non-empty string: real data
+
+  // The count sits past a run of zero padding whose length varies per call
+  // site (9 and 13 bytes both occur in real files), but always lands at
+  // markerAt + 4 + pad with pad % 4 == 1. Step through those candidate
+  // offsets and take the first plausible u32.
+  //
+  // Deliberately NOT "scan forward to the first non-zero byte": a count
+  // that is an exact multiple of 256 has a 0x00 low byte, which such a scan
+  // cannot tell apart from padding, so it would skip into the count and
+  // misalign every later read. Probing whole u32s at 4-byte strides never
+  // inspects an individual byte, so those counts round-trip correctly.
+  for (int pad = 1; pad <= _maxV20FillerPad; pad += 4) {
+    final at = markerAt + 4 + pad;
+    if (at + 4 > data.length) break;
+    final count = Tlv.readU32(data, at);
+    if (count > 0 &&
+        count <= limit &&
+        (ar == null || _plausibleListTag(ar, data, at + 4))) {
+      return (count: count, next: at + 4);
+    }
+  }
+  return null;
+}
+
+int? retryCountAfterV20Filler(LR r, int countPos, int limit, [Archive? ar]) {
+  final hit = findCountAfterV20Filler(r.data, countPos, limit, ar);
+  if (hit == null) return null;
+  r.pos = hit.next;
+  return hit.count;
+}
+
+/// The SketchUp 2020 layout of a model with NO component definitions AND no
+/// root entities. [findCountAfterV20Filler] cannot see it: behind the filler
+/// (an empty string record, then 13 bytes of padding) the only count is the
+/// ROOT entity count, and it is 0, which that search skips as "no count".
+///
+/// Returns the offset of that root count (so the caller can put the cursor
+/// there and read the zero), or null when the bytes are not that layout: the
+/// empty string record has to sit within 12 bytes of [countPos], and the 13
+/// padding bytes and the count behind it have to be all zero.
+int? findEmptyRootAfterV20Filler(Uint8List data, int countPos) {
+  var markerAt = -1;
+  for (var i = countPos; i < countPos + 12 && i + 4 <= data.length; i++) {
+    if (data[i] == 0xFF && data[i + 1] == 0xFE && data[i + 2] == 0xFF) {
+      markerAt = i;
+      break;
+    }
+  }
+  // none, or a non-empty string: real data
+  if (markerAt < 0 || data[markerAt + 3] != 0) return null;
+  final rootCountAt = markerAt + 4 + 13;
+  if (rootCountAt + 4 > data.length) return null;
+  for (var i = markerAt + 3; i < rootCountAt + 4; i++) {
+    if (data[i] != 0) return null;
+  }
+  return rootCountAt;
+}
+
+/// True when the u16 at [at] can legally start an object read: a null, an
+/// escape, a class definition, a class-ref to a KNOWN class, or an object
+/// back-ref within the allocated range.
+bool _plausibleListTag(Archive ar, Uint8List data, int at) {
+  if (at + 2 > data.length) return false;
+  final t = Tlv.readU16(data, at);
+  if (t == 0x0000 || t == 0x7FFF || t == 0xFFFF) return true;
+  if ((t & 0x8000) != 0) {
+    final ent = ar.slots[t & 0x7FFF];
+    return ent != null && ent.kind == 'class';
+  }
+  return t < ar.nextSlot;
+}
+
+/// True when the bytes at [p] are an MFC class-ref to class [slot]. Mirrors
+/// both encodings Archive.readObject decodes: the short 16-bit form
+/// (0x8000|slot) and, for slots past 0x7FFF, the big-tag escape (0x7FFF
+/// followed by a u32 of 0x80000000|slot).
+bool isClassRef(Uint8List data, int p, int slot) {
+  if (slot <= 0x7FFF) {
+    return p + 2 <= data.length && Tlv.readU16(data, p) == (0x8000 | slot);
+  }
+  return p + 6 <= data.length &&
+      Tlv.readU16(data, p) == 0x7FFF &&
+      Tlv.readU32(data, p + 2) == (0x80000000 | slot);
+}
+
+/// True when the bytes at [at] begin a CComponentDefinition record: its
+/// first-use class declaration, or a class-ref to its known slot.
+bool definitionStartsAt(Archive ar, Uint8List data, int at) {
+  if (at + 26 <= data.length &&
+      data[at] == 0xFF &&
+      data[at + 1] == 0xFF &&
+      _matchesAscii(data, at + 6, 'CComponentDefinition')) {
+    return true;
+  }
+  final defCls = ar.classSlot['CComponentDefinition'];
+  return defCls != null && isClassRef(data, at, defCls);
+}
+
+/// Byte cursor, matching Python's _R.
+class LR {
+  final Uint8List data;
+  int pos;
+
+  LR(this.data, [this.pos = 0]);
+
+  int u8() {
+    final v = data[pos];
+    pos += 1;
+    return v;
+  }
+
+  int u16() {
+    final v = Tlv.readU16(data, pos);
+    pos += 2;
+    return v;
+  }
+
+  int u32() {
+    final v = Tlv.readU32(data, pos);
+    pos += 4;
+    return v;
+  }
+
+  int i32() {
+    final v = Tlv.readI32(data, pos);
+    pos += 4;
+    return v;
+  }
+
+  double f64() {
+    final v = Tlv.readF64(data, pos);
+    pos += 8;
+    return v;
+  }
+
+  List<double> f64s(int n) {
+    return [for (int i = 0; i < n; i++) f64()];
+  }
+
+  Uint8List raw(int n) {
+    final v = Uint8List.sublistView(data, pos, pos + n);
+    pos += n;
+    return v;
+  }
+
+  Uint8List peek(int n) {
+    final len = (pos + n <= data.length) ? n : (data.length - pos);
+    return Uint8List.sublistView(data, pos, pos + (len < 0 ? 0 : len));
+  }
+
+  int peekU16() => Tlv.readU16(data, pos);
+
+  String utf16() {
+    if (!_bytesEqualAt(data, pos, _strMarker)) {
+      throw LegacyParseError('expected a string record ${ctx()}');
+    }
+    pos += 3;
+    int n = u8();
+    if (n == 0xFF) {
+      n = u16();
+      if (n == 0xFFFF) {
+        n = u32();
+      }
+    }
+    final bytes = raw(2 * n);
+    final codeUnits = <int>[];
+    for (int i = 0; i + 1 < bytes.length; i += 2) {
+      codeUnits.add(bytes[i] | (bytes[i + 1] << 8));
+    }
+    return String.fromCharCodes(codeUnits);
+  }
+
+  String ctx([int back = 16, int fwd = 32]) {
+    final p = pos;
+    final bstart = p - back < 0 ? 0 : p - back;
+    final before = Uint8List.sublistView(data, bstart, p);
+    final flen = (p + fwd <= data.length) ? fwd : (data.length - p);
+    final after = Uint8List.sublistView(data, p, p + (flen < 0 ? 0 : flen));
+    return '@0x${p.toRadixString(16)}: ...${Tlv.toHexUpper(before)} | ${Tlv.toHexUpper(after)}...';
+  }
+}
+
+class SlotEntry {
+  final String kind; // 'class' or 'obj'
+  final String? name;
+  final Object? value; // int? schema for 'class'; reader result for 'obj'
+  SlotEntry({required this.kind, this.name, this.value});
+}
+
+typedef LegacyReader = Object? Function(Archive ar, LR r);
+
+/// MFC CArchive store-map bookkeeping and object-graph walk, matching
+/// Python's _Archive.
+class Archive {
+  final Uint8List data;
+  final int ver;
+  final bool hasPid;
+  late final LR r;
+  final Map<int, SlotEntry> slots = {};
+  final Map<String, int> classSlot = {};
+  final Map<String, int> classSchema = {};
+  String? currentClass;
+  int? currentObjSlot;
+  int nextSlot = 0;
+  int walkBase = 0;
+  final Map<String, LegacyReader> readers = {};
+  int? currentLoop;
+  bool inEntityList = false;
+
+  // Burned store-map indices (see readEdgeUse): the writer maps an
+  // annotation's connection points into the store map WITHOUT writing
+  // bytes, so file back-references beyond each burn run ahead of the
+  // walker's numbering. Registrations always stay at WALKER indices - no
+  // captured slot ever goes stale - and _backref translates file
+  // references through the burn bands instead. [burns] holds
+  // (fileBandStart, width) per event; [cumDelta] their total;
+  // [annotWatermark] the walker slot right after the last annotation
+  // record - the only place a band can start.
+  final List<(int, int)> burns = [];
+  int cumDelta = 0;
+  int? annotWatermark;
+  final List<int> burnStack = []; // per-entity-list burned-item credits
+  // per-entity-list instances an annotation's path wrote in full (see
+  // _pathRef) that the list has not listed yet, in order
+  final List<Set<int>> inlineStack = [];
+  int? clineTail;
+
+  Archive(this.data, this.ver) : hasPid = ver >= 17 {
+    r = LR(data);
+  }
+
+  int alloc(SlotEntry entry) {
+    final s = nextSlot;
+    slots[s] = entry;
+    nextSlot += 1;
+    return s;
+  }
+
+  (int?, String?, Object?) readObject(LR r, [String? expect]) {
+    final tag = r.u16();
+    if (tag == 0) {
+      return (null, null, null);
+    }
+    if (tag == 0x7FFF) {
+      final big = r.u32();
+      if ((big & 0x80000000) != 0) {
+        return _newOfClass(r, big & 0x7FFFFFFF, expect);
+      }
+      return _backref(big, r);
+    }
+    if (tag == 0xFFFF) {
+      final schema = r.u16();
+      final namelen = r.u16();
+      if (namelen > 40) {
+        throw LegacyParseError('implausible class name length ${r.ctx()}');
+      }
+      final nameBytes = r.raw(namelen);
+      final name = ascii.decode(nameBytes);
+      alloc(SlotEntry(kind: 'class', name: name, value: schema));
+      classSlot[name] = nextSlot - 1;
+      classSchema[name] = schema;
+      return _newObj(r, name);
+    }
+    if ((tag & 0x8000) != 0) {
+      return _newOfClass(r, tag & 0x7FFF, expect);
+    }
+    return _backref(tag, r);
+  }
+
+  (int, String, Object?) _newOfClass(LR r, int cslot, String? expect) {
+    var ent = slots[cslot];
+    if (ent == null) {
+      if (expect == null) {
+        throw LegacyParseError('class-ref to unknown slot $cslot ${r.ctx()}');
+      }
+      ent = SlotEntry(kind: 'class', name: expect, value: null);
+      slots[cslot] = ent;
+      classSlot[expect] = cslot;
+    }
+    if (ent.kind != 'class') {
+      throw LegacyParseError(
+          'class-ref to non-class slot $cslot (${ent.name}) ${r.ctx()}');
+    }
+    return _newObj(r, ent.name!);
+  }
+
+  (int, String, Object?) _newObj(LR r, String name) {
+    inEntityList = false;
+    final slot = alloc(SlotEntry(kind: 'obj', name: name, value: null));
+    final reader = readers[name];
+    if (reader == null) {
+      throw LegacyParseError('no reader for class $name ${r.ctx()}');
+    }
+    final prevClass = currentClass;
+    final prevSlot = currentObjSlot;
+    currentClass = name;
+    currentObjSlot = slot;
+    Object? value;
+    try {
+      value = reader(this, r);
+    } finally {
+      currentClass = prevClass;
+      currentObjSlot = prevSlot;
+    }
+    slots[slot] = SlotEntry(kind: 'obj', name: name, value: value);
+    if (name == 'CDimensionLinear' || name == 'CText') {
+      annotWatermark = nextSlot;
+    }
+    return (slot, name, value);
+  }
+
+  // 0xffff CLayer, a class-ref to a CLayer already in classSlot, or —
+  // when [unmatchedClassRef] — any short 0x8000 class-ref. The last form
+  // is only for the throwaway slot-base probe, which numbers from 1<<20 so
+  // the file's 0x8000|real_slot will not match classSlot.
+  bool clayerRecordAt(int at, {bool unmatchedClassRef = false}) {
+    if (at + 2 > data.length) return false;
+    final tag = Tlv.readU16(data, at);
+    if (tag == 0xFFFF &&
+        at + 12 <= data.length &&
+        Tlv.readU16(data, at + 4) == 6 &&
+        ascii.decode(data.sublist(at + 6, at + 12)) == 'CLayer') {
+      return true;
+    }
+    final layCs = classSlot['CLayer'];
+    if (layCs != null && isClassRef(data, at, layCs)) return true;
+    return unmatchedClassRef && (tag & 0x8000) != 0 && tag != 0xFFFF;
+  }
+
+  // Colour CLayer ends in a 21-byte tail. Some v18 zero-material files
+  // (custom tag listed first, then Layer0) write 12 zero bytes + u32 after
+  // that, then another CLayer. Skip those 16 bytes only when they precede
+  // a CLayer; leave a definition-list back-ref alone.
+  void skipClayerColourExt() {
+    const pad = 12;
+    const ext = 16;
+    if (r.pos + ext + 2 > data.length) return;
+    for (int i = 0; i < pad; i++) {
+      if (data[r.pos + i] != 0) return;
+    }
+    if (clayerRecordAt(r.pos + ext, unmatchedClassRef: true)) r.pos += ext;
+  }
+
+  // v18 template Layer0 after a custom tag: <parent u16><active u16><dc u32>.
+  // Consume parent only when both u16s are already CLayer objects. A lone
+  // back-ref then a definition count (usual layout) stays put.
+  void skipClayerParentRef(int? selfSlot) {
+    if (r.pos + 4 > data.length || selfSlot == null) return;
+    final a = Tlv.readU16(data, r.pos);
+    final b = Tlv.readU16(data, r.pos + 2);
+    if (a == 0 || (a & 0x8000) != 0 || a == 0x7FFF || a == selfSlot) return;
+    if (b == 0 || (b & 0x8000) != 0 || b == 0x7FFF) return;
+    final ea = slots[a];
+    final eb = slots[b];
+    if (ea == null || eb == null) return;
+    if (ea.kind == 'class' || eb.kind == 'class') return;
+    if (ea.name != 'CLayer' || eb.name != 'CLayer') return;
+    r.pos += 2;
+  }
+
+  // Extra CLayer records past declared layerCount (v18: count=1 custom
+  // tag, then Layer0). Skip null separators; stop at the definition-list
+  // anchor. unmatchedClassRef only on the throwaway probe.
+  void collectTrailingLayers(
+      {List<int>? slotsOut,
+      List<(int, Object?)>? layersOut,
+      bool unmatchedClassRef = false}) {
+    while (r.pos + 2 <= data.length) {
+      final tag = r.peekU16();
+      if (tag == 0) {
+        r.pos += 2;
+        continue;
+      }
+      if (!clayerRecordAt(r.pos, unmatchedClassRef: unmatchedClassRef)) {
+        break;
+      }
+      final (s, _, v) = readObject(r, 'CLayer');
+      if (v != null) {
+        if (slotsOut != null && s != null) slotsOut.add(s);
+        if (layersOut != null && s != null) layersOut.add((s, v));
+      }
+    }
+  }
+
+  /// Map a FILE store-map index to the walker's numbering through the burn
+  /// bands. Returns the walker slot, or null when the reference points
+  /// INTO a band (a phantom, never-serialized connection point).
+  int? _translateRef(int slot) {
+    int offset = 0;
+    for (final (start, width) in burns) {
+      if (slot < start) break;
+      if (slot < start + width) return null;
+      offset += width;
+    }
+    return slot - offset;
+  }
+
+  /// The walker slot of the back-reference at the cursor, without moving
+  /// it; null when the next tag is anything else.
+  int? peekBackref(LR r) {
+    if (r.pos + 2 > r.data.length) return null;
+    final tag = r.data[r.pos] | (r.data[r.pos + 1] << 8);
+    int slot;
+    if (tag == 0x7FFF) {
+      if (r.pos + 6 > r.data.length) return null;
+      slot = Tlv.readU32(r.data, r.pos + 2);
+      if ((slot & 0x80000000) != 0) return null;
+    } else if (tag == 0 || (tag & 0x8000) != 0) {
+      return null;
+    } else {
+      slot = tag;
+    }
+    if (burns.isNotEmpty && slot >= burns[0].$1) {
+      return _translateRef(slot);
+    }
+    return slot;
+  }
+
+  (int?, String?, Object?) _backref(int slot, LR r) {
+    if (burns.isNotEmpty && slot >= burns[0].$1) {
+      final walker = _translateRef(slot);
+      if (walker == null) {
+        // a phantom (burned) connection-point index - annotation metadata
+        // only; nothing was ever serialized for it
+        return (slot, 'reserved', null);
+      }
+      slot = walker;
+    }
+    final ent = slots[slot];
+    if (ent == null) {
+      if (slot < walkBase) {
+        return (slot, 'premodel', null);
+      }
+      throw LegacyParseError('back-ref to unwalked slot $slot ${r.ctx()}');
+    }
+    if (ent.kind == 'class') {
+      throw LegacyParseError('back-ref to class slot $slot ${r.ctx()}');
+    }
+    return (slot, ent.name, ent.value);
+  }
+}
+
+// ── shared record blocks ───────────────────────────────────────────────────
+
+class DrawBase {
+  int mat = 0, hidden = 0, soft = 0, smooth = 0, layer = 0;
+}
+
+class PreambleResult {
+  final Object? attrs;
+  final int pid;
+  final int? attrsSlot;
+  PreambleResult(this.attrs, this.pid, [this.attrsSlot]);
+}
+
+class VertexRec {
+  List<double> xyz;
+  VertexRec(this.xyz);
+}
+
+class EdgeRec {
+  DrawBase db;
+  int? curve, v1, v2;
+
+  /// The curve itself, on the edge that first points at it (a back-ref to a
+  /// curve already read carries none).
+  Object? curveValue;
+  EdgeRec(
+      {required this.db, this.curve, this.curveValue, this.v1, this.v2});
+}
+
+class CurveRec {
+  int n;
+  CurveRec(this.n);
+}
+
+/// A CArcCurve: the points `center + cos(t) * xAxis + sin(t) * yAxis` for `t`
+/// from startAngle to endAngle.
+class ArcCurveRec {
+  final ArcFrame frame;
+  ArcCurveRec(this.frame);
+}
+
+class EdgeUseRec {
+  int? edge;
+  int sense;
+  EdgeUseRec({this.edge, required this.sense});
+}
+
+class LoopRec {
+  List<EdgeUseRec> uses;
+  LoopRec(this.uses);
+}
+
+class FaceRec {
+  DrawBase db;
+  List<double> plane;
+  List<LoopRec> loops;
+  int backMat;
+  AttrsRec? attrs;
+  FaceRec(
+      {required this.db,
+      required this.plane,
+      required this.loops,
+      required this.backMat,
+      this.attrs});
+}
+
+class AttrsRec {
+  List<(String?, Object?)> children;
+  AttrsRec(this.children);
+}
+
+class DictRec {
+  String name;
+  Map<String, Object?> entries;
+  DictRec(this.name, this.entries);
+}
+
+class LayerRec {
+  String name;
+  int hidden;
+  Uint8List rgba;
+  LayerRec({required this.name, required this.hidden, required this.rgba});
+}
+
+class MaterialRec {
+  String name;
+  Uint8List rgba;
+  double opacity = 0;
+  int useOpacity = 0;
+  int? texDib;
+  Uint8List? texData;
+  double texW = 0, texH = 0;
+  String texFile = '';
+  bool colorized = false;
+  int colorizeType = 0;
+  bool hasTexture = false;
+  MaterialRec({required this.name, required this.rgba});
+}
+
+class TextureBlockRec {
+  Uint8List rgba;
+  double opacity;
+  int useOpacity;
+  int? texDib;
+  Uint8List? texData;
+  double texW, texH;
+  String texFile;
+  bool colorized;
+  int colorizeType;
+  TextureBlockRec({
+    required this.rgba,
+    required this.opacity,
+    required this.useOpacity,
+    required this.texDib,
+    this.texData,
+    required this.texW,
+    required this.texH,
+    required this.texFile,
+    required this.colorized,
+    required this.colorizeType,
+  });
+}
+
+class DibRec {
+  int subtype;
+  Uint8List data;
+  DibRec(this.subtype, this.data);
+}
+
+class FtcRec {
+  List<double> front, back;
+  List<List<double>> frontPins, backPins;
+  bool frontProjected, backProjected;
+  FtcRec({
+    required this.front,
+    required this.back,
+    required this.frontPins,
+    required this.backPins,
+    required this.frontProjected,
+    required this.backProjected,
+  });
+}
+
+class CameraRec {}
+
+class ThumbnailRec {
+  int? dib;
+  ThumbnailRec(this.dib);
+}
+
+class ImageRec {
+  DrawBase db;
+  int? def;
+  List<double> xform;
+  String guid;
+  ImageRec(
+      {required this.db, this.def, required this.xform, required this.guid});
+}
+
+class RelationshipRec {}
+
+class ConstructionLineRec {
+  List<double> point;
+  List<double> direction;
+  List<double>? start;
+  List<double>? end;
+  ConstructionLineRec(this.point, this.direction, this.start, this.end);
+}
+
+class ConstructionPointRec {
+  DrawBase db;
+  List<double> pos;
+  ConstructionPointRec(this.db, this.pos);
+}
+
+class SectionPlaneRec {
+  DrawBase db;
+  List<double> plane;
+  String name;
+  String label;
+  SectionPlaneRec(this.db, this.plane, this.name, this.label);
+}
+
+class FontRec {}
+
+class DimLinearRec {
+  DrawBase db;
+  String text;
+  DimLinearRec(this.db, this.text);
+}
+
+class TextRec {
+  DrawBase db;
+  String text;
+  TextRec(this.db, this.text);
+}
+
+class DefinitionRec {
+  String name;
+  String guid;
+  List<(int, String?, Object?)> ents;
+  bool facesCamera;
+  bool shadowsFaceSun;
+  bool isGroup;
+  DefinitionRec(
+      {required this.name,
+      required this.guid,
+      required this.ents,
+      required this.facesCamera,
+      required this.shadowsFaceSun,
+      this.isGroup = false});
+}
+
+class InstanceRec {
+  DrawBase db;
+  int? def;
+  List<double> xf;
+  String name;
+  String guid;
+  AttrsRec? attrs;
+  InstanceRec(
+      {required this.db,
+      this.def,
+      required this.xf,
+      required this.name,
+      required this.guid,
+      this.attrs});
+}
+
+class LegacyReaders {
+  // SketchUp 3 (header "{3.0.x}") predates several fields every later file
+  // carries. The differences are gated on `ar.ver < firstV4` and were
+  // calibrated byte-by-byte on one real SketchUp-written V3 file (a
+  // synthetic model saved down through SketchUp's own version export) - not
+  // on a corpus - so they are exactly what that file proves and no more
+  // (openskp#284, #407; matches Python's legacy.py `_FIRST_V4`). SketchUp 4
+  // and 5 have layout differences of their own (openskp#284): see
+  // firstDibObject, firstNamedInstance and the version checks in drawbase,
+  // readCamera, readThumbnail, readDimLinear and readDefinition.
+  static const int firstV4 = 4;
+
+  /// The texture image became a first-class CDib object (store-map slot,
+  /// entity preamble) in SketchUp 6. SketchUp 3, 4 and 5 write it as a bare
+  /// inline subtype/length/bytes record straight after the material's flag
+  /// word.
+  static const int firstDibObject = 6;
+
+  /// First version whose instances and groups carry a name string (SketchUp
+  /// 3 and 4 files have none; where the name is optional the reader checks
+  /// for one).
+  static const int firstNamedInstance = 5;
+
+  /// [preamble] for the entity types that carry NO attribute-container
+  /// pointer in a SketchUp 3 file: vertex, loop, edge-use, material, layer.
+  /// (Edge, face, definition, instance and thumbnail still open with one.)
+  static PreambleResult earlyPreamble(Archive ar, LR r) {
+    if (ar.ver < firstV4) return PreambleResult(null, 0);
+    return preamble(ar, r);
+  }
+
+  static PreambleResult preamble(Archive ar, LR r) {
+    final (attrsSlot, __, attrs) = ar.readObject(r, 'CAttributeContainer');
+    int pid = 0;
+    if (ar.hasPid) {
+      final mask = r.u8();
+      for (int bit = 0; bit < 8; bit++) {
+        if ((mask & (1 << bit)) != 0) {
+          pid |= r.u8() << (8 * bit);
+        }
+      }
+    }
+    return PreambleResult(attrs, pid, attrsSlot);
+  }
+
+  static DrawBase drawbase(Archive ar, LR r) {
+    // SketchUp 3's draw block is 5 bytes, and they were identical for every
+    // entity in the calibration file - painted and unpainted faces, edges,
+    // groups - so nothing in them is decodable from what we have. Material
+    // comes from the face's own pointer instead (see readFace); report the
+    // rest as unset rather than the meaningless 0x0100 / "hidden" the 8-byte
+    // layout would read out of them.
+    // 5 bytes in V3, 7 in V4, 8 from V5.
+    final b = r.raw(ar.ver < firstV4 ? 5 : (ar.ver < 5 ? 7 : 8));
+    // The layer field is normally a u16 id, but an entity can carry the
+    // layer BY OBJECT instead (seen on real 2018 instances): a full inline
+    // CLayer record on first use, an escaped back-ref to it on later
+    // siblings. Layer ids never have the 0x8000 bit and never equal
+    // 0x7FFF, so both object forms are unambiguous.
+    final layCls = ar.classSlot['CLayer'];
+    final tag = r.peekU16();
+    int layer;
+    if (layCls != null && tag == (0x8000 | layCls)) {
+      ar.readObject(r, 'CLayer');
+      layer = 0; // by-object layer: keep the default id
+    } else if (tag == 0x7FFF) {
+      r.u16();
+      final big = r.u32();
+      if ((big & 0x80000000) != 0) {
+        throw LegacyParseError('drawbase layer: unexpected class ${r.ctx()}');
+      }
+      layer = 0; // by-object layer (back-ref)
+    } else {
+      layer = r.u16();
+    }
+    if (ar.ver < firstV4) return DrawBase()..layer = layer;
+    return DrawBase()
+      ..mat = Tlv.readU16(b, 0)
+      ..hidden = b[2]
+      ..soft = b[5]
+      ..smooth = b[6]
+      ..layer = layer;
+  }
+
+  static Object readVertex(Archive ar, LR r) {
+    earlyPreamble(ar, r);
+    return VertexRec(r.f64s(3));
+  }
+
+  static Object readEdge(Archive ar, LR r) {
+    preamble(ar, r);
+    final db = drawbase(ar, r);
+    final (s1, _, __) = ar.readObject(r, 'CVertex');
+    final (s2, _2, __2) = ar.readObject(r, 'CVertex');
+    final (cs, cn, cv) = ar.readObject(r);
+    if (cn != null && cn != 'CCurve' && cn != 'CArcCurve') {
+      throw LegacyParseError('edge curve pointer resolved to $cn ${r.ctx()}');
+    }
+    return EdgeRec(db: db, curve: cs, curveValue: cv, v1: s1, v2: s2);
+  }
+
+  static Object readCurve(Archive ar, LR r) {
+    preamble(ar, r);
+    r.u8();
+    final n = r.u32();
+    return CurveRec(n);
+  }
+
+  static Object readArcCurve(Archive ar, LR r) {
+    preamble(ar, r);
+    r.raw(5);
+    // center[3], normal[3], x_axis[3], start_angle, end_angle, y_axis[3]
+    final v = r.f64s(14);
+    return ArcCurveRec(ArcFrame(
+      center: (v[0], v[1], v[2]),
+      normal: (v[3], v[4], v[5]),
+      xAxis: (v[6], v[7], v[8]),
+      startAngle: v[9],
+      endAngle: v[10],
+      yAxis: (v[11], v[12], v[13]),
+    ));
+  }
+
+  /// Record that the writer burned [delta] store-map indices without
+  /// serializing any bytes for them.
+  ///
+  /// SketchUp maps an annotation's connection-point objects into the MFC
+  /// store map (CArchive::MapObject) when a dimension or leader text is
+  /// attached to geometry - each mapping consumes an index, but nothing is
+  /// written to the stream, so the file's later back-references run ahead
+  /// of a byte-exact walk. The band starts right after the last annotation
+  /// record (in FILE numbering); registrations never move - _backref
+  /// translates file references through the recorded bands instead, so no
+  /// slot value captured anywhere can go stale.
+  static void _registerBurn(Archive ar, int delta) {
+    ar.burns.add((ar.annotWatermark! + ar.cumDelta, delta));
+    ar.cumDelta += delta;
+    ar.annotWatermark = null;
+    // each burn event corresponds to ONE phantom top-level entity that the
+    // entity list's declared count includes but the stream never carries -
+    // credit it so the list doesn't run past its real end
+    if (ar.burnStack.isNotEmpty) {
+      ar.burnStack[ar.burnStack.length - 1] += 1;
+    }
+  }
+
+  static Object readEdgeUse(Archive ar, LR r) {
+    earlyPreamble(ar, r);
+    final (es, _, __) = ar.readObject(r, 'CEdge');
+    final sense = r.u8();
+    // parent-loop back-ref: the alignment oracle. Read as a RAW file index
+    // - after annotations the claimed index can sit AHEAD of the walker's
+    // numbering (burned MapObject indices, see _registerBurn), which is a
+    // correction signal, not a mis-parse.
+    final p0 = r.pos;
+    final tag = r.u16();
+    int? ps;
+    if (tag == 0x7FFF) {
+      final big = r.u32();
+      if ((big & 0x80000000) != 0) {
+        throw LegacyParseError('edge-use parent is a new object ${r.ctx()}');
+      }
+      ps = big;
+    } else if (tag == 0xFFFF || (tag & 0x8000) != 0) {
+      throw LegacyParseError('edge-use parent is a new object ${r.ctx()}');
+    } else {
+      ps = tag != 0 ? tag : null;
+    }
+    final expected =
+        ar.currentLoop != null ? ar.currentLoop! + ar.cumDelta : null;
+    if (ps != expected) {
+      final delta = (ps != null && expected != null) ? ps - expected : 0;
+      if (delta > 0 && delta <= 4096 && ar.annotWatermark != null) {
+        _registerBurn(ar, delta);
+      } else {
+        r.pos = p0;
+        throw LegacyParseError(
+            'edge-use parent slot $ps != current loop $expected ${r.ctx()}');
+      }
+    }
+    return EdgeUseRec(edge: es, sense: sense);
+  }
+
+  static Object readLoop(Archive ar, LR r) {
+    final mySlot = ar.nextSlot - 1;
+    final prev = ar.currentLoop;
+    ar.currentLoop = mySlot;
+    earlyPreamble(ar, r);
+    r.raw(2);
+    final uses = <EdgeUseRec>[];
+    while (true) {
+      if (r.peekU16() == 0) {
+        r.pos += 2;
+        break;
+      }
+      final (_, __, v) = ar.readObject(r, 'CEdgeUse');
+      uses.add(v as EdgeUseRec);
+    }
+    ar.currentLoop = prev;
+    return LoopRec(uses);
+  }
+
+  static Object readFace(Archive ar, LR r) {
+    final pre = preamble(ar, r);
+    final db = drawbase(ar, r);
+    var attrs = pre.attrs;
+    if (ar.ver < firstV4 && attrs is MaterialRec && pre.attrsSlot != null) {
+      // SketchUp 3: the pointer that opens a face is its FRONT MATERIAL
+      // (null for an unpainted face), not an attribute container.
+      db.mat = pre.attrsSlot!;
+      attrs = null;
+    }
+    final plane = r.f64s(4);
+    final nloops = r.u32();
+    if (nloops > 10000) {
+      throw LegacyParseError('implausible loop count $nloops ${r.ctx()}');
+    }
+    final loops = <LoopRec>[];
+    for (int i = 0; i < nloops; i++) {
+      final (_, __, v) = ar.readObject(r, 'CLoop');
+      loops.add(v as LoopRec);
+    }
+    final backMat = r.u16();
+    return FaceRec(
+        db: db,
+        plane: plane,
+        loops: loops,
+        backMat: backMat,
+        attrs: attrs as AttrsRec?);
+  }
+
+  static Object readAttrContainer(Archive ar, LR r) {
+    preamble(ar, r);
+    final children = <(String?, Object?)>[];
+    while (true) {
+      if (r.peekU16() == 0) {
+        r.pos += 2;
+        break;
+      }
+      final (_, n, v) = ar.readObject(r, 'CAttributeNamed');
+      children.add((n, v));
+    }
+    return AttrsRec(children);
+  }
+
+  static Object? _readTyped(LR r, int t) {
+    if (t == 0x00) return null;
+    if (t == 0x04) return r.i32();
+    if (t == 0x06) return r.f64();
+    if (t == 0x07) return r.u8();
+    if (t == 0x09) return r.u32();
+    if (t == 0x0a) return r.utf16();
+    if (t == 0x0c) return r.f64(); // Length (a double, inches)
+    if (t == 0x0b) {
+      final n = r.u32();
+      if (n > 100000) {
+        throw LegacyParseError('implausible attr array count ${r.ctx()}');
+      }
+      return [for (int i = 0; i < n; i++) _readTyped(r, r.u8())];
+    }
+    if (t == 0x11) return r.f64s(3); // 3D point (Geom::Point3d)
+    if (t == 0x12) return r.f64s(3); // 3D vector (Geom::Vector3d)
+    throw LegacyParseError(
+        'unknown attribute value type 0x${t.toRadixString(16)} ${r.ctx()}');
+  }
+
+  static Object readAttrNamed(Archive ar, LR r) {
+    preamble(ar, r);
+    r.raw(4);
+    final dictname = r.utf16();
+    final entries = <String, Object?>{};
+    while (true) {
+      final key = r.utf16();
+      if (key == '') break;
+      entries[key] = _readTyped(r, r.u8());
+    }
+    // CAttributeNamed's own trailing u32 is a v7+ addition: a real SketchUp
+    // 6 file ends the record at the empty-key terminator with nothing after
+    // it. Reading it unconditionally eats 4 bytes belonging to the next
+    // sibling's own tag, which surfaces many reads later as an unrelated
+    // "back-ref to unwalked slot" (openskp#284 / #385). The class's own
+    // schema is never observed (it is learned from the unwalked pre-model
+    // region), so the file's version is the only signal available.
+    if (ar.ver >= 7) r.u32();
+    return DictRec(dictname, entries);
+  }
+
+  // SketchUp's Dynamic Components extension stores its data in an
+  // attribute dictionary literally named "dynamic_attributes" - a stable,
+  // publicly documented part of the SketchUp Ruby API
+  // (Entity#attribute_dictionary("dynamic_attributes")). readAttrContainer/
+  // readAttrNamed above already fully decode an entity's
+  // CAttributeContainer into typed (dict-name, {key: value}) pairs for
+  // other purposes (CFaceTextureCoords lookup on faces) - this just looks
+  // up that one dictionary by name, mirroring what the VFF path's
+  // Geometry.extractDynamicProperties does for D007/DC05 TLV data.
+  static const String _dynamicAttributesDictName = 'dynamic_attributes';
+
+  /// Render an already-typed legacy attribute value (num, string, list, or
+  /// null) as a string, matching the string-valued Map<String, String>
+  /// contract the VFF path's Geometry.extractDynamicProperties produces.
+  static String stringifyAttrValue(Object? value) {
+    if (value == null) return '';
+    if (value is List) return value.map(stringifyAttrValue).join(',');
+    return value.toString();
+  }
+
+  /// Extract Dynamic Component attribute key/value pairs from a legacy
+  /// entity's already-parsed CAttributeContainer, or {} when the entity
+  /// carries no attribute container or no dynamic_attributes dictionary.
+  static Map<String, String> extractLegacyDynamicProperties(AttrsRec? attrs) {
+    if (attrs == null) return {};
+    // The tuple's first element is the entity CLASS NAME (always
+    // 'CAttributeNamed', from readObject) - never the dictionary's own
+    // declared name, which lives in DictRec.name.
+    for (final (_, value) in attrs.children) {
+      if (value is DictRec && value.name == _dynamicAttributesDictName) {
+        return {
+          for (final entry in value.entries.entries)
+            entry.key: stringifyAttrValue(entry.value)
+        };
+      }
+    }
+    return {};
+  }
+
+  static Object readLayer(Archive ar, LR r) {
+    earlyPreamble(ar, r);
+    final name = r.utf16();
+    final mid = <int>[];
+    while (mid.length < 8 && !_bytesEqualAt(r.peek(3), 0, _strMarker)) {
+      mid.add(r.raw(1)[0]);
+    }
+    r.utf16();
+    final flags = r.u16();
+    if ((flags & 0x00FF) != 0) {
+      // Colour-by-layer with a TEXTURED material: instead of the flat
+      // RGBA, the layer embeds the same texture block a CMaterial carries
+      // (SketchUp Pro assigns full materials to layers). Low byte of the
+      // flag word set = textured; a plain colour layer has 0 there (its
+      // high byte carries an unrelated flag, so the word as a whole is
+      // non-zero either way).
+      final tex = _textureBlock(ar, r);
+      r.raw(4); // trailing u32
+      return LayerRec(
+          name: name, hidden: mid.isNotEmpty ? mid[0] : 0, rgba: tex.rgba);
+    }
+    final rgba = r.raw(4);
+    r.utf16();
+    r.raw(ar.ver < firstV4 ? 17 : 21); // SketchUp 3's tail is 4 bytes shorter
+    ar.skipClayerColourExt();
+    ar.skipClayerParentRef(ar.currentObjSlot);
+    return LayerRec(
+        name: name, hidden: mid.isNotEmpty ? mid[0] : 0, rgba: rgba);
+  }
+
+  /// The textured-material payload: an embedded CDib plus applied size,
+  /// source file name, average colour, and opacity. Shared verbatim
+  /// between a CMaterial with a texture and a colour-by-layer CLayer that
+  /// carries a textured material.
+  ///
+  /// The texture is an entity in its own right, so right after the u8 "has
+  /// texture" flag it opens with the standard entity preamble: an
+  /// attribute-container ref (null unless an extension stored a dictionary
+  /// on the Texture itself, as render plugins do) and, from v17 on, the
+  /// persistent-id mask. Callers read the flag as a u16, so step back over
+  /// its high byte - the first byte of that preamble.
+  ///
+  /// SketchUp 3 has neither: the image follows the flag directly as a bare
+  /// subtype/length/bytes record - no preamble, no object tag, and so no
+  /// store-map slot (`texDib` is null; the bytes ride along as `texData`).
+  static TextureBlockRec _textureBlock(Archive ar, LR r) {
+    int? s;
+    Uint8List? inlineData;
+    if (ar.ver < firstDibObject) {
+      inlineData = (readDib(ar, r) as DibRec).data;
+    } else {
+      r.pos -= 1;
+      preamble(ar, r);
+      final (slot, _, dib) = ar.readObject(r, 'CDib');
+      if (dib is! DibRec) {
+        throw LegacyParseError('texture object is not a dib ${r.ctx()}');
+      }
+      s = slot;
+    }
+    // optional u32 between the dib and the 2 x f64 applied size
+    final marker = _findBytes(r.data, _strMarker, r.pos, r.pos + 28);
+    if (marker - r.pos == 20) {
+      r.u32();
+    } else if (marker - r.pos != 16) {
+      throw LegacyParseError('texture size block misaligned ${r.ctx()}');
+    }
+    final w = r.f64();
+    final h = r.f64();
+    final fname = r.utf16();
+    // Image average RGBA + 00 + the material's paint RGBA.
+    final avg = r.raw(9);
+    r.utf16();
+    // u32 material type (1 textured, 2 colorized) + u32 colorize mode.
+    final blob = r.raw(8);
+    final opacity = r.f64();
+    final useOp = r.u8();
+    // Checked against materials written by SketchUp's own library: the first
+    // blob u32 is SUMaterialGetType (2 = a colorized texture, which keeps the
+    // ORIGINAL image and stores the tint as the paint colour) and the second
+    // is SUMaterialGetColorizeType (0 shift, 1 tint). The alpha byte of the
+    // image average says nothing about either - it is 0xFF on plain textures
+    // too.
+    final colorized = blob[0] == 2;
+    return TextureBlockRec(
+      rgba: Uint8List.fromList([avg[5], avg[6], avg[7], 255]),
+      opacity: opacity,
+      useOpacity: useOp,
+      texDib: s,
+      texData: inlineData,
+      texW: w,
+      texH: h,
+      texFile: fname,
+      colorized: colorized,
+      colorizeType: blob[4] == 1 ? 1 : 0,
+    );
+  }
+
+  static Object readMaterial(Archive ar, LR r) {
+    earlyPreamble(ar, r);
+    final name = r.utf16();
+    final texflag = r.u16();
+    final out =
+        MaterialRec(name: name, rgba: Uint8List.fromList([128, 128, 128, 255]));
+    if (texflag == 0) {
+      final rgba = r.raw(4);
+      r.utf16();
+      r.raw(8);
+      final opacity = r.f64();
+      final useOp = r.u8();
+      out.rgba = rgba;
+      out.opacity = opacity;
+      out.useOpacity = useOp;
+    } else {
+      final tex = _textureBlock(ar, r);
+      out.rgba = tex.rgba;
+      out.opacity = tex.opacity;
+      out.useOpacity = tex.useOpacity;
+      out.texDib = tex.texDib;
+      out.texData = tex.texData;
+      out.texW = tex.texW;
+      out.texH = tex.texH;
+      out.texFile = tex.texFile;
+      out.colorized = tex.colorized;
+      out.colorizeType = tex.colorizeType;
+      out.hasTexture = true;
+    }
+    return out;
+  }
+
+  static Object readDib(Archive ar, LR r) {
+    final subtype = r.u32();
+    final length = r.u32();
+    if (length > r.data.length) {
+      throw LegacyParseError('implausible dib length $length ${r.ctx()}');
+    }
+    final data = r.raw(length);
+    return DibRec(subtype, data);
+  }
+
+  static Object readFtc(Archive ar, LR r) {
+    preamble(ar, r);
+    r.u32();
+    final ks = r.f64s(24);
+    final frontPinsCount = r.u32();
+    final frontPins = <List<double>>[];
+    for (int i = 0; i < frontPinsCount; i++) frontPins.add(r.f64s(4));
+    final backPinsCount = r.u32();
+    final backPins = <List<double>>[];
+    for (int i = 0; i < backPinsCount; i++) backPins.add(r.f64s(4));
+    final fflags = r.u32();
+    final bflags = r.u32();
+    return FtcRec(
+      front: ks.sublist(0, 9),
+      back: ks.sublist(12, 21),
+      frontPins: frontPins,
+      backPins: backPins,
+      frontProjected: (fflags & 2) != 0,
+      backProjected: (bflags & 2) != 0,
+    );
+  }
+
+  static Object readCamera(Archive ar, LR r) {
+    r.raw(137);
+    r.u16();
+    r.utf16();
+    r.raw(ar.ver >= 6 ? 33 : 10);
+    return CameraRec();
+  }
+
+  static Object readThumbnail(Archive ar, LR r) {
+    preamble(ar, r);
+    if (ar.ver < firstV4) {
+      // SketchUp 3: a fixed 129-byte camera block, no name, no image.
+      r.raw(129);
+      return ThumbnailRec(null);
+    }
+    ar.readObject(r, 'CCamera');
+    if (ar.ver < 6) {
+      // SketchUp 4 and 5 end the thumbnail with its camera: no trailing
+      // image pointer (not even a null one).
+      return ThumbnailRec(null);
+    }
+    final (dibSlot, _, __) = ar.readObject(r, 'CDib');
+    return ThumbnailRec(dibSlot);
+  }
+
+  /// CImage: an Image entity - instance-shaped: a back-ref to the (already
+  /// walked) CComponentDefinition holding the image's face and texture, a
+  /// 3x4 placement, a constant 1.0, the source path string (empty in every
+  /// sample), and a 16-byte GUID. It appears as a normal entity-list item
+  /// inside the definition that owns the image (typically a
+  /// face-me/photo definition), whose own tail the ordinary definition
+  /// reader then consumes.
+  static Object readImage(Archive ar, LR r) {
+    preamble(ar, r);
+    final db = drawbase(ar, r);
+    final (ds, _, __) = ar.readObject(r); // the image's definition
+    final xform = r.f64s(12);
+    r.f64(); // constant 1.0
+    r.utf16(); // source path
+    final guid = r.raw(16);
+    return ImageRec(db: db, def: ds, xform: xform, guid: Tlv.toHexUpper(guid));
+  }
+
+  /// A reference-to-entity tag: dimension connection points and text
+  /// leader attachments. Unlike readObject's back-ref path, this tolerates
+  /// a slot the walk has not reached yet - SketchUp serializes a
+  /// label/dimension BEFORE the entity it anchors to when both live in the
+  /// same entity list, so the reference can legitimately point forward.
+  /// Returns the slot number, or null for a null reference.
+  static int? _entityRef(Archive? ar, LR r) {
+    final tag = r.u16();
+    if (tag == 0) return null;
+    if (tag == 0x7FFF) {
+      final big = r.u32();
+      if ((big & 0x80000000) != 0) {
+        throw LegacyParseError('entity ref is a new object ${r.ctx()}');
+      }
+      return big;
+    }
+    if (tag == 0xFFFF || (tag & 0x8000) != 0) {
+      throw LegacyParseError('entity ref is a new object ${r.ctx()}');
+    }
+    return tag;
+  }
+
+  static Object readRelationship(Archive ar, LR r) {
+    // two object pointers (small maps: two u16 back-refs - which read like
+    // the "u32" of the public notes; big maps escalate them to big-tags).
+    // They bind an annotation to the entity it labels, and the annotation
+    // side is routinely serialized BEFORE the geometry side - so these can
+    // point forward, past the walk cursor; _entityRef tolerates that where
+    // readObject's back-ref path (rightly) does not.
+    preamble(ar, r);
+    _entityRef(ar, r);
+    _entityRef(ar, r);
+    return RelationshipRec();
+  }
+
+  /// True when the u16 at [at] starts an object read in one of the
+  /// UNAMBIGUOUS forms: null, escape, class definition, or a class-ref to
+  /// a class already known. Plain object back-refs are excluded on
+  /// purpose - any 2-byte junk below 0x8000 would qualify, which is
+  /// exactly the ambiguity this check exists to avoid.
+  static bool _strictNextTag(Archive ar, Uint8List data, int at,
+      [bool allowNull = true]) {
+    if (at + 2 > data.length) return false;
+    final t = Tlv.readU16(data, at);
+    if (t == 0x0000) return allowNull;
+    if (t == 0x7FFF || t == 0xFFFF) return true;
+    if ((t & 0x8000) != 0) {
+      final ent = ar.slots[t & 0x7FFF];
+      return ent != null && ent.kind == 'class';
+    }
+    return false;
+  }
+
+  static Object readConstructionLine(Archive ar, LR r) {
+    preamble(ar, r);
+    drawbase(ar, r);
+    final point = r.f64s(3);
+    final direction = r.f64s(3);
+    // Signed distance along `direction` from `point` marking where the visible segment
+    // starts/ends - ground truth (real SketchUp 2025, SDK/Ruby cross-checked): a bounded
+    // segment's start/end exactly equal point/direction scaled by these two parameters
+    // (verified against Sketchup::ConstructionLine#start/#end/#direction byte-for-byte,
+    // including the segment LENGTH as end_param); an unbounded direction uses a +-1e30
+    // sentinel, matching Sketchup::ConstructionLine#start/#end returning nil for that side.
+    final lineParams = r.f64s(2); // line params (+-~4.4e29 = infinite)
+    final startParam = lineParams[0];
+    final endParam = lineParams[1];
+    // The trailing block varies by the WRITING BUILD, not cleanly by
+    // version: 7 bytes on the v17 calibration corpus, 4 on v16 and on a
+    // real v18, 0 on another real v17. Self-calibrate on the first guide
+    // line of the file - the length that lands on a legitimate next tag
+    // (strict forms only) - and cache it for the rest of the file.
+    int? k = ar.clineTail;
+    if (k == null) {
+      final dflt = ar.ver == 17 ? 7 : 4;
+      final order = [
+        dflt,
+        ...[0, 4, 7].where((c) => c != dflt)
+      ];
+      // two passes: a zero tail full of padding can mimic a null tag, so
+      // only accept a null-anchored candidate when no candidate lands on a
+      // STRONG form (escape / known class / class definition)
+      outer:
+      for (final allowNull in [false, true]) {
+        for (final cand in order) {
+          if (_strictNextTag(ar, r.data, r.pos + cand, allowNull)) {
+            k = cand;
+            break outer;
+          }
+        }
+      }
+      k ??= dflt;
+      ar.clineTail = k;
+    }
+    r.raw(k);
+
+    const huge = 1e20; // well below the real +-1e30 sentinel, far above any real geometry extent
+    final start = startParam.abs() >= huge
+        ? null
+        : [
+            point[0] + direction[0] * startParam,
+            point[1] + direction[1] * startParam,
+            point[2] + direction[2] * startParam,
+          ];
+    final end = endParam.abs() >= huge
+        ? null
+        : [
+            point[0] + direction[0] * endParam,
+            point[1] + direction[1] * endParam,
+            point[2] + direction[2] * endParam,
+          ];
+    return ConstructionLineRec(point, direction, start, end);
+  }
+
+  static Object readConstructionPoint(Archive ar, LR r) {
+    preamble(ar, r);
+    final db = drawbase(ar, r);
+    final pos = r.f64s(3);
+    r.f64s(3);
+    r.u8();
+    return ConstructionPointRec(db, pos);
+  }
+
+  static Object readSectionPlane(Archive ar, LR r) {
+    preamble(ar, r);
+    final db = drawbase(ar, r);
+    final first = Tlv.readF64(r.data, r.pos);
+    if (!(first.abs() <= 1.0001)) {
+      ar.readObject(r);
+    }
+    final plane = r.f64s(4);
+    var name = '';
+    var label = '';
+    if (_bytesEqualAt(r.peek(3), 0, _strMarker)) {
+      name = r.utf16();
+      label = r.utf16();
+    }
+    return SectionPlaneRec(db, plane, name, label);
+  }
+
+  static Object readSkFont(Archive ar, LR r) {
+    ar.readObject(r, 'CAttributeContainer');
+    if (ar.hasPid) {
+      // the mask byte says how many pid bytes follow (SketchUp 2017+ writes
+      // two or more here)
+      final mask = r.u8();
+      var n = 0;
+      for (var bit = 0; bit < 8; bit++) {
+        if ((mask & (1 << bit)) != 0) n++;
+      }
+      r.raw(n);
+    }
+    r.utf16();
+    r.raw(15);
+    return FontRec();
+  }
+
+  static Object readDimLinear(Archive ar, LR r) {
+    preamble(ar, r);
+    final db = drawbase(ar, r);
+    final text = r.utf16();
+    if (ar.ver >= 6) ar.readObject(r, 'CSkFont');
+    // The tail is NOT a fixed 165-byte blob: it embeds two object
+    // references (the dimension's connection points into the geometry).
+    // Each is a normal MFC tag - 2 bytes in small files, but 6 bytes once
+    // the archive holds more than 0x7FFE objects and the 0x7FFF big-tag
+    // escape kicks in - so a fixed-size skip walks off the rails exactly
+    // on large models.
+    //
+    // Each connection ref is followed by a second entity ref and two ref
+    // lists, [ref][u32 n1][n1 refs][u32 n2][n2 refs] - the INSTANCE PATHS of
+    // the anchored entity: the groups/components it lives in. A dimension on
+    // loose geometry has a null ref and two empty lists (the zeros the fixed
+    // 42/82-byte blocks used to skip); one anchored to a vertex inside nested
+    // groups carries a ref per group, and the fixed-size read slid off the
+    // record by exactly those refs - silently truncating the ROOT entity list
+    // after it, because the root reader stops at the first unreadable item.
+    // Every record is 161 fixed bytes plus its refs (openskp#384, the Python
+    // fix; found again on a real SketchUp 2017 cabinet, openskp#412).
+    // SketchUp 4 and 5 write neither the font object above nor the 5 bytes in
+    // front of the first connection block, nor the trailing u32 of the last
+    // one.
+    r.raw(ar.ver >= 6 ? 37 : 32);
+    _pathRef((rr) => ar.readObject(rr).$1, r); // connection point 1 (may be null; may be written in full)
+    connectionPaths((rr) => ar.readObject(rr).$1, r, ar);
+    r.raw(32);
+    _pathRef((rr) => ar.readObject(rr).$1, r); // connection point 2 (may be null; may be written in full)
+    connectionPaths((rr) => ar.readObject(rr).$1, r, ar);
+    r.raw(ar.ver >= 6 ? 72 : 68);
+    return DimLinearRec(db, text);
+  }
+
+  /// What follows a dimension connection ref (see [readDimLinear]):
+  /// `[entity ref][u32 n1][n1 refs][u32 n2][n2 refs]`. [readNewObject] reads a
+  /// path entry that MFC wrote in full (the first time anything pointed at it)
+  /// and returns its slot; [ar], when given, notes such an entry for the
+  /// entity list being read (see [_pathRef]).
+  static (int?, List<int?>, List<int?>) connectionPaths(
+      int? Function(LR r) readNewObject, LR r,
+      [Archive? ar]) {
+    final extra = _entityRef(null, r);
+    final lists = <List<int?>>[];
+    for (int k = 0; k < 2; k++) {
+      final count = r.u32();
+      if (count > 1000) {
+        throw LegacyParseError('implausible dimension path length ${r.ctx()}');
+      }
+      lists.add([
+        for (int i = 0; i < count; i++)
+          _pathRef(readNewObject, r, i == 0 ? ar : null)
+      ]);
+    }
+    return (extra, lists[0], lists[1]);
+  }
+
+  /// One instance of a dimension's path. Usually a reference, but MFC writes
+  /// an object IN FULL the first time anything points at it - and a dimension
+  /// serialized before the group it is anchored in carries that whole group
+  /// right here (the root list later holds a back-reference). Read it like
+  /// any object then, so it is registered and the stream stays aligned;
+  /// return its slot either way. A path runs from the outermost instance in,
+  /// so its first one is an entity of the list the annotation is in: [member]
+  /// is given for it, and one written here in full is noted for that list
+  /// (see [readEntityList]).
+  static int? _pathRef(int? Function(LR r) readNewObject, LR r,
+      [Archive? member]) {
+    final tag = r.peekU16();
+    var isNew = tag == 0xFFFF || (tag != 0x7FFF && (tag & 0x8000) != 0);
+    if (tag == 0x7FFF) {
+      isNew = (Tlv.readU32(r.data, r.pos + 2) & 0x80000000) != 0;
+    }
+    if (!isNew) return _entityRef(null, r);
+    final slot = readNewObject(r);
+    if (member != null && slot != null && member.inlineStack.isNotEmpty) {
+      member.inlineStack.last.add(slot);
+    }
+    return slot;
+  }
+
+  /// The text's string start: the variable-length variant middle ends in an
+  /// 11-byte block `01 00 00 00 ?? 00 <arrow type> 00 00 00 01` right before
+  /// it.
+  static int _textDelimiter(LR r) {
+    int p = r.pos;
+    while (true) {
+      final idx = _findBytes(r.data, _strMarker, p, r.pos + 512);
+      if (idx < 0) {
+        throw LegacyParseError('text delimiter not found ${r.ctx()}');
+      }
+      final blk = Uint8List.sublistView(r.data, idx - 11, idx);
+      if (blk[0] == 0x01 &&
+          blk[1] == 0x00 &&
+          blk[2] == 0x00 &&
+          blk[3] == 0x00 &&
+          blk[6] <= 8 &&
+          blk[7] == 0x00 &&
+          blk[8] == 0x00 &&
+          blk[9] == 0x00 &&
+          blk[10] == 1) {
+        return idx;
+      }
+      p = idx + 3;
+    }
+  }
+
+  /// Whether the text whose font ends at [pos] is anchored to an entity:
+  /// after the two screen-fraction f64s comes the connection block,
+  /// `[u32 type][u32 4][point3d]`, and a type other than 0 or 1 (2, 4, 5 and
+  /// 7 seen; see docs/dimension-record-notes.md) anchors the label.
+  static bool _anchoredConnection(Uint8List data, int pos) {
+    if (pos + 24 > data.length) return false;
+    if (Tlv.readU32(data, pos + 20) != 4) return false;
+    final kind = Tlv.readU32(data, pos + 16);
+    return kind >= 2 && kind <= 15;
+  }
+
+  static Object readText(Archive ar, LR r) {
+    preamble(ar, r);
+    final db = drawbase(ar, r);
+    ar.readObject(r, 'CSkFont');
+    if (_anchoredConnection(r.data, r.pos)) {
+      // An anchored connection block is followed, as a dimension's is (see
+      // readDimLinear), by the anchored entity's ref and its instance paths -
+      // and MFC writes a path instance IN FULL there when nothing has pointed
+      // at it before (a label anchored to a component instance serialized
+      // after it, its class declaration included when it is the file's first
+      // instance). Skipped as bytes, that instance never gets its store-map
+      // slots and every later reference is off by them ("class-ref to
+      // non-class slot"); read it instead.
+      r.raw(16 + 32);
+      _entityRef(ar, r);
+      connectionPaths((rr) => ar.readObject(rr).$1, r, ar);
+    }
+    final idx = _textDelimiter(r);
+    r.raw(idx - r.pos);
+    final text = r.utf16();
+    r.raw(5);
+    // Optional leader-attachment refs follow the fixed tail (a text label
+    // anchored to geometry stores the anchored entities here; they can
+    // point FORWARD - see _entityRef). Only the escaped 6-byte form is
+    // recognisable without risk: a 2-byte back-ref here would be
+    // indistinguishable from the next list item's tag, and every known
+    // sample either has no attachments or lives in a >0x7FFE-object file
+    // where the escape is mandatory anyway.
+    while (true) {
+      final head = r.peek(2);
+      if (!(head.length == 2 && head[0] == 0xFF && head[1] == 0x7F)) break;
+      final full = r.peek(6);
+      if (full.length < 6) break;
+      final val = Tlv.readU32(full, 2);
+      if ((val & 0x80000000) != 0) break; // new-object tag - the next entity
+      r.raw(6);
+    }
+    return TextRec(db, text);
+  }
+
+  static List<(int, String?, Object?)> readEntityList(
+      Archive ar, LR r, int count, String owner) {
+    final ents = <(int, String?, Object?)>[];
+    ar.burnStack.add(0);
+    ar.inlineStack.add(<int>{});
+    try {
+      _readEntityListInner(ar, r, count, owner, ents);
+      // An instance an annotation wrote in full (see _pathRef) is one of this
+      // list's items, and the declared count holds it - but SketchUp does not
+      // always list it again with a back-reference (labels anchored to the
+      // loudspeakers of an auditorium: of five instances written in a
+      // definition's labels, three were listed again, two not). Keep the ones
+      // never listed, as the list's own entities.
+      for (final slot in ar.inlineStack.last) {
+        if (ents.length >= count) break;
+        final ent = ar.slots[slot];
+        ents.add((slot, ent?.name, ent?.value));
+      }
+      return ents;
+    } finally {
+      ar.burnStack.removeLast();
+      ar.inlineStack.removeLast();
+    }
+  }
+
+  static List<(int, String?, Object?)> _readEntityListInner(Archive ar, LR r,
+      int count, String owner, List<(int, String?, Object?)> ents) {
+    final inline = ar.inlineStack.isNotEmpty ? ar.inlineStack.last : null;
+    while (ents.length < count) {
+      final p = r.pos;
+      if (inline != null &&
+          inline.isNotEmpty &&
+          ents.length + inline.length >= count) {
+        final next = ar.peekBackref(r);
+        if (next == null || !inline.contains(next)) {
+          // every item left is an instance an annotation already wrote in
+          // full and the list does not list again (see readEntityList)
+          break;
+        }
+      }
+      final hasBurnCredit =
+          owner == 'def' && ar.burnStack.isNotEmpty && ar.burnStack.last > 0;
+      if (hasBurnCredit &&
+          p + 25 <= r.data.length &&
+          Tlv.readU32(r.data, p) == 0 &&
+          _bytesEqualAt(r.data, p + 22, _strMarker)) {
+        // burned MapObject indices (see _registerBurn) mean the declared
+        // count includes phantom entities the stream never carries; the
+        // definition tail signature (nrel=0 + pad + 16-byte GUID + name
+        // marker at +22) marks the list's REAL end
+        break;
+      }
+      final prevFlag = ar.inEntityList;
+      ar.inEntityList = true;
+      int? s;
+      String? n;
+      Object? v;
+      try {
+        (s, n, v) = ar.readObject(r);
+      } on LegacyParseError {
+        ar.inEntityList = prevFlag;
+        if (owner == 'root') {
+          // over-declared root counts run into the document tail - stop
+          r.pos = p;
+          break;
+        }
+        if (hasBurnCredit) {
+          // this list had burned MapObject indices (see _registerBurn):
+          // the phantom connection points were also counted as items, so
+          // the declared count overshoots the real records. Stop at the
+          // failed item - the definition tail that follows (nrel, GUID
+          // anchor, thumbnail scan) validates the cut.
+          r.pos = p;
+          break;
+        }
+        rethrow;
+      }
+      ar.inEntityList = prevFlag;
+      inline?.remove(s!);
+      ents.add((s!, n, v));
+    }
+    return ents;
+  }
+
+  static Object readDefinition(Archive ar, LR r) {
+    preamble(ar, r);
+    // undecoded base block: 13 bytes in SketchUp 3, 19 in 4, 20 from 5, 22
+    // from 2017
+    r.raw(ar.ver >= 17 ? 22 : (ar.ver >= 5 ? 20 : (ar.ver >= firstV4 ? 19 : 13)));
+    final nlayers = r.u32();
+    if (nlayers > 10000) {
+      throw LegacyParseError('implausible def layer count ${r.ctx()}');
+    }
+    // like the model-level layer list, the count is REAL layers (new
+    // records or back-refs); SketchUp 2020 interleaves null separators
+    // between them
+    int got = 0;
+    while (got < nlayers) {
+      if (r.peekU16() == 0) {
+        r.pos += 2;
+        continue;
+      }
+      ar.readObject(r, 'CLayer');
+      got += 1;
+    }
+    if (ar.ver == 19 && nlayers > 0 && r.peekU16() == 0) {
+      // SketchUp 2019 follows the LAST layer with a separator null too (2020
+      // does as well, but its count recovery already absorbs it).
+      r.pos += 2;
+    }
+    var decl = r.u16();
+    if (decl == 0x7FFF) {
+      decl = r.u32();
+    }
+    // v20 can drop its undocumented filler right here, swallowing the u32
+    // field (and, behind a layer-separator null, even the decl itself): if
+    // the empty-string marker sits in the next few bytes, the real count
+    // is the first non-zero u32 after its padding.
+    int? filled;
+    if (ar.ver >= 20) {
+      filled = retryCountAfterV20Filler(r, r.pos, 5000000, ar);
+    }
+    int count;
+    if (filled != null) {
+      count = filled;
+    } else {
+      r.u32();
+      count = r.u32();
+    }
+    // A zero count is as much a symptom of the v20 filler as an implausibly
+    // large one: the reader lands on the leading zero bytes of the filler
+    // instead of the count. A genuinely empty definition reads zero with no
+    // filler ahead, and retryCountAfterV20Filler leaves those alone.
+    if (count > 5000000 || count == 0) {
+      final retry = retryCountAfterV20Filler(r, r.pos - 4, 5000000, ar);
+      if (retry != null) count = retry;
+    }
+    if (count > 5000000) {
+      throw LegacyParseError('implausible def entity count ${r.ctx()}');
+    }
+    final ents = readEntityList(ar, r, count, 'def');
+    var nrel = r.u32();
+    if (nrel > 100000) {
+      final retry = retryCountAfterV20Filler(r, r.pos - 4, 100000, ar);
+      if (retry != null) nrel = retry;
+    }
+    if (nrel > 100000) {
+      throw LegacyParseError('definition list misaligned ${r.ctx()}');
+    }
+    for (int i = 0; i < nrel; i++) {
+      ar.readObject(r, 'CRelationship');
+    }
+    r.u16();
+    // The GUID is followed immediately by the name string. Some files
+    // (SketchUp 2020) carry two extra bytes ahead of the GUID, which would
+    // shift this read and leave the cursor mid-record. Anchor on the string
+    // marker that must follow the 16 GUID bytes instead of trusting the
+    // fixed prefix width.
+    if (!_bytesEqualAt(r.data, r.pos + 16, _strMarker)) {
+      for (int skip = 1; skip <= 4; skip++) {
+        final at = r.pos + skip;
+        if (_bytesEqualAt(r.data, at + 16, _strMarker)) {
+          r.pos = at;
+          break;
+        }
+      }
+    }
+    final guid = r.raw(16);
+    final name = r.utf16();
+    r.utf16();
+    r.utf16();
+    r.u32();
+
+    int? tpos;
+    final thumbSlot = ar.classSlot['CThumbnail'];
+    for (int off = 0; off < 96; off++) {
+      final p = r.pos + off;
+      if (p + 16 <= r.data.length &&
+          r.data[p] == 0xFF &&
+          r.data[p + 1] == 0xFF &&
+          r.data[p + 4] == 0x0a &&
+          r.data[p + 5] == 0x00 &&
+          _matchesAscii(r.data, p + 6, 'CThumbnail')) {
+        tpos = p;
+        break;
+      }
+      if (thumbSlot != null && isClassRef(r.data, p, thumbSlot)) {
+        tpos = p;
+        break;
+      }
+    }
+    if (tpos == null) {
+      throw LegacyParseError('definition tail: thumbnail not found ${r.ctx()}');
+    }
+    final gap = r.raw(tpos - r.pos);
+    final behavior = gap.length >= 9 ? gap[gap.length - 9] : 0;
+    // the last u32 before the thumbnail is 1 for the definition of a group
+    // and 0 for a component's (what SketchUp's SUComponentDefinitionGetType
+    // reports), measured against SketchUp 2025's own counts
+    final isGroup = gap.length >= 4 &&
+        (gap[gap.length - 4] |
+                (gap[gap.length - 3] << 8) |
+                (gap[gap.length - 2] << 16) |
+                (gap[gap.length - 1] << 24)) ==
+            1;
+    ar.readObject(r, 'CThumbnail');
+    return DefinitionRec(
+      name: name,
+      guid: Tlv.toHexUpper(guid),
+      ents: ents,
+      facesCamera: (behavior & 1) != 0,
+      shadowsFaceSun: (behavior & 2) != 0,
+      isGroup: isGroup,
+    );
+  }
+
+  static Object readInstance(Archive ar, LR r) {
+    final pre = preamble(ar, r);
+    final db = drawbase(ar, r);
+    final (ds, dn, _) = ar.readObject(r, 'CComponentDefinition');
+    if (dn != 'CComponentDefinition') {
+      throw LegacyParseError('instance definition ref is $dn ${r.ctx()}');
+    }
+    final xf = r.f64s(13);
+    // SketchUp 3 and 4 instances carry no name string (5 is the first to
+    // write one); where it is optional, take it only if a string is there.
+    final name = (ar.ver >= firstNamedInstance ||
+            _bytesEqualAt(r.peek(3), 0, _strMarker))
+        ? r.utf16()
+        : '';
+
+    // The trailing instance GUID is a version-14 (SketchUp 2014) addition for
+    // BOTH CComponentInstance and CGroup - gated by the file's own version,
+    // not by the class's reported schema. Schema doesn't generalize: a v7
+    // file's CComponentInstance reports schema 6, and CGroup reports schema 1
+    // on every version, so a schema gate is always true for it and forces a
+    // phantom 16-byte read on every pre-2014 group (openskp#284 / #310).
+    final guid = ar.ver >= 14 ? r.raw(16) : Uint8List(0);
+
+    return InstanceRec(
+        db: db,
+        def: ds,
+        xf: xf,
+        name: name,
+        guid: Tlv.toHexUpper(guid),
+        attrs: pre.attrs as AttrsRec?);
+  }
+
+  static final Map<String, LegacyReader> readers = {
+    'CVertex': readVertex,
+    'CEdge': readEdge,
+    'CCurve': readCurve,
+    'CArcCurve': readArcCurve,
+    'CEdgeUse': readEdgeUse,
+    'CLoop': readLoop,
+    'CFace': readFace,
+    'CLayer': readLayer,
+    'CMaterial': readMaterial,
+    'CDib': readDib,
+    'CAttributeContainer': readAttrContainer,
+    'CAttributeNamed': readAttrNamed,
+    'CCamera': readCamera,
+    'CThumbnail': readThumbnail,
+    'CRelationship': readRelationship,
+    'CComponentDefinition': readDefinition,
+    'CImage': readImage,
+    'CComponentInstance': readInstance,
+    'CGroup': readInstance,
+    'CFaceTextureCoords': readFtc,
+    'CConstructionLine': readConstructionLine,
+    'CConstructionPoint': readConstructionPoint,
+    'CSectionPlane': readSectionPlane,
+    'CSkFont': readSkFont,
+    'CDimensionLinear': readDimLinear,
+    'CText': readText,
+  };
+}
+
+class Legacy {
+  /// True when [data] is a classic (pre-2021) MFC-container .skp.
+  static bool isLegacy(Uint8List data) {
+    if (!(data.length >= 4 &&
+        data[0] == 0xFF &&
+        data[1] == 0xFE &&
+        data[2] == 0xFF &&
+        data[3] == 0x0E)) {
+      return false;
+    }
+    final head100Len = data.length < 0x100 ? data.length : 0x100;
+    if (_findBytes(data, [0x50, 0x4B, 0x03, 0x04], 0, head100Len) >= 0) {
+      return false;
+    }
+    final head200Len = data.length < 0x200 ? data.length : 0x200;
+    return _findBytes(data, ascii.encode('CVersionMap'), 0, head200Len) >= 0;
+  }
+
+  static final List<int?> _cMaterialPattern = [
+    0xFF,
+    0xFF,
+    null,
+    null,
+    0x09,
+    0x00,
+    ...ascii.encode('CMaterial'),
+  ];
+
+  static final List<int?> _cLayerPattern = [
+    0xFF,
+    0xFF,
+    null,
+    null,
+    0x06,
+    0x00,
+    ...ascii.encode('CLayer'),
+  ];
+
+  static int? _findVersionMajor(Uint8List data) {
+    final headLen = data.length < 0x60 ? data.length : 0x60;
+    final stripped = <int>[];
+    for (int i = 0; i < headLen; i++) {
+      if (data[i] != 0x00) stripped.add(data[i]);
+    }
+    final text = latin1.decode(stripped);
+    final m = RegExp(r'\{(\d+)\.').firstMatch(text);
+    if (m == null) return null;
+    return int.parse(m.group(1)!);
+  }
+
+  /// Bootstrap the absolute slot base: parse material 1 with a throwaway
+  /// archive; material 2's class-ref tag names CMaterial's true slot.
+  static int _bootstrapTwoMaterials(Uint8List data, int ver, int matHdr) {
+    final boot = Archive(data, ver);
+    boot.readers.addAll(LegacyReaders.readers);
+    boot.nextSlot = 1 << 20;
+    boot.walkBase = 1 << 20;
+    boot.r.pos = matHdr;
+    boot.readObject(boot.r, 'CMaterial');
+    final tag = boot.r.peekU16();
+    if (tag == 0xFFFF || (tag & 0x8000) == 0) {
+      throw LegacyParseError('cannot bootstrap the slot base');
+    }
+    return tag & 0x7FFF;
+  }
+
+  /// Slot-base candidates for files where the two-material trick is
+  /// unavailable (0 or 1 materials).
+  ///
+  /// Parse the model prefix (materials, layer list) with a throwaway base;
+  /// the object right after the layer list is the definition-list anchor -
+  /// an ABSOLUTE back-ref to the active layer, an object we just allocated
+  /// relatively. Each walked layer yields one candidate base; with a single
+  /// layer (the common case) the answer is exact.
+  static List<int> _probeLayerAnchorBases(
+      Uint8List data, int ver, int start, int matCount) {
+    final boot = Archive(data, ver);
+    boot.readers.addAll(LegacyReaders.readers);
+    const b0 = 1 << 20;
+    boot.nextSlot = b0;
+    boot.walkBase = b0;
+    boot.r.pos = start;
+    for (int i = 0; i < matCount; i++) {
+      boot.readObject(boot.r, 'CMaterial');
+    }
+    boot.r.u32();
+    if (ver >= 17) {
+      boot.r.u8();
+    }
+    // SketchUp 3 writes no layer count: the layer records simply run until the
+    // definition-list anchor, which collectTrailingLayers (below) already stops
+    // at. Reading a count here would consume the first layer record and reject
+    // every single-material V3 file.
+    var layerCount = 0;
+    if (ver >= LegacyReaders.firstV4) {
+      layerCount = boot.r.u32();
+      if (layerCount < 1 || layerCount > 100000) {
+        throw LegacyParseError('implausible layer count in base probe');
+      }
+    }
+    final layerSlots = <int>[];
+    for (int i = 0; i < layerCount; i++) {
+      final (s, _, __) = boot.readObject(boot.r, 'CLayer');
+      // a null entry in the layer list has no slot, so it is no candidate
+      // (files saved through SketchUp's C API as 2019 or 2020 have one)
+      if (s != null) layerSlots.add(s);
+    }
+    boot.collectTrailingLayers(slotsOut: layerSlots, unmatchedClassRef: true);
+    final (s, n, __) = boot.readObject(boot.r);
+    if (n != 'premodel') {
+      // under the throwaway base every absolute back-ref classifies as
+      // premodel; anything else means the prefix did not parse
+      throw LegacyParseError('base probe: anchor resolved to $n');
+    }
+    return [
+      for (final rel in layerSlots)
+        if (s! - (rel - b0) > 0 && s - (rel - b0) < b0) s - (rel - b0)
+    ];
+  }
+
+  /// Public entry point for [_probeLayerAnchorBases] - exposed for
+  /// openskp.create's scaffold-splicing bootstrap, which needs the exact
+  /// same slot-base bootstrap this reader already performs for a
+  /// zero/one-material legacy prefix (see that method's own doc comment).
+  static List<int> probeLayerAnchorBases(
+          Uint8List data, int ver, int start, int matCount) =>
+      _probeLayerAnchorBases(data, ver, start, matCount);
+
+  static ({
+    Archive ar,
+    List<(int, String?, Object?)> root,
+    List<(int, Object?)> layers,
+    List<(int, Object?)> materials
+  }) _walk(Uint8List data) {
+    final ver = _findVersionMajor(data);
+    if (ver == null) {
+      throw LegacyParseError('no version string in header');
+    }
+
+    // anchor: the material manager (u32 count right before the first
+    // CMaterial new-class record); zero-material files have no CMaterial
+    // record anywhere, so fall back to the first CLayer class record and
+    // start at the layer-list marker just before it
+    final matHdr = _findPattern(data, _cMaterialPattern);
+    int start;
+    int matCount;
+    if (matHdr >= 0) {
+      start = matHdr;
+      matCount = Tlv.readU32(data, matHdr - 4);
+      if (matCount > 100000) {
+        throw LegacyParseError('implausible material count');
+      }
+    } else {
+      final layerHdr = _findPattern(data, _cLayerPattern);
+      if (layerHdr < 0) {
+        throw LegacyParseError('no CMaterial or CLayer class record found');
+      }
+      matCount = 0;
+      start = layerHdr - (ver >= 17 ? 9 : 8);
+    }
+
+    final bases = matCount >= 2
+        ? [_bootstrapTwoMaterials(data, ver, start)]
+        : _probeLayerAnchorBases(data, ver, start, matCount);
+
+    // Every candidate but the right one dies almost immediately (the slot
+    // numbers it hands out disagree with the file's own class-refs), while
+    // the right one only fails where the file really differs from what we
+    // know. So report the failure that got FURTHEST into the file - not the
+    // last candidate's, which is the earliest to fail and says nothing useful.
+    LegacyParseError? bestExc;
+    var bestAt = -1;
+    for (final base in bases) {
+      try {
+        return _walkModel(data, ver, start, matCount, base);
+      } on LegacyParseError catch (e) {
+        final m = RegExp(r'@0x([0-9a-f]+)').firstMatch(e.message);
+        final at = m != null ? int.parse(m.group(1)!, radix: 16) : -1;
+        if (bestExc == null || at > bestAt) {
+          bestExc = e;
+          bestAt = at;
+        }
+      }
+    }
+    if (bestExc != null) throw bestExc;
+    throw LegacyParseError('no viable slot base candidate');
+  }
+
+  static ({
+    Archive ar,
+    List<(int, String?, Object?)> root,
+    List<(int, Object?)> layers,
+    List<(int, Object?)> materials
+  }) _walkModel(Uint8List data, int ver, int start, int matCount, int base) {
+    final ar = Archive(data, ver);
+    ar.readers.addAll(LegacyReaders.readers);
+    ar.nextSlot = base;
+    ar.walkBase = base;
+    final r = ar.r;
+
+    r.pos = start;
+    final materials = <(int, Object?)>[];
+    for (int i = 0; i < matCount; i++) {
+      final (s, _, v) = ar.readObject(r, 'CMaterial');
+      materials.add((s!, v));
+    }
+
+    r.u32();
+    if (ver >= 17) {
+      r.u8();
+    }
+    // SketchUp 3 writes no layer count: the layer records simply run until
+    // the definition-list anchor, which the loop below already stops at (a
+    // back-ref, not a layer record).
+    final layerCount = ver < LegacyReaders.firstV4 ? (1 << 30) : r.u32();
+    if (layerCount > 100000 && ver >= LegacyReaders.firstV4) {
+      throw LegacyParseError('implausible layer count');
+    }
+    // layerCount counts REAL layers. SketchUp 2020 interleaves a null
+    // object-ref after each layer record (a separator, not a layer), so
+    // counting reads walks off mid-list on files with several layers;
+    // count parsed layers instead, skip the separators, and stop early if
+    // the next tag is a back-ref (the definition-list anchor) - a v20
+    // variant where the count over-includes separators.
+    final layers = <(int, Object?)>[];
+    while (layers.length < layerCount) {
+      final tag = r.peekU16();
+      if (tag == 0) {
+        r.pos += 2;
+        continue;
+      }
+      if (tag != 0xFFFF && (tag & 0x8000) == 0) {
+        break;
+      }
+      final (s, _, v) = ar.readObject(r, 'CLayer');
+      if (v == null) continue;
+      layers.add((s!, v));
+    }
+    // trailing separators (and any layer records past the declared count)
+    ar.collectTrailingLayers(layersOut: layers);
+
+    final (_, dn, __) = ar.readObject(r);
+    if (dn != 'CLayer') {
+      throw LegacyParseError('definition-list anchor is $dn, not a layer');
+    }
+    var defCount = r.u32();
+    if (defCount > 1000000) {
+      final retry = retryCountAfterV20Filler(r, r.pos - 4, 1000000, ar);
+      if (retry != null) {
+        defCount = retry;
+        if (!definitionStartsAt(ar, r.data, r.pos)) {
+          // A model with NO component definitions has no definition count to
+          // find: SketchUp 2020 writes its filler where the count would be,
+          // and the first count behind it is the ROOT entity count. The retry
+          // cannot tell the two apart, so it handed the root count over as a
+          // definition count - and the root entities were then read (and
+          // silently dropped) as "definitions". A real definition count is
+          // always followed by a definition record; anything else means this
+          // is the root count, so put it back.
+          defCount = 0;
+          r.pos -= 4;
+        }
+      } else {
+        // No count behind the filler at all: an entirely empty model, whose
+        // root count is 0 (the retry only accepts counts > 0).
+        final rootCountAt = findEmptyRootAfterV20Filler(r.data, r.pos - 4);
+        if (rootCountAt != null) {
+          defCount = 0;
+          r.pos = rootCountAt;
+        }
+      }
+    }
+    if (defCount > 1000000) {
+      throw LegacyParseError('implausible definition count');
+    }
+    for (int i = 0; i < defCount; i++) {
+      ar.readObject(r, 'CComponentDefinition');
+    }
+
+    final defCls = ar.classSlot['CComponentDefinition'];
+    while (true) {
+      final tag = r.peekU16();
+      var isDef = defCls != null && tag == (0x8000 | defCls);
+      if (!isDef &&
+          tag == 0xFFFF &&
+          _matchesAscii(r.peek(26), 6, 'CComponentDefinition')) {
+        isDef = true;
+      }
+      if (!isDef) break;
+      ar.readObject(r);
+    }
+
+    var rootCount = r.u32();
+    if (rootCount > 5000000) {
+      final retry = retryCountAfterV20Filler(r, r.pos - 4, 5000000, ar);
+      if (retry != null) rootCount = retry;
+    }
+    if (rootCount > 5000000) {
+      throw LegacyParseError('implausible root entity count');
+    }
+    final root = LegacyReaders.readEntityList(ar, r, rootCount, 'root');
+
+    return (ar: ar, root: root, layers: layers, materials: materials);
+  }
+
+  /// Mirror of Geometry's GeometryBuilder, kept dependency-free from the
+  /// VFF-specific TLV machinery.
+  static void _addEdge(
+      GeometryBuilder builder, int slot, EdgeRec e, Map<int, SlotEntry> slots) {
+    if (builder.edges.containsKey(slot)) return;
+    for (final vs in [e.v1, e.v2]) {
+      if (vs == null) continue;
+      final ent = slots[vs];
+      if (ent != null &&
+          ent.value != null &&
+          !builder.vertices.containsKey(vs)) {
+        final xyz = (ent.value as VertexRec).xyz;
+        builder.vertices[vs] = (xyz[0], xyz[1], xyz[2]);
+      }
+    }
+    builder.edges[slot] = (e.v1, e.v2);
+    final db = e.db;
+    final flags = (db.soft != 0 ? 0x08 : 0) |
+        (db.smooth != 0 ? 0x10 : 0) |
+        (db.hidden != 0 ? 0x01 : 0);
+    if (flags != 0) {
+      builder.edgeFlags[slot] = flags;
+    }
+    // The edge's parent Curve (the CCurve/CArcCurve slot) and, if that curve
+    // is an analytic arc, its frame: it arrives on the edge that first
+    // references the CArcCurve; every later edge on the arc back-refs it.
+    final curve = e.curve;
+    if (curve != null) {
+      builder.edgeCurves[slot] = curve;
+      final cv = e.curveValue;
+      if (cv is ArcCurveRec) builder.arcCurves[curve] = cv.frame;
+    }
+  }
+
+  static void _fillBuilder(GeometryBuilder builder,
+      List<(int, String?, Object?)> ents, Map<int, SlotEntry> slots) {
+    for (final (s, _, v) in ents) {
+      if (v == null) continue;
+      if (v is EdgeRec) {
+        _addEdge(builder, s, v, slots);
+      } else if (v is ArcCurveRec) {
+        builder.arcCurves[s] = v.frame;
+      } else if (v is FaceRec) {
+        final loops = <List<(int, int)>>[];
+        for (final lp in v.loops) {
+          final loop = <(int, int)>[];
+          for (final u in lp.uses) {
+            final es = u.edge;
+            if (es == null) continue;
+            final ent = slots[es];
+            if (ent == null || ent.value == null) continue;
+            _addEdge(builder, es, ent.value as EdgeRec, slots);
+            // Normalize to the documented CoEdge contract (+1 = same
+            // direction as the edge, -1 = reversed) - u.sense is the raw
+            // SketchUp bit (0 = forward, 1 = reversed).
+            loop.add((es, u.sense != 0 ? -1 : 1));
+          }
+          loops.add(loop);
+        }
+        final face = GeometryBuilderFace()
+          ..loops = loops
+          ..normal = (v.plane[0], v.plane[1], v.plane[2])
+          ..materialId = v.db.mat != 0 ? v.db.mat : null
+          ..backMaterialId = v.backMat != 0 ? v.backMat : null
+          ..uvTransform = null
+          ..uvTransformBack = null
+          ..hidden = v.db.hidden != 0;
+        final attrs = v.attrs;
+        if (attrs != null) {
+          for (final (_, cv) in attrs.children) {
+            if (cv is FtcRec) {
+              face.uvTransform = List<double>.from(cv.front);
+              face.uvTransformBack = List<double>.from(cv.back);
+              face.uvProjected = cv.frontProjected;
+              face.uvProjectedBack = cv.backProjected;
+            }
+          }
+        }
+        builder.faces[s] = face;
+      } else if (v is InstanceRec) {
+        builder.instances.add(GeometryBuilderInstance()
+          ..offset = 0
+          ..name = v.name
+          ..refIdx = v.def
+          ..refGuid = ''
+          ..matrix = List<double>.from(v.xf)
+          ..materialId = v.db.mat != 0 ? v.db.mat : null
+          ..hidden = v.db.hidden != 0
+          ..layerId = v.db.layer != 0 ? v.db.layer : null
+          ..children = const []
+          ..properties = LegacyReaders.extractLegacyDynamicProperties(v.attrs));
+      } else if (v is ImageRec) {
+        // Placed exactly like an ordinary component instance - same
+        // transform/definition-reference shape - the only difference is
+        // the definition it points at is flagged isImage=true (set below
+        // via imageDefIds), matching how the VFF/modern reader already
+        // treats an Image entity as "a component placed through the same
+        // instance machinery as any other". Previously dropped here
+        // entirely: this record matched none of the branches above, so an
+        // Image entity parsed without error but never appeared anywhere a
+        // caller could see it.
+        builder.instances.add(GeometryBuilderInstance()
+          ..offset = 0
+          ..name = ''
+          ..refIdx = v.def
+          ..refGuid = v.guid
+          ..matrix = List<double>.from(v.xform)
+          ..materialId = v.db.mat != 0 ? v.db.mat : null
+          ..hidden = v.db.hidden != 0
+          ..layerId = v.db.layer != 0 ? v.db.layer : null
+          ..children = const []
+          ..properties = const {});
+      } else if (v is SectionPlaneRec) {
+        builder.sectionPlanes.add(SectionPlane(
+          plane: v.plane,
+          name: v.name,
+          label: v.label,
+          hidden: v.db.hidden != 0,
+        ));
+      } else if (v is TextRec) {
+        builder.texts.add(TextEntity(
+          text: v.text,
+          hidden: v.db.hidden != 0,
+        ));
+      } else if (v is DimLinearRec) {
+        builder.dimensions.add(Dimension(
+          text: v.text,
+          hidden: v.db.hidden != 0,
+        ));
+      } else if (v is ConstructionLineRec) {
+        builder.constructionLines.add(ConstructionLine(
+          point: (v.point[0], v.point[1], v.point[2]),
+          direction: (v.direction[0], v.direction[1], v.direction[2]),
+          start: v.start == null ? null : (v.start![0], v.start![1], v.start![2]),
+          end: v.end == null ? null : (v.end![0], v.end![1], v.end![2]),
+        ));
+      } else if (v is ConstructionPointRec) {
+        builder.constructionPoints.add(ConstructionPoint(
+          position: (v.pos[0], v.pos[1], v.pos[2]),
+        ));
+      }
+    }
+  }
+
+  /// Parse a classic MFC .skp into the shared RawParsed shape, which
+  /// Parser converts to the public SkpModel exactly like the VFF path.
+  static RawParsed fullParseLegacy(Uint8List data, [ParseOptions? options]) {
+    final sw = Stopwatch()..start();
+    emitLog(options, SkpLogLevel.info,
+        'Parsing legacy buffer (${data.length} bytes)');
+
+    var version = 'unknown';
+    final second = _findBytes(data, _strMarker, 4);
+    if (second > 0) {
+      final start = second + 4;
+      final len = (start + 100 <= data.length) ? 100 : (data.length - start);
+      final codeUnits = <int>[];
+      for (int i = start; i + 1 < start + len; i += 2) {
+        codeUnits.add(data[i] | (data[i + 1] << 8));
+      }
+      final text = String.fromCharCodes(codeUnits);
+      final braceStart = text.indexOf('{');
+      final braceEnd = text.indexOf('}');
+      if (braceStart >= 0 && braceEnd >= 0) {
+        version = text.substring(braceStart, braceEnd + 1);
+      }
+    }
+    emitLog(options, SkpLogLevel.debug, 'Detected legacy version $version');
+
+    ({
+      Archive ar,
+      List<(int, String?, Object?)> root,
+      List<(int, Object?)> layers,
+      List<(int, Object?)> materials
+    }) walkResult;
+    try {
+      walkResult = _walk(data);
+    } on LegacyParseError catch (e) {
+      throw SkpParseException('legacy .skp parse failed: ${e.message}',
+          stage: 'legacy_walk', cause: e);
+    }
+
+    final ar = walkResult.ar;
+    final slots = ar.slots;
+    emitLog(
+      options,
+      SkpLogLevel.debug,
+      'Legacy walk complete: ${walkResult.materials.length} materials, ${walkResult.layers.length} layers',
+    );
+
+    final materialsMap = <String, RawMaterial>{};
+    final materialIdToName = <int, String>{};
+    for (final (s, vObj) in walkResult.materials) {
+      final v = vObj as MaterialRec;
+      final rgba = v.rgba;
+      final trans = v.useOpacity != 0 ? (1.0 - v.opacity).clamp(0.0, 1.0) : 1.0;
+      final colorized = v.colorized;
+      RawTexture? texture;
+      if (v.hasTexture) {
+        Uint8List? texData;
+        final dibEnt = v.texDib != null ? slots[v.texDib] : null;
+        if (dibEnt != null && dibEnt.value is DibRec) {
+          texData = (dibEnt.value as DibRec).data;
+        } else if (v.texData != null) {
+          texData = v.texData;
+        }
+        final isPng = texData != null &&
+            texData.length >= 4 &&
+            texData[0] == 0x89 &&
+            texData[1] == 0x50 &&
+            texData[2] == 0x4E &&
+            texData[3] == 0x47;
+        final ext = isPng ? '.png' : '.jpg';
+        final fname = v.texFile.isNotEmpty ? v.texFile : '${v.name}$ext';
+        texture = RawTexture(
+            filename: fname, xScale: v.texW, yScale: v.texH, data: texData);
+      }
+      final matObj = RawMaterial(
+        name: v.name,
+        r: rgba[0],
+        g: rgba[1],
+        b: rgba[2],
+        a: rgba[3],
+        transparency: trans,
+        colorized: colorized,
+        colorizeType: v.colorizeType,
+        texture: texture,
+      );
+      materialsMap[v.name] = matObj;
+      materialIdToName[s] = v.name;
+    }
+
+    final layerColors = <String, (int, int, int)>{};
+    final layerHidden = <String, bool>{};
+    final layerIdToName = <int, String>{};
+    for (final (s, vObj) in walkResult.layers) {
+      final v = vObj as LayerRec;
+      final rgba = v.rgba;
+      layerColors[v.name] = (rgba[0], rgba[1], rgba[2]);
+      layerHidden[v.name] = v.hidden != 0;
+      layerIdToName[s] = v.name;
+    }
+    if (!layerColors.containsKey('Layer0')) {
+      layerColors['Layer0'] = (136, 136, 136);
+    }
+    if (!layerHidden.containsKey('Layer0')) {
+      layerHidden['Layer0'] = false;
+    }
+
+    // Scanned before the definitions loop below so isImage can be set
+    // correctly the first time a definition is built, matching the VFF
+    // reader's RawDefinition.isImage field.
+    final imageDefIds = <int>{};
+    for (final entry in slots.entries) {
+      final ent = entry.value;
+      if (ent.kind == 'obj' && ent.name == 'CImage' && ent.value is ImageRec) {
+        final def = (ent.value as ImageRec).def;
+        if (def != null) imageDefIds.add(def);
+      }
+    }
+
+    final defsDict = <int, RawDefinition>{};
+    var processed = 0;
+    var lastSlot = -1;
+    try {
+      for (final entry in slots.entries) {
+        lastSlot = entry.key;
+        final ent = entry.value;
+        if (ent.kind == 'obj' &&
+            ent.name == 'CComponentDefinition' &&
+            ent.value != null) {
+          final d = ent.value as DefinitionRec;
+          final b = GeometryBuilder();
+          _fillBuilder(b, d.ents, slots);
+          defsDict[entry.key] = RawDefinition(
+            guid: d.guid,
+            name: d.name,
+            isImage: imageDefIds.contains(entry.key),
+            isGroup: d.isGroup,
+            alwaysFacesCamera: d.facesCamera,
+            shadowsFaceSun: d.shadowsFaceSun,
+            builder: b,
+          );
+          processed++;
+          if (processed % progressInterval == 0) {
+            emitProgress(options, 'legacy_defs', processed, processed);
+            emitLog(options, SkpLogLevel.debug,
+                'Processed $processed component definitions');
+          }
+        }
+      }
+    } catch (e) {
+      throw SkpParseException(
+        'Failed while building component definitions: $e',
+        stage: 'legacy_defs',
+        definitionId: lastSlot,
+        cause: e,
+      );
+    }
+
+    final rootBuilder = GeometryBuilder();
+    _fillBuilder(rootBuilder, walkResult.root, slots);
+
+    emitLog(
+      options,
+      SkpLogLevel.info,
+      'Parse complete: ${defsDict.length} defs (${(sw.elapsedMilliseconds / 1000).toStringAsFixed(2)}s)',
+    );
+
+    return RawParsed()
+      ..version = version
+      // Legacy (pre-2021 MFC) files carry no meta/meta.dat container -
+      // that's a VFF/ZIP-only construct - so there is no known source for
+      // the model's unit-system string here.
+      ..units = null
+      // Scenes come from the scene list in the document tail (see
+      // legacy_pages.dart).
+      ..pages.addAll(readPageList(data, ar) ?? const [])
+      ..layerColors.addAll(layerColors)
+      ..layerHidden.addAll(layerHidden)
+      ..layerIdToName.addAll(layerIdToName)
+      ..materialIdToName.addAll(materialIdToName)
+      ..materials.addAll(materialsMap)
+      ..styles.addAll(const [])
+      ..defsDict.addAll(defsDict)
+      ..root =
+          RawDefinition(guid: 'ROOT', name: 'ROOT_MODEL', builder: rootBuilder);
+  }
+}

@@ -1,0 +1,105 @@
+name: .NET CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      dotnet: ${{ steps.filter.outputs.dotnet }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            dotnet:
+              - 'packages/dotnet/**'
+
+  test:
+    needs: changes
+    if: needs.changes.outputs.dotnet == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '9.0'
+
+      - name: Restore
+        run: |
+          dotnet restore packages/dotnet/OpenSkp.Tests/OpenSkp.Tests.csproj
+          dotnet restore packages/dotnet/OpenSkp.Fragments.Tests/OpenSkp.Fragments.Tests.csproj
+
+      - name: Build
+        run: |
+          dotnet build packages/dotnet/OpenSkp.Tests/OpenSkp.Tests.csproj --no-restore --configuration Release
+          dotnet build packages/dotnet/OpenSkp.Fragments.Tests/OpenSkp.Fragments.Tests.csproj --no-restore --configuration Release
+
+      - name: Test
+        run: |
+          dotnet test packages/dotnet/OpenSkp.Tests/OpenSkp.Tests.csproj --no-build --configuration Release
+          dotnet test packages/dotnet/OpenSkp.Fragments.Tests/OpenSkp.Fragments.Tests.csproj --no-build --configuration Release
+
+  format:
+    needs: changes
+    if: needs.changes.outputs.dotnet == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '9.0'
+
+      - name: Restore
+        run: |
+          dotnet restore packages/dotnet/OpenSkp/OpenSkp.csproj
+          dotnet restore packages/dotnet/OpenSkp.Tests/OpenSkp.Tests.csproj
+          dotnet restore packages/dotnet/OpenSkp.Fragments/OpenSkp.Fragments.csproj
+          dotnet restore packages/dotnet/OpenSkp.Fragments.Tests/OpenSkp.Fragments.Tests.csproj
+
+      - name: Verify formatting (.editorconfig)
+        run: |
+          dotnet format packages/dotnet/OpenSkp/OpenSkp.csproj --verify-no-changes
+          dotnet format packages/dotnet/OpenSkp.Tests/OpenSkp.Tests.csproj --verify-no-changes
+          dotnet format packages/dotnet/OpenSkp.Fragments/OpenSkp.Fragments.csproj --verify-no-changes
+          dotnet format packages/dotnet/OpenSkp.Fragments.Tests/OpenSkp.Fragments.Tests.csproj --verify-no-changes
+
+      - name: Build with analyzers as errors
+        run: |
+          dotnet build packages/dotnet/OpenSkp.Tests/OpenSkp.Tests.csproj --no-restore --configuration Release -warnaserror
+          dotnet build packages/dotnet/OpenSkp.Fragments.Tests/OpenSkp.Fragments.Tests.csproj --no-restore --configuration Release -warnaserror
+
+  # Single stable check name for branch protection to require, regardless of
+  # whether packages/dotnet/** changed - see ci-python.yml's `required` job
+  # for why this exists.
+  required:
+    name: .NET CI required
+    needs: [changes, test, format]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check outcome
+        run: |
+          if [ "${{ needs.changes.outputs.dotnet }}" != "true" ]; then
+            echo "packages/dotnet/** unchanged - nothing to verify"
+            exit 0
+          fi
+          if [ "${{ needs.test.result }}" != "success" ] || [ "${{ needs.format.result }}" != "success" ]; then
+            echo ".NET CI failed"
+            exit 1
+          fi
+          echo ".NET CI passed"

@@ -1,0 +1,79 @@
+name: Dart CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      dart: ${{ steps.filter.outputs.dart }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            dart:
+              - 'packages/dart/**'
+              - 'packages/dart_fragments/**'
+
+  test:
+    needs: changes
+    if: needs.changes.outputs.dart == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@v1
+
+      - name: Install dependencies
+        run: |
+          cd packages/dart
+          dart pub get
+          cd ../dart_fragments
+          dart pub get
+
+      - name: Analyze
+        run: |
+          cd packages/dart
+          dart analyze --fatal-infos
+          cd ../dart_fragments
+          dart analyze --fatal-infos
+
+      - name: Test
+        run: |
+          cd packages/dart
+          dart test
+          cd ../dart_fragments
+          dart test
+
+  # Single stable check name for branch protection to require, regardless of
+  # whether packages/dart/** changed - see ci-python.yml's `required` job
+  # for why this exists.
+  required:
+    name: Dart CI required
+    needs: [changes, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check outcome
+        run: |
+          if [ "${{ needs.changes.outputs.dart }}" != "true" ]; then
+            echo "packages/dart/** and packages/dart_fragments/** unchanged - nothing to verify"
+            exit 0
+          fi
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "Dart CI failed"
+            exit 1
+          fi
+          echo "Dart CI passed"

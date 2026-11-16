@@ -1,0 +1,427 @@
+# Contributing to OpenSKP
+
+First off — **thank you** for considering contributing to OpenSKP! 🎉
+
+This project exists because someone decided a proprietary file format shouldn't be locked behind a proprietary SDK. Every contribution — whether it's a bug fix, a new feature, better documentation, or a whole new platform implementation — helps make 3D data more accessible to everyone.
+
+---
+
+## 📋 Table of Contents
+
+- [Code of Conduct](#code-of-conduct)
+- [Getting Started](#getting-started)
+- [Development Setup](#development-setup)
+- [Running Tests](#running-tests)
+- [Making Changes](#making-changes)
+- [Pull Request Process](#pull-request-process)
+- [Coding Standards](#coding-standards)
+- [Adding a New Platform](#adding-a-new-platform)
+- [Releasing (maintainers)](#releasing-maintainers)
+- [Reporting Bugs](#reporting-bugs)
+- [Suggesting Features](#suggesting-features)
+
+---
+
+## Code of Conduct
+
+This project follows the [Contributor Covenant v2.1](CODE_OF_CONDUCT.md). By participating, you agree to uphold this code. Please report unacceptable behavior to the project maintainers.
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+| Platform | Requirements |
+|:---------|:------------|
+| Python | Python 3.10+, pip |
+| TypeScript | Node.js 22.18+, 24.11+ or 26+ (the build and test tooling needs it; the published package itself runs on 22.12+), npm or pnpm |
+| .NET | .NET SDK 8.0+ |
+| Dart | Dart SDK 3.0+ |
+| C++ | CMake 3.21+, a C++17 compiler |
+| Rust | Rust 1.88 or newer (via `rustup`; CI tests stable and 1.88); the `wasm32-unknown-unknown` target only for the viewer |
+| All | Git, a good hex editor (recommended) |
+
+### Understanding the Codebase
+
+Before diving in, we recommend reading:
+
+1. **[Architecture](docs/ARCHITECTURE.md)** — Understand the three-layer design
+2. **[Binary Format Spec](docs/BINARY_FORMAT.md)** — Learn how SKP files are structured
+3. **[API Design](docs/API_DESIGN.md)** — Understand the cross-platform API contract
+4. **[Research Methodology](research/METHODOLOGY.md)** — How we reverse-engineered the format
+
+---
+
+## Development Setup
+
+### Python
+
+```bash
+# Clone the repository
+git clone https://github.com/iamahsanmehmood/openskp.git
+cd openskp
+
+# Create and activate a virtual environment
+cd packages/python
+python -m venv .venv
+
+# Linux / macOS
+source .venv/bin/activate
+
+# Windows
+.venv\Scripts\activate
+
+# Install in editable mode with dev dependencies
+pip install -e ".[dev]"
+```
+
+### TypeScript
+
+```bash
+cd packages/typescript
+npm install
+npm test
+```
+
+### .NET
+
+```bash
+cd packages/dotnet/OpenSkp.Tests
+dotnet test
+```
+
+### Dart
+
+```bash
+cd packages/dart
+dart pub get
+dart test
+```
+
+### C++
+
+```bash
+cmake -S packages/cpp -B build/cpp -DOPENSKP_BUILD_TESTS=ON
+cmake --build build/cpp
+ctest --test-dir build/cpp --output-on-failure
+```
+
+### Rust
+
+```bash
+cd packages/rust
+cargo test --release
+```
+
+The writer's reference files (`packages/rust/tests/fixtures/create_reference/*.skp`) come from
+the C++ writer. After a change to `packages/cpp/src/create.cpp`, regenerate them with
+`python packages/rust/tests/fixtures/create_reference/regenerate.py` (needs a C++17 compiler),
+then run `cargo test --release --test create_reference_test` to see what the Rust writer must
+follow.
+
+---
+
+## Running Tests
+
+### Python
+
+```bash
+cd packages/python
+
+# Run the full test suite
+pytest
+
+# Run with coverage report
+pytest --cov=openskp --cov-report=html
+
+# Run a specific test file
+pytest tests/test_tlv_parser.py
+
+# Run tests matching a keyword
+pytest -k "test_vertex"
+```
+
+See [Development Setup](#development-setup) above for the equivalent test
+commands in TypeScript, .NET, Dart, C++, and Rust.
+
+### Test Fixtures
+
+Test SKP files are stored in `packages/python/tests/fixtures/`. If you need to add new test files:
+
+1. Keep them small (< 1 MB if possible)
+2. Document what each test file contains
+3. Never commit files you don't have the right to distribute
+
+---
+
+## Making Changes
+
+### Branch Naming Convention
+
+| Type | Format | Example |
+|:-----|:-------|:--------|
+| Feature | `feat/short-description` | `feat/uv-coordinate-parsing` |
+| Bug fix | `fix/short-description` | `fix/face-normal-calculation` |
+| Documentation | `docs/short-description` | `docs/add-export-examples` |
+| Refactor | `refactor/short-description` | `refactor/tlv-parser-cleanup` |
+| Platform | `platform/name` | `platform/typescript-init` |
+
+### Commit Message Format
+
+We follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<type>(<scope>): <short description>
+
+<optional body>
+
+<optional footer>
+```
+
+**Examples:**
+
+```
+feat(parser): add UV coordinate extraction from face tags
+
+fix(export): correct Y-up coordinate conversion in GLB exporter
+
+docs: update binary format spec with new tag discoveries
+
+test(python): add regression test for nested component instances
+```
+
+**Types:** `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `chore`, `ci`
+
+---
+
+## Pull Request Process
+
+1. **Fork** the repository and create your branch from `main`
+2. **Write code** and add/update tests as needed
+3. **Run the full test suite** and ensure all tests pass
+4. **Update documentation** if your change affects the API or behavior
+5. **Submit a PR** using the [pull request template](.github/PULL_REQUEST_TEMPLATE.md)
+6. **Wait for review** — maintainers aim to review within 48 hours
+
+### PR Checklist
+
+- [ ] Tests pass locally (`pytest`)
+- [ ] New code has test coverage
+- [ ] Documentation is updated (if applicable)
+- [ ] Commit messages follow conventional commits
+- [ ] No unrelated changes are included
+- [ ] PR description clearly explains the change
+
+### Review Process
+
+- At least **one maintainer approval** is required
+- CI must pass (linting, tests, type checking)
+- Discussions should be resolved before merge
+- Squash merge is preferred for single-feature PRs
+
+---
+
+## Coding Standards
+
+### Python
+
+| Rule | Standard |
+|:-----|:---------|
+| Formatter | `black` (line length 88) |
+| Linter | `ruff` |
+| Type checking | `mypy` (strict mode) |
+| Docstrings | Google style |
+| Imports | `isort` (profile: black) |
+| Minimum version | Python 3.10 |
+
+```python
+# ✅ Good
+def parse_vertex(data: bytes, offset: int = 0) -> tuple[float, float, float]:
+    """Parse a 3D vertex from raw bytes.
+
+    Args:
+        data: Raw byte buffer containing vertex data.
+        offset: Byte offset to start reading from.
+
+    Returns:
+        Tuple of (x, y, z) coordinates in inches.
+
+    Raises:
+        ParseError: If the buffer is too short for a complete vertex.
+    """
+    ...
+```
+
+### TypeScript
+
+| Rule | Standard |
+|:-----|:---------|
+| Formatter | `prettier` |
+| Linter | `eslint` |
+| Type checking | `strict: true` in tsconfig |
+| Module system | ESM |
+| Minimum version | Node.js 22.12 to use the package; building from source needs 22.18+, 24.11+ or 26+ |
+
+### C++
+
+| Rule | Standard |
+|:-----|:---------|
+| Language | C++17 |
+| Formatter | `clang-format` 18 |
+| Style | Google, with a 100-column limit |
+| Local format | `cmake --build build/cpp --target openskp-format` |
+| Local check | `cmake --build build/cpp --target openskp-format-check` |
+
+Formatting is enforced by C++ CI. Configure with
+`-DOPENSKP_CLANG_FORMAT_EXECUTABLE=/path/to/clang-format` to select a specific
+local executable.
+
+### Rust
+
+| Rule | Standard |
+|:-----|:---------|
+| Edition | 2021 |
+| Formatter | `rustfmt` (default settings, 100-column limit), enforced by Rust CI |
+| Linter | `cargo clippy --all-targets -- -D warnings` (enforced by Rust CI) |
+| Dependencies | None: the crate uses `std` only |
+
+### General Principles
+
+- **Explicit over implicit** — Name things clearly, avoid magic numbers
+- **Parse, don't validate** — Convert raw bytes into typed structures as early as possible
+- **Fail loudly** — Throw descriptive errors with byte offsets when parsing fails
+- **Zero external dependencies** for the core parser — stdlib only
+- **Cross-platform parity** — If you add a feature in one language, document the expected behavior so other platforms can follow
+
+---
+
+## Adding a New Platform
+
+Want to bring OpenSKP to a new language? Fantastic! Here's the process:
+
+### 1. Propose It First
+
+Open an issue with the `platform` label describing:
+- The target language and ecosystem
+- Your experience with that language
+- Estimated timeline
+
+### 2. Follow the Architecture
+
+All platform implementations **must** follow the [three-layer architecture](docs/ARCHITECTURE.md):
+
+```
+Layer 1: Binary Parser     → Read raw TLV from model.dat
+Layer 2: Structured Model  → Build typed model objects
+Layer 3: Export Engines     → GLB, OBJ, JSON export
+```
+
+### 3. Implement the API Contract
+
+Follow the [API Design](docs/API_DESIGN.md) specification. The public API should feel natural in the target language while maintaining behavioral equivalence.
+
+### 4. Port the Test Suite
+
+Every platform must pass the same behavioral tests against the same fixture files.
+
+### 5. Directory Structure
+
+```
+<language>/
+├── README.md          # Platform-specific README
+├── src/               # Source code
+├── tests/             # Test suite
+└── <package-config>   # pyproject.toml / package.json / pubspec.yaml
+```
+
+---
+
+## Releasing (maintainers)
+
+Each language is released independently by pushing a tag; the corresponding
+`.github/workflows/release-*.yml` picks it up and publishes to that
+language's registry. Bump the version in every file that references it
+*before* tagging — package manifest, README platform table, and
+[docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md)'s install table — then
+tag exactly as below:
+
+| Language | Version lives in | Tag to push | Registry |
+|---|---|---|---|
+| Python | `packages/python/pyproject.toml` + `src/openskp/__init__.py` | `python-vX.Y.Z` | PyPI |
+| TypeScript | `packages/typescript/package.json` (+ regenerate `package-lock.json`) | `typescript-vX.Y.Z` | npm |
+| .NET | `packages/dotnet/OpenSkp/OpenSkp.csproj` (`<Version>`) | `nuget-vX.Y.Z` | NuGet |
+| Dart | `packages/dart/pubspec.yaml` | **`vX.Y.Z`** (bare — not `dart-vX.Y.Z`) | pub.dev |
+
+The Dart entry is easy to get wrong: `release-dart.yml` listens for both
+`dart-v*` and bare `v*`, which looks like `dart-v0.3.0` should be the
+"correct", collision-avoiding choice. It isn't — pub.dev's OIDC
+trusted-publisher for this package is registered against the bare
+`vX.Y.Z` pattern specifically, so `dart-v0.3.0` builds and validates the
+package but fails at the upload step with *"Expected tag 'vX.Y.Z'"* (confirmed
+when releasing 0.3.0). No other workflow in this repo listens for bare
+`v*`, so pushing it only triggers the Dart release — verify that's still
+true (`grep -A2 "tags:" .github/workflows/*.yml`) before relying on it,
+in case a future workflow adds its own bare-`v*` trigger.
+
+**Push tags one at a time, not batched in one `git push`.** Confirmed
+directly when releasing 1.3.0 across all 5 languages: `git push origin
+python-v1.3.0 typescript-v1.3.0 nuget-v1.3.0 cpp-v1.3.0 v1.3.0` in a
+single command succeeded at the git level (all 5 landed on the remote,
+confirmed via `git ls-remote --tags`) but triggered **zero** workflow
+runs — no push event fired for any of them. Deleting and re-pushing each
+tag individually (`git push origin :refs/tags/<tag>` then `git push
+origin <tag>`) triggered the corresponding release workflow correctly
+every time. Root cause not confirmed (a GitHub webhook-batching quirk on
+multi-ref pushes is the leading suspect), but the workaround is simple:
+one `git push origin <tag>` per tag, checking each one actually queued a
+run before moving to the next - `gh run list --branch <tag>` does **not**
+reliably show tag-triggered runs (confirmed empty even for runs that did
+fire), use `gh api repos/<owner>/<repo>/actions/runs?event=push` and
+filter `.head_branch` instead. Releasing 1.4.0 this way (one tag per push,
+`python-v1.4.0`, `typescript-v1.4.0`, `nuget-v1.4.0`, `cpp-v1.4.0`, then the
+bare `v1.4.0`, each checked) queued every release workflow, and all five
+packages appeared on their registries. NuGet is the slow one: both packages
+were pushed and answered "Created" but the package pages returned 404 for
+about half an hour while NuGet validated them, so a green workflow is not the
+same as a visible package; check the registry before announcing. If the
+NuGet step fails with `403 (The specified API key has expired)` the build is
+fine and nothing was pushed: create a new key on nuget.org (Push scope, glob
+`OpenSkp*`, 365 days), set it with `gh secret set NUGET_TOKEN`, and re-run only
+the failed job (`gh run rerun <run-id> --failed`); no new tag is needed, and
+the push uses `--skip-duplicate`. Copy the key when nuget.org shows it, right
+after creating it; it is shown only once.
+
+---
+
+## Reporting Bugs
+
+Use the [Bug Report](https://github.com/iamahsanmehmood/openskp/issues/new?template=bug_report.md) issue template. Please include:
+
+- OpenSKP version and platform (Python/TypeScript/Dart)
+- Operating system
+- SketchUp version that created the `.skp` file
+- Minimal reproduction steps
+- Expected vs. actual behavior
+- Error messages and stack traces
+
+> [!NOTE]
+> If you can share the `.skp` file that causes the issue (or a minimal reproduction), it dramatically speeds up debugging.
+
+---
+
+## Suggesting Features
+
+Use the [Feature Request](https://github.com/iamahsanmehmood/openskp/issues/new?template=feature_request.md) issue template. Describe:
+
+- The problem you're trying to solve
+- Your proposed solution
+- Alternative approaches you've considered
+
+---
+
+## 💙 Thank You
+
+Every contribution, no matter how small, makes OpenSKP better. Whether you're fixing a typo in the docs or implementing an entirely new export format — you're helping make 3D data more accessible to the world.
+
+Welcome aboard! 🚀

@@ -1,0 +1,84 @@
+{
+  "name": "skp-core-custom",
+  "version": "1.5.0-custom.0",
+  "description": "Open-source SketchUp (.skp) binary file parser, writer, and converter — extract geometry, metadata, layers, and materials; create and edit .skp files; convert to GLB, OBJ, STL, PLY, DXF, and IFC4. Works in browser and Node.js.",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts",
+    "postbuild": "node copy-dist.js",
+    "copy-dist": "node copy-dist.js",
+    "test": "vitest run",
+    "bench:instanced": "vite-node tests/bench/instanced-bench.ts",
+    "bench:vertex-store": "node --expose-gc ./node_modules/vite-node/dist/cli.mjs tests/bench/vertex-store-bench.ts",
+    "bench:edge-store": "node --expose-gc ./node_modules/vite-node/dist/cli.mjs tests/bench/edge-store-bench.ts",
+    "lint": "eslint src/",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "sketchup",
+    "skp",
+    "3d",
+    "parser",
+    "writer",
+    "converter",
+    "conversion",
+    "glb",
+    "gltf",
+    "bim",
+    "cad",
+    "geometry",
+    "three.js",
+    "webgl",
+    "dxf",
+    "autocad",
+    "ifc",
+    "obj",
+    "stl",
+    "ply"
+  ],
+  "author": "Ahsan Mehmood",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iamahsanmehmood/openskp",
+    "directory": "packages/typescript"
+  },
+  "homepage": "https://openskp.com",
+  "bugs": "https://github.com/iamahsanmehmood/openskp/issues",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "earcut": "^3.1.0",
+    "fflate": "^0.8.0",
+    "flatbuffers": "^25.9.23"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@thatopen/fragments": "^3.4.7",
+    "eslint": "10.14.0",
+    "three": "^0.187.0",
+    "tsup": "^9.0.0",
+    "typescript": "^5.3.0",
+    "typescript-eslint": "8.72.1",
+    "vite-node": "^6.0.0",
+    "vitest": "^5.0.1",
+    "web-ifc": "^0.0.78"
+  },
+  "overrides": {
+    "postcss": "8.5.23",
+    "esbuild": "^0.28.1"
+  }
+}

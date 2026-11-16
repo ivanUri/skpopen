@@ -1,0 +1,960 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:archive/archive.dart';
+import 'package:xml/xml.dart';
+
+import 'model.dart';
+import 'observability.dart';
+import 'tlv.dart';
+import 'vff.dart';
+
+class GeometryBuilderFace {
+  List<List<(int edgeId, int orientation)>> loops = [];
+  (double, double, double) normal = (0.0, 0.0, 1.0);
+  int? materialId;
+  int? backMaterialId;
+  List<double>? uvTransform;
+  List<double>? uvTransformBack;
+  bool uvProjected = false;
+  bool uvProjectedBack = false;
+  bool hidden = false;
+}
+
+class GeometryBuilderInstance {
+  int offset = 0;
+  String? refGuid;
+  int? refIdx;
+  String? name;
+  List<double> matrix = [];
+  int? materialId;
+  bool hidden = false;
+  List<TlvNode> children = const [];
+  /// This instance's own explicit layer override (unresolved numeric
+  /// TLV ID), or null when it has none - an instance without one
+  /// inherits its *placement's* layer, only resolvable once the scene
+  /// graph is flattened (see scene.dart's InstanceNode.layer).
+  int? layerId;
+  /// Dynamic Component key/value properties attached directly to this
+  /// instance - populated eagerly here for both legacy (pre-2021 MFC,
+  /// via legacy.dart's extractLegacyDynamicProperties) and VFF
+  /// instances (via extractDynamicProperties on this instance's own
+  /// D007/DC05 children).
+  Map<String, String>? properties;
+}
+
+/// Accumulates the raw geometry extracted for one component definition (or
+/// the implicit ROOT definition). Mirrors Python's _GeometryBuilder.
+/// The analytic frame of a Curve that is one arc: the points
+/// `center + cos(t) * xAxis + sin(t) * yAxis` for `t` from [startAngle] to
+/// [endAngle].
+class ArcFrame {
+  final (double, double, double) center;
+  final (double, double, double) normal;
+  final (double, double, double) xAxis;
+  final (double, double, double) yAxis;
+  final double startAngle;
+  final double endAngle;
+  ArcFrame({
+    required this.center,
+    required this.normal,
+    required this.xAxis,
+    required this.yAxis,
+    required this.startAngle,
+    required this.endAngle,
+  });
+}
+
+class GeometryBuilder {
+  final Map<int, (double, double, double)> vertices = {};
+  final Map<int, (int?, int?)> edges = {};
+  final Map<int, int> edgeFlags = {};
+
+  /// Edge id -> entity id of the Curve the edge belongs to (SketchUp's
+  /// `Edge#curve`). Absent means the edge belongs to no curve.
+  final Map<int, int> edgeCurves = {};
+
+  /// Curve id -> its analytic arc, for the curves that are arcs.
+  final Map<int, ArcFrame> arcCurves = {};
+  final Map<int, GeometryBuilderFace> faces = {};
+  final List<GeometryBuilderInstance> instances = [];
+  final List<SectionPlane> sectionPlanes = [];
+  final List<TextEntity> texts = [];
+  final List<Dimension> dimensions = [];
+  final List<ConstructionLine> constructionLines = [];
+  final List<ConstructionPoint> constructionPoints = [];
+}
+
+class RawTexture {
+  String filename;
+  double xScale;
+  double yScale;
+  Uint8List? data;
+  RawTexture(
+      {required this.filename,
+      required this.xScale,
+      required this.yScale,
+      this.data});
+}
+
+class RawMaterial {
+  String name;
+  int r, g, b, a;
+  double transparency;
+  bool colorized;
+  int colorizeType;
+  RawTexture? texture;
+  RawMaterial({
+    required this.name,
+    this.r = 128,
+    this.g = 128,
+    this.b = 128,
+    this.a = 255,
+    this.transparency = 1.0,
+    this.colorized = false,
+    this.colorizeType = 0,
+    this.texture,
+  });
+}
+
+class RawStyle {
+  String name;
+  (int, int, int)? frontColor;
+  (int, int, int)? backColor;
+  RawStyle({required this.name, this.frontColor, this.backColor});
+}
+
+class RawDefinition {
+  String? guid;
+  String? name;
+  bool alwaysFacesCamera;
+  bool shadowsFaceSun;
+  bool isImage;
+  bool isGroup;
+  GeometryBuilder builder;
+  RawDefinition({
+    this.guid,
+    this.name,
+    this.alwaysFacesCamera = false,
+    this.shadowsFaceSun = false,
+    this.isImage = false,
+    this.isGroup = false,
+    GeometryBuilder? builder,
+  }) : builder = builder ?? GeometryBuilder();
+}
+
+class Geometry {
+  static TlvNode? findChildTag(List<TlvNode> nodes, String target) {
+    for (final n in nodes) {
+      if (n.tag == target) return n;
+      final res = findChildTag(n.children, target);
+      if (res != null) return res;
+    }
+    return null;
+  }
+
+  static void findAllNodesRec(
+      List<TlvNode> nodes, String targetTag, List<TlvNode> results) {
+    for (final n in nodes) {
+      if (n.tag == targetTag) results.add(n);
+      findAllNodesRec(n.children, targetTag, results);
+    }
+  }
+
+  /// Mirrors Python's extract_entity_id exactly: only DE05 and a
+  /// DE05-prefixed DC05 resolve an ID here (unlike collectLayers /
+  /// collectMaterialIds, which also fall back to a bare var-int read when
+  /// the DC05 payload lacks the DE05 marker).
+  static int? extractEntityId(TlvNode node) {
+    for (final child in node.children) {
+      if (child.tag == 'DE05') {
+        return Tlv.parseVarInt(child.payload, 0, child.payload.length);
+      }
+      if (child.tag == 'DC05') {
+        final payload = child.payload;
+        if (payload.length >= 2 && payload[0] == 0xDE && payload[1] == 0x05) {
+          final de05Len = Tlv.readU32(payload, 2);
+          return Tlv.parseVarInt(payload, 6, de05Len);
+        }
+      }
+    }
+    for (final child in node.children) {
+      final res = extractEntityId(child);
+      if (res != null) return res;
+    }
+    return null;
+  }
+
+  /// Entity-ID resolution used by collectLayers / collectMaterialIds: falls
+  /// back to a raw var-int read of the whole DC05 payload when it doesn't
+  /// start with the DE05 marker.
+  static int _parseIdFromDc05(Uint8List payload) {
+    if (payload.length >= 2 && payload[0] == 0xDE && payload[1] == 0x05) {
+      final de05Len = Tlv.readU32(payload, 2);
+      return Tlv.parseVarInt(payload, 6, de05Len);
+    }
+    return Tlv.parseVarInt(payload, 0, payload.length);
+  }
+
+  static (List<double>?, List<double>?) extractUvTransforms(
+      Uint8List dc05Payload) {
+    final dd05 = Tlv.findFlat(Tlv.parseFlat(dc05Payload), 'DD05');
+    if (dd05 == null) return (null, null);
+    final b136 = Tlv.findFlat(Tlv.parseFlat(dd05), 'B136');
+    if (b136 == null) return (null, null);
+    final b236 = Tlv.findFlat(Tlv.parseFlat(b136), 'B236');
+    if (b236 == null) return (null, null);
+    final t1027 = Tlv.findFlat(Tlv.parseFlat(b236), '1027');
+    if (t1027 == null) return (null, null);
+
+    final sides = Tlv.parseFlat(t1027);
+    final front = _extractUvSide(sides, '1127');
+    final back = _extractUvSide(sides, '1227');
+    return (front, back);
+  }
+
+  static List<double>? _extractUvSide(
+      List<(String, Uint8List)> sides, String sideTag) {
+    final side = Tlv.findFlat(sides, sideTag);
+    if (side == null) return null;
+    final t1327 = Tlv.findFlat(Tlv.parseFlat(side), '1327');
+    if (t1327 == null) return null;
+    final t1527 = Tlv.findFlat(Tlv.parseFlat(t1327), '1527');
+    if (t1527 == null || t1527.length != 72) return null;
+    return [for (int i = 0; i < 9; i++) Tlv.readF64(t1527, i * 8)];
+  }
+
+  /// Dynamic Component key/value pairs from an instance's D007 attribute
+  /// container. Mirrors Python's _core.extract_dynamic_properties and
+  /// TypeScript's extractDynamicProperties: DC05's payload isn't part of
+  /// the main model.dat TLV tree (DC05 isn't a top-level container tag),
+  /// so it's re-parsed here with its own, more specific container-tag set
+  /// - within that tree, a B636 tag carries a property key and the AD38
+  /// tag immediately after it carries that property's value.
+  static const Set<String> _propContainerTags = {
+    'DD05', 'B536', 'B136', 'B236', 'B336', 'B036', 'A438', 'AE38',
+  };
+
+  static Map<String, String> extractDynamicProperties(TlvNode d007) {
+    final dc05 = d007.children.where((c) => c.tag == 'DC05').firstOrNull;
+    if (dc05 == null) return {};
+    final propElements =
+        Tlv.parseRecursive(dc05.payload, 0, dc05.payload.length, _propContainerTags);
+    final properties = <String, String>{};
+    String? currentKey;
+    void extractProps(List<TlvNode> nodes) {
+      for (final n in nodes) {
+        if (n.tag == 'B636') {
+          // Property key name (UTF-8 string)
+          currentKey = utf8.decode(n.payload, allowMalformed: true);
+        } else if (n.tag == 'AD38' && currentKey != null) {
+          // Property value (UTF-8 string) matching preceding key
+          properties[currentKey!] = utf8.decode(n.payload, allowMalformed: true);
+          currentKey = null;
+        }
+        extractProps(n.children);
+      }
+    }
+
+    extractProps(propElements);
+    return properties;
+  }
+
+  // AF38 (Length) and A938 (plain Float) both encode as a flat 8-byte
+  // float64 but are genuinely different tags - real SketchUp/FrameBuilder
+  // data uses both for different keys.
+  static const Set<String> _vffAttrDoubleTags = {'AF38', 'A938'};
+
+  /// Decode one A438-wrapped attribute value node into a native Dart
+  /// value. A438 with no children is null; otherwise it has exactly one
+  /// child holding the value's own type tag. An unrecognized type tag (or
+  /// a payload of the wrong size for its tag) is left undecoded (returns
+  /// null) rather than guessed at - matching this project's standing rule
+  /// to never assume an unverified binary layout. Mirrors Python's
+  /// `_decode_vff_attr_value` exactly (7 of the format's 9 documented
+  /// types - no native bool/time_t tag has ever been observed in real
+  /// data, so 7/9 is the real ceiling, not an arbitrary stopping point).
+  static Object? _decodeVffAttrValue(TlvNode a438Node) {
+    if (a438Node.children.isEmpty) return null;
+    final child = a438Node.children.first;
+    final tag = child.tag;
+    final payload = child.payload;
+    if (tag == 'AD38') return utf8.decode(payload, allowMalformed: true);
+    if (_vffAttrDoubleTags.contains(tag) && payload.length == 8) {
+      return Tlv.readF64(payload, 0);
+    }
+    if (tag == 'A738' && payload.length == 4) return Tlv.readI32(payload, 0);
+    if ((tag == 'B438' || tag == 'B538') && payload.length == 24) {
+      return [Tlv.readF64(payload, 0), Tlv.readF64(payload, 8), Tlv.readF64(payload, 16)];
+    }
+    if (tag == 'AE38') {
+      return child.children.map(_decodeVffAttrValue).toList();
+    }
+    return null;
+  }
+
+  /// Render an already-typed VFF attribute value as a string, matching
+  /// [extractDynamicProperties]'s pre-existing `Map<String, String>`
+  /// contract - mirrors Python's `_stringify_vff_attr_value` exactly.
+  static String stringifyVffAttrValue(Object? value) {
+    if (value == null) return '';
+    if (value is List) {
+      return value.map(stringifyVffAttrValue).join(',');
+    }
+    return value.toString();
+  }
+
+  /// Extract EVERY attribute dictionary attached to a D007 container node,
+  /// keyed by the dictionary's own declared name (tag B436) rather than
+  /// merged into one flat dict - mirrors Python's
+  /// `_core.extract_attribute_dictionaries` exactly (openskp#254), decoding
+  /// every value type the format carries rather than only strings
+  /// (openskp#285) - see [_decodeVffAttrValue] for the full type table
+  /// this project has ground-truthed.
+  ///
+  /// Each dictionary is a B436 (name) node immediately followed by a
+  /// sibling entries container (typically B536) holding that dictionary's
+  /// own B636 (key name) / A438 (type-tagged value) pairs. Returns `{}`
+  /// when the entity carries no DC05 subtree at all.
+  ///
+  /// NOT the same view as [extractDynamicProperties] above, which flattens
+  /// every dictionary's entries into one bag regardless of which named
+  /// dictionary each pair came from - that established, if non-
+  /// canonically-named, contract is left untouched since real callers
+  /// depend on it.
+  static Map<String, Map<String, Object?>> extractAttributeDictionaries(TlvNode d007) {
+    final dictionaries = <String, Map<String, Object?>>{};
+    final dc05 = d007.children.where((c) => c.tag == 'DC05').firstOrNull;
+    if (dc05 == null) return dictionaries;
+    final propElements =
+        Tlv.parseRecursive(dc05.payload, 0, dc05.payload.length, _propContainerTags);
+
+    // currentKey lives OUTSIDE extractEntries (reset per dictionary right
+    // before each call, in walk below) rather than as a local inside it -
+    // kept for the same defensive reason as extractDynamicProperties's own
+    // extractProps: a real file's exact nesting isn't something to assume
+    // beyond what's been ground-truthed, even though B636/A438 are direct
+    // siblings here (unlike that function's B636/AD38, which can be split
+    // across a recursion level).
+    String? currentKey;
+    void extractEntries(List<TlvNode> nodes, Map<String, Object?> entries) {
+      for (final n in nodes) {
+        if (n.tag == 'B636') {
+          currentKey = utf8.decode(n.payload, allowMalformed: true);
+        } else if (n.tag == 'A438' && currentKey != null) {
+          entries[currentKey!] = _decodeVffAttrValue(n);
+          currentKey = null;
+        } else {
+          extractEntries(n.children, entries);
+        }
+      }
+    }
+
+    void walk(List<TlvNode> nodes) {
+      for (var i = 0; i < nodes.length; i++) {
+        if (nodes[i].tag == 'B436') {
+          final name = utf8.decode(nodes[i].payload, allowMalformed: true);
+          final entries = <String, Object?>{};
+          currentKey = null;
+          if (i + 1 < nodes.length) {
+            extractEntries(nodes[i + 1].children, entries);
+          }
+          dictionaries[name] = entries;
+        } else {
+          walk(nodes[i].children);
+        }
+      }
+    }
+
+    walk(propElements);
+    return dictionaries;
+  }
+
+  // Matches SketchUp's own auto-generated placeholder definition names
+  // ("Group#1", "Component#12"), which carry no more meaning than the
+  // internal index they'd otherwise fall back to - mirrors Python's
+  // _is_generic_definition_name()/C++'s is_generic_definition_name()
+  // exactly (same pattern, same purpose). Shared by scene.dart's and
+  // instanced_scene.dart's own display-name resolution.
+  static final RegExp _genericDefinitionNamePattern = RegExp(r'^(?:Group|Component)\d*#\d+$');
+
+  static bool isGenericDefinitionName(String name) => _genericDefinitionNamePattern.hasMatch(name);
+
+  // "name"/"label"/"code" checked in this order, first dictionary (other
+  // than dynamic_attributes/SU_InstanceSet) and first key found wins -
+  // mirrors Python's/C++'s own name_override_keys default.
+  static const List<String> _nameOverrideKeys = ['name', 'label', 'code'];
+
+  /// Look for a display-name override in any attribute dictionary the
+  /// instance carries OTHER than "dynamic_attributes" (SketchUp's own
+  /// Dynamic Components dictionary, already surfaced separately as
+  /// `properties`) or "SU_InstanceSet" - whichever third-party plugin
+  /// wrote it (FrameBuilder's "name", TechSteel's "label", etc.), same
+  /// fallback order and exclusions as Python's/C++'s own instanced_scene/
+  /// scene name-resolution. Returns `null` when no override is present.
+  static String? findNameOverride(Map<String, Map<String, Object?>>? attributeDicts) {
+    if (attributeDicts == null) return null;
+    for (final dictName in attributeDicts.keys) {
+      if (dictName == 'dynamic_attributes' || dictName == 'SU_InstanceSet') continue;
+      final entries = attributeDicts[dictName]!;
+      for (final key in _nameOverrideKeys) {
+        if (!entries.containsKey(key)) continue;
+        final val = stringifyVffAttrValue(entries[key]);
+        if (val.isNotEmpty) return val;
+      }
+    }
+    return null;
+  }
+
+  static void extractGeometryFromNodes(
+      List<TlvNode> elements, GeometryBuilder builder) {
+    for (final el in elements) {
+      final tag = el.tag;
+
+      if (tag == 'C409') {
+        final vId = extractEntityId(el);
+        final c509 = findChildTag(el.children, 'C509');
+        if (vId != null && c509 != null && c509.payload.length >= 24) {
+          final x = Tlv.readF64(c509.payload, 0);
+          final y = Tlv.readF64(c509.payload, 8);
+          final z = Tlv.readF64(c509.payload, 16);
+          builder.vertices[vId] = (x, y, z);
+        }
+      } else if (tag == 'B80B') {
+        final eId = extractEntityId(el);
+        if (eId != null) {
+          final v1Node = findChildTag(el.children, 'B90B');
+          final v2Node = findChildTag(el.children, 'BA0B');
+          final v1 = v1Node != null
+              ? Tlv.parseVarInt(v1Node.payload, 0, v1Node.payload.length)
+              : null;
+          final v2 = v2Node != null
+              ? Tlv.parseVarInt(v2Node.payload, 0, v2Node.payload.length)
+              : null;
+          builder.edges[eId] = (v1, v2);
+
+          final d007 = el.children.where((c) => c.tag == 'D007').firstOrNull;
+          if (d007 != null) {
+            final d307 =
+                d007.children.where((c) => c.tag == 'D307').firstOrNull;
+            if (d307 != null && d307.payload.isNotEmpty) {
+              builder.edgeFlags[eId] = d307.payload[0];
+            }
+          }
+
+          // BB0B = the parent Curve's entity id (Edge#curve).
+          final bb0b = findChildTag(el.children, 'BB0B');
+          if (bb0b != null && bb0b.payload.isNotEmpty) {
+            final curveId =
+                Tlv.parseVarInt(bb0b.payload, 0, bb0b.payload.length);
+            if (curveId != 0) builder.edgeCurves[eId] = curveId;
+          }
+        }
+      } else if (tag == '2C4C') {
+        // A Curve (384A: its entity id and edge count) and, when the curve is
+        // an arc, 2D4C: 16 doubles - center, normal, the plane constant, x
+        // axis, y axis, radius, start angle, end angle. Checked against
+        // SketchUp 2025's own SUArcCurve getters.
+        final curve = findChildTag(el.children, '384A');
+        final arc = findChildTag(el.children, '2D4C');
+        if (curve != null && arc != null && arc.payload.length == 128) {
+          final curveId = extractEntityId(curve);
+          if (curveId != null) {
+            double f(int i) => Tlv.readF64(arc.payload, i * 8);
+            builder.arcCurves[curveId] = ArcFrame(
+              center: (f(0), f(1), f(2)),
+              normal: (f(3), f(4), f(5)),
+              xAxis: (f(7), f(8), f(9)),
+              yAxis: (f(10), f(11), f(12)),
+              startAngle: f(14),
+              endAngle: f(15),
+            );
+          }
+        }
+      } else if (tag == 'AC0D') {
+        final fId = extractEntityId(el);
+        if (fId != null) {
+          var normal = (0.0, 0.0, 1.0);
+          final ad0d = findChildTag(el.children, 'AD0D');
+          if (ad0d != null && ad0d.payload.length >= 24) {
+            normal = (
+              Tlv.readF64(ad0d.payload, 0),
+              Tlv.readF64(ad0d.payload, 8),
+              Tlv.readF64(ad0d.payload, 16),
+            );
+          }
+
+          final ae0d = findChildTag(el.children, 'AE0D');
+          final loops = <List<(int, int)>>[];
+          if (ae0d != null) {
+            final loopNodes = <TlvNode>[];
+            findAllNodesRec(ae0d.children, '9411', loopNodes);
+            for (final ln in loopNodes) {
+              final coEdges = <(int, int)>[];
+              final coNodes = <TlvNode>[];
+              findAllNodesRec(ln.children, 'A00F', coNodes);
+              for (final cn in coNodes) {
+                final payload = cn.payload;
+                int? edgeId;
+                int? orient;
+                int subPos = 0;
+                while (subPos < payload.length - 6) {
+                  final b0 = payload[subPos];
+                  final b1 = payload[subPos + 1];
+                  final subSize = Tlv.readU32(payload, subPos + 2);
+                  if (subPos + 6 + subSize <= payload.length) {
+                    final val = Tlv.parseVarInt(payload, subPos + 6, subSize);
+                    if (b0 == 0xA1 && b1 == 0x0F) {
+                      edgeId = val;
+                    } else if (b0 == 0xA2 && b1 == 0x0F) {
+                      orient = val;
+                    }
+                  }
+                  subPos += 6 + subSize;
+                }
+                if (edgeId != null && orient != null) {
+                  // Normalize to the documented CoEdge contract (+1 = same
+                  // direction as the edge, -1 = reversed) - the raw A20F
+                  // value is SketchUp's own bit (0 = forward, 1 = reversed).
+                  coEdges.add((edgeId, orient == 0 ? 1 : -1));
+                }
+              }
+              if (coEdges.isNotEmpty) loops.add(coEdges);
+            }
+          }
+
+          int? faceMatId;
+          List<double>? uvFront;
+          List<double>? uvBack;
+          var faceHidden = false;
+          final d007 = el.children.where((c) => c.tag == 'D007').firstOrNull;
+          if (d007 != null) {
+            final d107 =
+                d007.children.where((c) => c.tag == 'D107').firstOrNull;
+            if (d107 != null) {
+              faceMatId = Tlv.parseVarInt(d107.payload, 0, d107.payload.length);
+            }
+            final dc05 =
+                d007.children.where((c) => c.tag == 'DC05').firstOrNull;
+            if (dc05 != null) {
+              final (f, b) = extractUvTransforms(dc05.payload);
+              uvFront = f;
+              uvBack = b;
+            }
+            // D307 = display flags, same record edges already read (base
+            // 0x06, +0x01 hidden) - faces carry the identical tag under
+            // their own D007 container.
+            final d307 =
+                d007.children.where((c) => c.tag == 'D307').firstOrNull;
+            if (d307 != null && d307.payload.isNotEmpty) {
+              faceHidden = (d307.payload[0] & 0x01) != 0;
+            }
+          }
+
+          int? backMatId;
+          final af0d = el.children.where((c) => c.tag == 'AF0D').firstOrNull;
+          if (af0d != null && af0d.payload.isNotEmpty) {
+            backMatId = Tlv.parseVarInt(af0d.payload, 0, af0d.payload.length);
+          }
+
+          builder.faces[fId] = GeometryBuilderFace()
+            ..loops = loops
+            ..normal = normal
+            ..materialId = faceMatId
+            ..backMaterialId = backMatId
+            ..uvTransform = uvFront
+            ..uvTransformBack = uvBack
+            ..hidden = faceHidden;
+        }
+      } else if (tag == '6419') {
+        final nodesToSearch = el.children.isNotEmpty ? el.children : [el];
+        String? guid;
+        int? defIdx;
+        String? name;
+        final matrix = <double>[];
+
+        final guidNode = findChildTag(nodesToSearch, '6819');
+        if (guidNode != null && guidNode.payload.length == 16) {
+          guid = Tlv.toHexUpper(guidNode.payload);
+        }
+        final defIdxNode = findChildTag(nodesToSearch, '6719');
+        if (defIdxNode != null) {
+          defIdx =
+              Tlv.parseVarInt(defIdxNode.payload, 0, defIdxNode.payload.length);
+        }
+        final nameNode = findChildTag(nodesToSearch, '6519');
+        if (nameNode != null) {
+          name = Tlv.decodeUtf8(nameNode.payload);
+        }
+        final matNode = findChildTag(nodesToSearch, '6619');
+        if (matNode != null && matNode.payload.length >= 104) {
+          for (int idx = 0; idx < 13; idx++) {
+            matrix.add(Tlv.readF64(matNode.payload, idx * 8));
+          }
+        }
+
+        int? instMatId;
+        var instHidden = false;
+        int? instLayerId;
+        Map<String, String>? instProperties;
+        final instD007 = el.children.where((c) => c.tag == 'D007').firstOrNull;
+        if (instD007 != null) {
+          final d107 =
+              instD007.children.where((c) => c.tag == 'D107').firstOrNull;
+          if (d107 != null) {
+            instMatId = Tlv.parseVarInt(d107.payload, 0, d107.payload.length);
+          }
+          final d207 =
+              instD007.children.where((c) => c.tag == 'D207').firstOrNull;
+          if (d207 != null && d207.payload.isNotEmpty) {
+            instLayerId = Tlv.parseVarInt(d207.payload, 0, d207.payload.length);
+          }
+          instProperties = extractDynamicProperties(instD007);
+          // D307 = display flags, same record edges/faces already read
+          // (base 0x06, +0x01 hidden).
+          final instD307 =
+              instD007.children.where((c) => c.tag == 'D307').firstOrNull;
+          if (instD307 != null && instD307.payload.isNotEmpty) {
+            instHidden = (instD307.payload[0] & 0x01) != 0;
+          }
+        }
+
+        builder.instances.add(GeometryBuilderInstance()
+          ..offset = el.offset
+          ..refGuid = guid
+          ..refIdx = defIdx
+          ..name = name
+          ..matrix = matrix
+          ..materialId = instMatId
+          ..hidden = instHidden
+          ..layerId = instLayerId
+          ..properties = instProperties
+          ..children = el.children);
+      } else if (tag == '6942') {
+        // VFF construction line (9113 -> 6942 -> 6A42): point,
+        // direction and start/end distance parameters as eight doubles.
+        final body = findChildTag(el.children, '6A42');
+        if (body != null && body.payload.length >= 64) {
+          final p = body.payload;
+          final point = (
+            Tlv.readF64(p, 0),
+            Tlv.readF64(p, 8),
+            Tlv.readF64(p, 16),
+          );
+          final direction = (
+            Tlv.readF64(p, 24),
+            Tlv.readF64(p, 32),
+            Tlv.readF64(p, 40),
+          );
+          (double, double, double)? endpoint(double distance) =>
+              distance.abs() < 1e20
+                  ? (
+                      point.$1 + direction.$1 * distance,
+                      point.$2 + direction.$2 * distance,
+                      point.$3 + direction.$3 * distance,
+                    )
+                  : null;
+          builder.constructionLines.add(ConstructionLine(
+            point: point,
+            direction: direction,
+            start: endpoint(Tlv.readF64(p, 48)),
+            end: endpoint(Tlv.readF64(p, 56)),
+          ));
+        }
+      } else if (tag == '6C42') {
+        // VFF construction point (9213 -> 6C42 -> 6D42).
+        final pos = findChildTag(el.children, '6D42');
+        if (pos != null && pos.payload.length >= 24) {
+          builder.constructionPoints.add(ConstructionPoint(
+            position: (
+              Tlv.readF64(pos.payload, 0),
+              Tlv.readF64(pos.payload, 8),
+              Tlv.readF64(pos.payload, 16),
+            ),
+          ));
+        }
+      } else if (el.children.isNotEmpty) {
+        extractGeometryFromNodes(el.children, builder);
+      }
+    }
+  }
+
+  // ── Layer / material ID lookups (used by Core.fullParse) ────────────────
+
+  static void collectLayers(
+      List<TlvNode> nodes, Map<int, String> layerIdToName,
+      [Map<String, bool>? layerHidden]) {
+    for (final el in nodes) {
+      if (el.tag == '993A') {
+        for (final child in el.children) {
+          if (child.tag == '8C3C') {
+            final dc05 = findChildTag(child.children, 'DC05');
+            final nameNode = findChildTag(child.children, '8D3C');
+            if (dc05 != null && nameNode != null) {
+              final lId = _parseIdFromDc05(dc05.payload);
+              final lName = Tlv.decodeUtf8(nameNode.payload);
+              layerIdToName[lId] = lName;
+
+              // 8E3C: a single byte, 1 = hidden / 0 = visible - confirmed
+              // byte-for-byte against a real production file's own Tags
+              // panel (openskp FrameSmart pipeline report, 2026-09-08):
+              // every layer showing a hollow (hidden) eye icon had
+              // 8E3C=01, every visible one had 8E3C=00. Mirrors Python's
+              // own collect_layers exactly (openskp#285) - the VFF-format
+              // counterpart of the legacy format's already-known
+              // layer-hidden flag.
+              if (layerHidden != null) {
+                final hiddenNode = findChildTag(child.children, '8E3C');
+                if (hiddenNode != null && hiddenNode.payload.isNotEmpty) {
+                  layerHidden[lName] = hiddenNode.payload[0] == 1;
+                }
+              }
+            }
+          }
+        }
+      }
+      collectLayers(el.children, layerIdToName, layerHidden);
+    }
+  }
+
+  static void collectMaterialIds(
+      List<TlvNode> nodes, Map<int, String> materialIdToName) {
+    for (final el in nodes) {
+      if (el.tag == 'C832') {
+        final dc05 = findChildTag(el.children, 'DC05');
+        final nameNode = findChildTag(el.children, 'CC32');
+        if (dc05 != null && nameNode != null) {
+          final mId = _parseIdFromDc05(dc05.payload);
+          final mName = Tlv.decodeUtf8(nameNode.payload);
+          materialIdToName[mId] = mName;
+        }
+      }
+      collectMaterialIds(el.children, materialIdToName);
+    }
+  }
+
+  static void collectDefs(
+      List<TlvNode> nodes, Map<int, RawDefinition> defsDict) {
+    for (final el in nodes) {
+      if (el.tag == '7C15') {
+        String? guid;
+        String? name;
+        bool facesCamera = false;
+        bool shadowsFaceSun = false;
+        bool isImage = false;
+        bool isGroup = false;
+        for (final child in el.children) {
+          if (child.tag == '7D15' && child.payload.length == 16) {
+            guid = Tlv.toHexUpper(child.payload);
+          } else if (child.tag == '7E15') {
+            name = Tlv.decodeUtf8(child.payload);
+          } else if (child.tag == '581B') {
+            int pos = 0;
+            final pl = child.payload;
+            while (pos <= pl.length - 6) {
+              final subTag =
+                  Tlv.toHexUpper(Uint8List.sublistView(pl, pos, pos + 2));
+              final subSize = Tlv.readU32(pl, pos + 2);
+              if (pos + 6 + subSize > pl.length) break;
+              if (subTag == '5D1B' && subSize >= 1) {
+                facesCamera = Tlv.parseVarInt(pl, pos + 6, subSize) == 1;
+              } else if (subTag == '5E1B' && subSize >= 1) {
+                shadowsFaceSun = Tlv.parseVarInt(pl, pos + 6, subSize) == 1;
+              }
+              pos += 6 + subSize;
+            }
+          } else if (child.tag == '8315' && child.payload.isNotEmpty) {
+            // Definition kind: 0 for a component, 1 for a group (what
+            // SketchUp's own API reports too), 2 for the quad definition
+            // backing an Image entity.
+            final kind =
+                Tlv.parseVarInt(child.payload, 0, child.payload.length);
+            isImage = kind == 2;
+            isGroup = kind == 1;
+          }
+        }
+        final entId = extractEntityId(el);
+        final builder = GeometryBuilder();
+        extractGeometryFromNodes(el.children, builder);
+        if (entId != null) {
+          defsDict[entId] = RawDefinition(
+            guid: guid,
+            name: name,
+            alwaysFacesCamera: facesCamera,
+            shadowsFaceSun: shadowsFaceSun,
+            isImage: isImage,
+            isGroup: isGroup,
+            builder: builder,
+          );
+        }
+      }
+      collectDefs(el.children, defsDict);
+    }
+  }
+
+  // ── material.xml / style.xml parsing ─────────────────────────────────────
+
+  static const _matNs =
+      'http://sketchup.google.com/schemas/sketchup/1.0/material';
+  static const _styleNs =
+      'http://sketchup.google.com/schemas/sketchup/1.0/style';
+  static const _typesNs = 'http://sketchup.google.com/schemas/1.0/types';
+
+  /// Parse one materials/<folder>/material.xml entry. [xmlName] is the
+  /// archive path (e.g. "materials/Wood/material.xml"), used to resolve
+  /// sibling texture image files.
+  static RawMaterial? parseMaterialXml(
+      Archive zip, String xmlName, Uint8List xmlData, [ParseOptions? options]) {
+    XmlDocument doc;
+    try {
+      doc = XmlDocument.parse(utf8.decode(xmlData));
+    } catch (e) {
+      emitLog(options, SkpLogLevel.debug, 'Failed to parse material.xml $xmlName: $e');
+      return null;
+    }
+
+    final matElem =
+        doc.findAllElements('material', namespaceUri: _matNs).firstOrNull;
+    if (matElem == null) return null;
+
+    final matName = matElem.getAttribute('name') ?? 'unknown';
+    final r = int.tryParse(matElem.getAttribute('colorRed') ?? '') ?? 128;
+    final g = int.tryParse(matElem.getAttribute('colorGreen') ?? '') ?? 128;
+    final b = int.tryParse(matElem.getAttribute('colorBlue') ?? '') ?? 128;
+
+    double trans;
+    if (matElem.getAttribute('useTrans') == '1') {
+      final raw = double.tryParse(matElem.getAttribute('trans') ?? '') ?? 0.0;
+      trans = (1.0 - raw).clamp(0.0, 1.0);
+    } else {
+      trans = 1.0;
+    }
+
+    final colorized = matElem.getAttribute('type') == '2';
+    final colorizeType =
+        int.tryParse(matElem.getAttribute('colorizeType') ?? '') ?? 0;
+
+    final mat = RawMaterial(
+      name: matName,
+      r: r,
+      g: g,
+      b: b,
+      transparency: trans,
+      colorized: colorized,
+      colorizeType: colorizeType,
+    );
+
+    mat.texture = _extractTexture(zip, xmlName, matElem);
+    return mat;
+  }
+
+  static RawTexture? _extractTexture(
+      Archive zip, String xmlName, XmlElement matElem) {
+    final texElem = matElem.getElement('texture', namespaceUri: _matNs);
+    if (texElem == null) return null;
+
+    var filename = texElem.getAttribute('textureFilename') ?? '';
+    final xScale = double.tryParse(texElem.getAttribute('xScale') ?? '') ?? 0.0;
+    final yScale = double.tryParse(texElem.getAttribute('yScale') ?? '') ?? 0.0;
+
+    final lastSlash = xmlName.lastIndexOf('/');
+    final folder = lastSlash >= 0 ? xmlName.substring(0, lastSlash) : '';
+
+    Uint8List? data;
+    final entryNames = zip.files.map((f) => f.name).toSet();
+
+    final candidate = filename.isNotEmpty ? '$folder/$filename' : null;
+    if (candidate != null && entryNames.contains(candidate)) {
+      final candEntry = zip.findFile(candidate);
+      if (candEntry != null) {
+        Vff.validateEntrySize(candEntry);
+        data = candEntry.content;
+      }
+    } else {
+      for (final entry in zip.files) {
+        if (entry.name.startsWith('$folder/') &&
+            entry.name != xmlName &&
+            !entry.name.toLowerCase().endsWith('.xml')) {
+          Vff.validateEntrySize(entry);
+          data = entry.content;
+          if (filename.isEmpty) {
+            final s = entry.name.lastIndexOf('/');
+            filename = s >= 0 ? entry.name.substring(s + 1) : entry.name;
+          }
+          break;
+        }
+      }
+    }
+
+    if (data == null) {
+      final imgElem = texElem
+          .getElement('images', namespaceUri: _matNs)
+          ?.getElement('image', namespaceUri: _matNs);
+      var imgPath = imgElem?.getAttribute('path') ?? '';
+      imgPath = _lstripChars(imgPath, './');
+      for (final cand in [imgPath, '$folder/$imgPath']) {
+        if (cand.isNotEmpty && entryNames.contains(cand)) {
+          final candEntry = zip.findFile(cand);
+          if (candEntry != null) {
+            Vff.validateEntrySize(candEntry);
+            data = candEntry.content;
+          }
+          if (filename.isEmpty) {
+            final s = cand.lastIndexOf('/');
+            filename = s >= 0 ? cand.substring(s + 1) : cand;
+          }
+          break;
+        }
+      }
+    }
+
+    return RawTexture(
+        filename: filename, xScale: xScale, yScale: yScale, data: data);
+  }
+
+  /// Matches Python's str.lstrip(chars): repeatedly strips any leading
+  /// character found in [chars], NOT the literal prefix "./".
+  static String _lstripChars(String s, String chars) {
+    int i = 0;
+    while (i < s.length && chars.contains(s[i])) i++;
+    return s.substring(i);
+  }
+
+  static RawStyle? parseStyleXml(Uint8List xmlData, [String xmlName = '', ParseOptions? options]) {
+    XmlDocument doc;
+    try {
+      doc = XmlDocument.parse(utf8.decode(xmlData));
+    } catch (e) {
+      emitLog(options, SkpLogLevel.debug, 'Failed to parse style.xml $xmlName: $e');
+      return null;
+    }
+
+    final styleEl = doc.rootElement.getElement('style', namespaceUri: _styleNs);
+    if (styleEl == null) return null;
+
+    final colors = <String, (int, int, int)>{};
+    for (final item in styleEl.findElements('item', namespaceUri: _styleNs)) {
+      final iid = item.getAttribute('id');
+      final variant = item.getElement('variant', namespaceUri: _typesNs);
+      if ((iid == '2002' || iid == '2003') &&
+          variant != null &&
+          variant.innerText.isNotEmpty) {
+        final signed = int.tryParse(variant.innerText);
+        if (signed != null) {
+          final v = signed & 0xFFFFFFFF;
+          colors[iid!] = (v & 255, (v >> 8) & 255, (v >> 16) & 255);
+        }
+      }
+    }
+
+    return RawStyle(
+      name: styleEl.getAttribute('name') ?? '',
+      frontColor: colors['2002'],
+      backColor: colors['2003'],
+    );
+  }
+}
+
+extension _FirstOrNull<T> on Iterable<T> {
+  T? get firstOrNull => isEmpty ? null : first;
+}

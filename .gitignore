@@ -1,0 +1,7 @@
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+sketchup-viewer-*.apk
+.DS_Store

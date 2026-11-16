@@ -1,0 +1,1488 @@
+// Tests for openskp::create (packages/cpp/src/create.cpp), the C++ port of
+// packages/python/src/openskp/create.py. Mirrors the feature-area coverage of
+// packages/python/tests/test_create.py, adapted to this project's GoogleTest/round-trip-through-
+// our-own-reader idiom (see legacy_single_material_test.cpp for precedent): most tests build a
+// file with SkpBuilder, then parse the resulting bytes back with SkpFile::from_buffer(...).parse()
+// and assert on the resulting SkpModel - the same "read your own output back with the
+// already-trusted reader" validation strategy this project already uses on the read side.
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <gtest/gtest.h>
+
+#include <openskp/openskp.hpp>
+
+#include "test_helpers.hpp"
+
+namespace openskp {
+namespace {
+
+// A local constant instead of <cmath>'s non-standard M_PI (MSVC only defines it with
+// _USE_MATH_DEFINES set before <cmath> is first included, which isn't guaranteed here) - avoids
+// that portability trap across this project's GCC/Clang/MSVC CI matrix.
+constexpr double kPi = 3.14159265358979323846;
+
+SkpModel round_trip(SkpBuilder& builder) {
+  ByteBuffer bytes = builder.to_bytes();
+  return SkpFile::from_buffer(bytes).parse();
+}
+
+// A syntactically-tiny PNG - just the magic bytes plus filler. write_textured_material embeds
+// image bytes verbatim without decoding them as a real image, so this is sufficient to exercise
+// the writer/reader's own byte plumbing without needing a real PNG encoder in the test.
+ByteBuffer fake_png_bytes() {
+  ByteBuffer data = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+  data.insert(data.end(), 64, 0x42);
+  return data;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Single face / basic geometry.
+// ---------------------------------------------------------------------------------------------
+
+TEST(Create, SingleFaceRoundTrips) {
+  auto builder = create();
+  builder->add_face({{0, 0, 0}, {100, 0, 0}, {100, 100, 0}, {0, 100, 0}});
+
+  SkpModel model = round_trip(*builder);
+  const Definition& root = model.root();
+  ASSERT_EQ(root.faces.size(), 1u);
+  EXPECT_EQ(root.vertices.size(), 4u);
+  EXPECT_EQ(root.edges.size(), 4u);
+
+  std::vector<Point3> expected = {{0, 0, 0}, {100, 0, 0}, {100, 100, 0}, {0, 100, 0}};
+  for (const auto& p : expected) {
+    bool found = false;
+    for (const auto& [id, v] : root.vertices) {
+      if (v.x == p[0] && v.y == p[1] && v.z == p[2]) found = true;
+    }
+    EXPECT_TRUE(found) << "expected vertex (" << p[0] << ", " << p[1] << ", " << p[2]
+                       << ") not found";
+  }
+}
+
+TEST(Create, SharedVerticesAndEdgesAreDeduplicated) {
+  auto builder = create();
+  // Two triangles sharing an edge - the shared 2 vertices/1 edge should not be duplicated.
+  builder->add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}});
+  builder->add_face({{0, 0, 0}, {10, 10, 0}, {0, 10, 0}});
+
+  SkpModel model = round_trip(*builder);
+  const Definition& root = model.root();
+  EXPECT_EQ(root.faces.size(), 2u);
+  EXPECT_EQ(root.vertices.size(), 4u);  // not 6
+  EXPECT_EQ(root.edges.size(), 5u);     // not 6
+}
+
+TEST(Create, FaceRequiresAtLeast3Points) {
+  auto builder = create();
+  EXPECT_THROW(builder->add_face({{0, 0, 0}, {1, 0, 0}}), SkpWriteError);
+}
+
+TEST(Create, NonCoplanarFaceRaisesWithoutAutoTriangulate) {
+  auto builder = create();
+  EXPECT_THROW(builder->add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 5}, {0, 10, 0}}), SkpWriteError);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Material/layer handle validation.
+// ---------------------------------------------------------------------------------------------
+
+std::vector<Point3> square_pts() { return {{0, 0, 0}, {100, 0, 0}, {100, 100, 0}, {0, 100, 0}}; }
+
+TEST(Create, AddFaceRejectsALayerHandlePassedAsMaterial) {
+  // The exact real-world mistake this guards against: a caller accidentally passes a layer
+  // handle into FaceOptions::material (e.g. via a field mix-up in a wrapper function around
+  // add_face). Before this check, the layer's slot silently became a dangling material
+  // reference - openskp's own reader tolerated it, but real SketchUp rejected the resulting
+  // file outright.
+  auto builder = create();
+  int layer = builder->add_layer("Layer0");
+  FaceOptions opts;
+  opts.material = layer;
+  EXPECT_THROW(builder->add_face(square_pts(), opts), SkpWriteError);
+}
+
+TEST(Create, AddFaceRejectsAMaterialHandlePassedAsLayer) {
+  auto builder = create();
+  int mat = builder->add_material("Red", Color3{255, 0, 0});
+  FaceOptions opts;
+  opts.layer = mat;
+  EXPECT_THROW(builder->add_face(square_pts(), opts), SkpWriteError);
+}
+
+TEST(Create, AddFaceRejectsAnUnrelatedBackMaterialHandle) {
+  auto builder = create();
+  int layer = builder->add_layer("Layer0");
+  FaceOptions opts;
+  opts.back_material = layer;
+  EXPECT_THROW(builder->add_face(square_pts(), opts), SkpWriteError);
+}
+
+TEST(Create, AddFaceRejectsAHandleFromADifferentBuilder) {
+  auto other_builder = create();
+  int stray_material = other_builder->add_material("Blue", Color3{0, 0, 255});
+  auto builder = create();
+  FaceOptions opts;
+  opts.material = stray_material;
+  EXPECT_THROW(builder->add_face(square_pts(), opts), SkpWriteError);
+}
+
+TEST(Create, AddInstanceRejectsALayerHandlePassedAsMaterial) {
+  auto builder = create();
+  int layer = builder->add_layer("Layer0");
+  auto& chair = builder->add_component_definition("Chair");
+  chair.add_face(square_pts());
+  chair.close();
+  InstanceOptions opts;
+  opts.material = layer;
+  EXPECT_THROW(builder->add_instance(chair, opts), SkpWriteError);
+}
+
+TEST(Create, AddGroupRejectsAnUnrelatedLayerHandle) {
+  auto builder = create();
+  int mat = builder->add_material("Red", Color3{255, 0, 0});
+  GroupOptions opts;
+  opts.name = "Table";
+  opts.layer = mat;
+  EXPECT_THROW(builder->add_group(opts), SkpWriteError);
+}
+
+TEST(Create, ComponentScopeAddFaceRejectsAnUnrelatedHandle) {
+  auto builder = create();
+  int layer = builder->add_layer("Layer0");
+  auto& chair = builder->add_component_definition("Chair");
+  FaceOptions opts;
+  opts.material = layer;
+  EXPECT_THROW(chair.add_face(square_pts(), opts), SkpWriteError);
+  // the definition must still be usable after a rejected call
+  chair.add_face(square_pts());
+}
+
+TEST(Create, AddFaceAcceptsARealMaterialAndLayer) {
+  auto builder = create();
+  int mat = builder->add_material("Red", Color3{255, 0, 0});
+  int layer = builder->add_layer("MyLayer");
+  FaceOptions opts;
+  opts.material = mat;
+  opts.layer = layer;
+  builder->add_face(square_pts(), opts);
+  EXPECT_GT(builder->to_bytes().size(), 0u);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Materials.
+// ---------------------------------------------------------------------------------------------
+
+TEST(Create, SolidMaterialRoundTrips) {
+  auto builder = create();
+  int red = builder->add_material("Red", Color3{255, 0, 0});
+  FaceOptions opts;
+  opts.material = red;
+  builder->add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}}, opts);
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.materials.size(), 1u);
+  EXPECT_EQ(model.materials[0].name, "Red");
+  EXPECT_EQ(model.materials[0].color[0], 255);
+  EXPECT_EQ(model.materials[0].color[1], 0);
+  EXPECT_EQ(model.materials[0].color[2], 0);
+
+  ASSERT_EQ(model.root().faces.size(), 1u);
+  const Face& f = model.root().faces.begin()->second;
+  ASSERT_TRUE(f.material_id.has_value());
+  const Material* mat = model.material_by_id(*f.material_id);
+  ASSERT_NE(mat, nullptr);
+  EXPECT_EQ(mat->name, "Red");
+}
+
+TEST(Create, DuplicateMaterialNameReturnsSameHandle) {
+  auto builder = create();
+  int a = builder->add_material("Blue", Color3{0, 0, 255});
+  int b = builder->add_material("Blue", Color3{10, 10, 10});  // different rgba is ignored on repeat
+  EXPECT_EQ(a, b);
+  EXPECT_EQ(builder->materials_by_name.at("Blue"), a);
+}
+
+TEST(Create, TexturedMaterialRoundTrips) {
+  auto tmp_path = std::filesystem::temp_directory_path() / "openskp_create_test_texture.png";
+  {
+    std::ofstream f(tmp_path, std::ios::binary);
+    ByteBuffer png = fake_png_bytes();
+    f.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+  }
+
+  auto builder = create();
+  int brick = builder->add_texture_material("Brick", tmp_path);
+  FaceOptions opts;
+  opts.material = brick;
+  builder->add_face({{0, 0, 0}, {100, 0, 0}, {100, 100, 0}, {0, 100, 0}}, opts);
+
+  SkpModel model = round_trip(*builder);
+  std::filesystem::remove(tmp_path);
+
+  ASSERT_EQ(model.materials.size(), 1u);
+  const Material& mat = model.materials[0];
+  EXPECT_EQ(mat.name, "Brick");
+  ASSERT_TRUE(mat.texture.has_value());
+  ASSERT_TRUE(mat.texture->data.has_value());
+  EXPECT_EQ(*mat.texture->data, fake_png_bytes());
+}
+
+TEST(Create, TexturedMaterialDefaultAppliedHeightIsOneNotCorrupted) {
+  // Regression test for a real bug: until 2026-08-28, an omitted
+  // applied_height wrote a corrupted internal sentinel byte pattern
+  // (~1.29e-231) instead of a real number - confirmed via real SketchUp
+  // screenshots to render as a streaky, vertically-smeared texture.
+  // add_texture_material's applied WIDTH is unconditionally 1.0 (a
+  // deliberate ground-truth value); height should match it by default
+  // now, not silently corrupt every caller who doesn't know to pass
+  // applied_height=1.0 explicitly.
+  auto tmp_path = std::filesystem::temp_directory_path() / "openskp_create_test_texture_height.png";
+  {
+    std::ofstream f(tmp_path, std::ios::binary);
+    ByteBuffer png = fake_png_bytes();
+    f.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+  }
+
+  auto builder = create();
+  int brick = builder->add_texture_material("Brick", tmp_path);
+  FaceOptions opts;
+  opts.material = brick;
+  builder->add_face({{0, 0, 0}, {100, 0, 0}, {100, 100, 0}, {0, 100, 0}}, opts);
+
+  SkpModel model = round_trip(*builder);
+  std::filesystem::remove(tmp_path);
+
+  ASSERT_EQ(model.materials.size(), 1u);
+  ASSERT_TRUE(model.materials[0].texture.has_value());
+  EXPECT_DOUBLE_EQ(model.materials[0].texture->width, 1.0);
+  EXPECT_DOUBLE_EQ(model.materials[0].texture->height, 1.0);
+}
+
+TEST(Create, TexturedMaterialExplicitAppliedHeightStillOverridable) {
+  auto tmp_path =
+      std::filesystem::temp_directory_path() / "openskp_create_test_texture_height2.png";
+  {
+    std::ofstream f(tmp_path, std::ios::binary);
+    ByteBuffer png = fake_png_bytes();
+    f.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+  }
+
+  auto builder = create();
+  int brick = builder->add_texture_material("Brick", tmp_path, 48.0);
+  FaceOptions opts;
+  opts.material = brick;
+  builder->add_face({{0, 0, 0}, {100, 0, 0}, {100, 100, 0}, {0, 100, 0}}, opts);
+
+  SkpModel model = round_trip(*builder);
+  std::filesystem::remove(tmp_path);
+
+  ASSERT_EQ(model.materials.size(), 1u);
+  ASSERT_TRUE(model.materials[0].texture.has_value());
+  EXPECT_DOUBLE_EQ(model.materials[0].texture->height, 48.0);
+}
+
+// Real SketchUp writes the material's own tile size in BOTH axes (a file authored in SketchUp
+// Web carries 8.0 x 16.0 for a brick); a texture applied without positioning carries no per-face
+// UV record, so this pair IS its mapping (openskp#252).
+TEST(Create, TexturedMaterialAppliedSizeFullyOverridable) {
+  auto tmp_path = std::filesystem::temp_directory_path() / "openskp_create_test_texture_size.png";
+  {
+    std::ofstream f(tmp_path, std::ios::binary);
+    ByteBuffer png = fake_png_bytes();
+    f.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+  }
+
+  auto builder = create();
+  int brick = builder->add_texture_material("Brick", tmp_path, 16.0, 8.0);
+  FaceOptions opts;
+  opts.material = brick;
+  builder->add_face({{0, 0, 0}, {100, 0, 0}, {100, 100, 0}, {0, 100, 0}}, opts);
+
+  SkpModel model = round_trip(*builder);
+  std::filesystem::remove(tmp_path);
+
+  ASSERT_EQ(model.materials.size(), 1u);
+  ASSERT_TRUE(model.materials[0].texture.has_value());
+  EXPECT_DOUBLE_EQ(model.materials[0].texture->width, 8.0);
+  EXPECT_DOUBLE_EQ(model.materials[0].texture->height, 16.0);
+}
+
+TEST(Create, TexturedMaterialCarriesOpacity) {
+  auto tmp_path =
+      std::filesystem::temp_directory_path() / "openskp_create_test_texture_opacity.png";
+  {
+    std::ofstream f(tmp_path, std::ios::binary);
+    ByteBuffer png = fake_png_bytes();
+    f.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+  }
+
+  auto builder = create();
+  int voile = builder->add_texture_material("Voile", tmp_path, std::nullopt, std::nullopt, 0.5);
+  FaceOptions opts;
+  opts.material = voile;
+  builder->add_face({{0, 0, 0}, {100, 0, 0}, {100, 100, 0}, {0, 100, 0}}, opts);
+
+  SkpModel model = round_trip(*builder);
+  std::filesystem::remove(tmp_path);
+
+  ASSERT_EQ(model.materials.size(), 1u);
+  EXPECT_NEAR(model.materials[0].transparency, 0.5, 1e-9);
+}
+
+TEST(Create, SolidMaterialCarriesOpacity) {
+  auto builder = create();
+  int glass = builder->add_material("Glass", Color4{200, 220, 255, 255}, 0.35);
+  FaceOptions opts;
+  opts.material = glass;
+  builder->add_face({{0, 0, 0}, {100, 0, 0}, {100, 100, 0}, {0, 100, 0}}, opts);
+
+  SkpModel model = round_trip(*builder);
+
+  ASSERT_EQ(model.materials.size(), 1u);
+  EXPECT_NEAR(model.materials[0].transparency, 0.35, 1e-9);
+}
+
+TEST(Create, OmittedOpacityStaysFullyOpaque) {
+  auto builder = create();
+  int red = builder->add_material("Red", Color3{255, 0, 0});
+  FaceOptions opts;
+  opts.material = red;
+  builder->add_face({{0, 0, 0}, {100, 0, 0}, {100, 100, 0}, {0, 100, 0}}, opts);
+
+  SkpModel model = round_trip(*builder);
+
+  ASSERT_EQ(model.materials.size(), 1u);
+  EXPECT_DOUBLE_EQ(model.materials[0].transparency, 1.0);
+}
+
+TEST(Create, AddImagePlacesARealImageEntityNotAPlainTexturedFace) {
+  auto tmp_path = std::filesystem::temp_directory_path() / "openskp_create_test_image.png";
+  {
+    std::ofstream f(tmp_path, std::ios::binary);
+    ByteBuffer png = fake_png_bytes();
+    f.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+  }
+
+  auto builder = create();
+  ImageOptions opts;
+  opts.translation = {0, 0, 40};
+  opts.rotation = Rotation{{1, 0, 0}, kPi / 2};
+  builder->add_image(tmp_path, 48, 36, opts);
+
+  SkpModel model = round_trip(*builder);
+  std::filesystem::remove(tmp_path);
+
+  int image_def_count = 0;
+  EntityId image_def_id = 0;
+  for (const auto& [id, def] : model.definitions) {
+    if (def.is_image) {
+      image_def_count++;
+      image_def_id = id;
+      EXPECT_EQ(def.faces.size(), 1u);
+    }
+  }
+  EXPECT_EQ(image_def_count, 1);
+  ASSERT_EQ(model.root().instances.size(), 1u);
+  ASSERT_TRUE(model.root().instances[0].ref_idx.has_value());
+  EXPECT_EQ(*model.root().instances[0].ref_idx, image_def_id);
+}
+
+TEST(Create, MaterialsMustPrecedeGeometry) {
+  auto builder = create();
+  builder->add_face({{0, 0, 0}, {1, 0, 0}, {1, 1, 0}});
+  EXPECT_THROW(builder->add_material("TooLate", Color3{1, 2, 3}), SkpWriteError);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Layers.
+// ---------------------------------------------------------------------------------------------
+
+TEST(Create, LayerRoundTrips) {
+  auto builder = create();
+  LayerOptions opts;
+  opts.color = Color4{10, 20, 30, 255};
+  opts.hidden = true;
+  int roof = builder->add_layer("Roof", opts);
+  FaceOptions fopts;
+  fopts.layer = roof;
+  builder->add_face({{0, 0, 0}, {1, 0, 0}, {1, 1, 0}}, fopts);
+
+  SkpModel model = round_trip(*builder);
+  // Layer0 (from the scaffold) + the new "Roof" layer.
+  ASSERT_EQ(model.layers.size(), 2u);
+  const Layer* roof_layer = nullptr;
+  for (const auto& l : model.layers) {
+    if (l.name == "Roof") roof_layer = &l;
+  }
+  ASSERT_NE(roof_layer, nullptr);
+  EXPECT_TRUE(roof_layer->hidden);
+  EXPECT_EQ(roof_layer->color[0], 10);
+  EXPECT_EQ(roof_layer->color[1], 20);
+  EXPECT_EQ(roof_layer->color[2], 30);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Component definitions + instances.
+// ---------------------------------------------------------------------------------------------
+
+TEST(Create, ComponentDefinitionAndMultipleInstances) {
+  auto builder = create();
+  auto& chair = builder->add_component_definition("Chair");
+  chair.add_face({{0, 0, 0}, {20, 0, 0}, {20, 20, 0}, {0, 20, 0}});
+  chair.close();
+
+  InstanceOptions a;
+  a.translation = {100, 0, 0};
+  builder->add_instance(chair, a);
+  InstanceOptions b;
+  b.translation = {200, 0, 0};
+  b.name = "Second Chair";
+  builder->add_instance(chair, b);
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.definitions.size(), 1u);
+  const Definition& def = model.definitions.begin()->second;
+  EXPECT_EQ(def.name, "Chair");
+  EXPECT_EQ(def.faces.size(), 1u);
+
+  ASSERT_EQ(model.root().instances.size(), 2u);
+  bool found_translation_100 = false, found_named = false;
+  for (const auto& inst : model.root().instances) {
+    ASSERT_GE(inst.matrix.size(), 12u);
+    if (std::abs(inst.matrix[9] - 100.0) < 1e-9) found_translation_100 = true;
+    if (inst.name == "Second Chair") found_named = true;
+  }
+  EXPECT_TRUE(found_translation_100);
+  EXPECT_TRUE(found_named);
+}
+
+TEST(Create, InstanceMustReferenceAClosedDefinitionFromTheSameBuilder) {
+  auto builder = create();
+  auto& chair = builder->add_component_definition("Chair");
+  chair.add_face({{0, 0, 0}, {1, 0, 0}, {1, 1, 0}});
+  // Not yet closed.
+  EXPECT_THROW(builder->add_instance(chair), SkpWriteError);
+  chair.close();
+
+  auto other_builder = create();
+  EXPECT_THROW(other_builder->add_instance(chair), SkpWriteError);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Groups + nesting.
+// ---------------------------------------------------------------------------------------------
+
+TEST(Create, GroupSelfPlaces) {
+  auto builder = create();
+  GroupOptions opts;
+  opts.name = "Table";
+  opts.translation = {50, 0, 0};
+  auto& table = builder->add_group(opts);
+  table.add_face({{0, 0, 0}, {30, 0, 0}, {30, 30, 0}, {0, 30, 0}});
+  table.close();
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.definitions.size(), 1u);
+  ASSERT_EQ(model.root().instances.size(), 1u);
+  const Instance& inst = model.root().instances[0];
+  EXPECT_EQ(inst.name, "Table");
+  ASSERT_GE(inst.matrix.size(), 12u);
+  EXPECT_NEAR(inst.matrix[9], 50.0, 1e-9);
+}
+
+TEST(Create, AGroupIsWrittenAsAGroupAndAComponentAsAComponent) {
+  // SketchUp 2025's own library reports one group definition and one component definition for a
+  // file like this (openskp#446)
+  auto builder = create();
+  GroupOptions opts;
+  opts.name = "Table";
+  auto& table = builder->add_group(opts);
+  table.add_face(square_pts());
+  table.close();
+  auto& chair = builder->add_component_definition("Chair");
+  chair.add_face(square_pts());
+  chair.close();
+  builder->add_instance(chair);
+
+  SkpModel model = round_trip(*builder);
+  int groups = 0;
+  for (const auto& d : model.definitions) {
+    if (d.second.is_group) ++groups;
+    if (d.second.name == "Chair") EXPECT_FALSE(d.second.is_group);
+  }
+  EXPECT_EQ(groups, 1);
+}
+
+TEST(Create, AGroupPlacedInsideAComponentIsAGroup) {
+  // SketchUp 2025's own library reports the placed definition as a group definition and the
+  // enclosing one as a component (openskp#467)
+  auto builder = create();
+  auto& engine = builder->add_component_definition("Engine");
+  engine.add_face(square_pts());
+  engine.close();
+  auto& car = builder->add_component_definition("Car");
+  car.add_face(square_pts());
+  GroupInstanceOptions gopts;
+  gopts.translation = {50, 0, 10};
+  car.add_group_instance(engine, gopts);
+  car.close();
+  builder->add_instance(car);
+
+  SkpModel model = round_trip(*builder);
+  for (const auto& d : model.definitions) {
+    if (d.second.name == "Engine") EXPECT_TRUE(d.second.is_group);
+    if (d.second.name == "Car") EXPECT_FALSE(d.second.is_group);
+  }
+}
+
+TEST(Create, GroupAttributesRoundTrip) {
+  // Groups used to hardcode a null attribute pointer on the belief that a CGroup never carries a
+  // CAttributeContainer - real production files (SketchUp 2020-legacy export, ground truth)
+  // contradicted this (openskp#261). Smoke test only, matching InstanceAttributesRoundTrip above:
+  // model.root().instances[].properties isn't wired to custom CAttributeNamed dictionaries in
+  // this port.
+  auto builder = create();
+  GroupOptions opts;
+  opts.name = "Table";
+  opts.attributes["sku"] = std::string{"TBL-1"};
+  opts.attributes["qty"] = std::int32_t{2};
+  auto& table = builder->add_group(opts);
+  table.add_face({{0, 0, 0}, {30, 0, 0}, {30, 30, 0}, {0, 30, 0}});
+  table.close();
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.root().instances.size(), 1u);
+}
+
+TEST(Create, NestedDefinitionInstanceAndNestedGroupInstance) {
+  auto builder = create();
+  auto& wheel = builder->add_component_definition("Wheel");
+  wheel.add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}});
+  wheel.close();
+
+  auto& engine = builder->add_component_definition("Engine");
+  engine.add_face({{0, 0, 0}, {30, 0, 0}, {30, 30, 0}, {0, 30, 0}});
+  engine.close();
+
+  auto& car = builder->add_component_definition("Car");
+  car.add_face({{0, 0, 0}, {150, 0, 0}, {150, 60, 0}, {0, 60, 0}});
+  InstanceOptions wheel_inst;
+  wheel_inst.translation = {0, 0, 0};
+  car.add_instance(wheel, wheel_inst);
+  GroupInstanceOptions engine_group;
+  engine_group.translation = {50, 0, 10};
+  car.add_group_instance(engine, engine_group);
+  car.close();
+
+  builder->add_instance(car);
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.definitions.size(), 3u);
+  const Definition* car_def = nullptr;
+  for (const auto& [id, defn] : model.definitions) {
+    if (defn.name == "Car") car_def = &defn;
+  }
+  ASSERT_NE(car_def, nullptr);
+  EXPECT_EQ(car_def->faces.size(), 1u);
+  EXPECT_EQ(car_def->instances.size(), 2u);  // the wheel instance + the engine group instance
+}
+
+TEST(Create, NestedGroupInstanceCarriesItsOwnAttributesToo) {
+  auto builder = create();
+  auto& engine = builder->add_component_definition("Engine");
+  engine.add_face({{0, 0, 0}, {30, 0, 0}, {30, 30, 0}, {0, 30, 0}});
+  engine.close();
+
+  auto& car = builder->add_component_definition("Car");
+  car.add_face({{0, 0, 0}, {150, 0, 0}, {150, 60, 0}, {0, 60, 0}});
+  GroupInstanceOptions engine_group;
+  engine_group.translation = {50, 0, 10};
+  engine_group.attributes["part"] = std::string{"V6"};
+  car.add_group_instance(engine, engine_group);
+  car.close();
+
+  builder->add_instance(car);
+
+  SkpModel model = round_trip(*builder);
+  const Definition* car_def = nullptr;
+  for (const auto& [id, defn] : model.definitions) {
+    if (defn.name == "Car") car_def = &defn;
+  }
+  ASSERT_NE(car_def, nullptr);
+  EXPECT_EQ(car_def->instances.size(), 1u);
+}
+
+TEST(Create, EachNestedLevelKeepsItsOwnInstanceNameInMeshIndex) {
+  // Cross-language parity check for openskp#240: Python, TypeScript, .NET,
+  // and Dart all had a bug where a shallow instance's own name overwrote
+  // every mesh beneath it in scene.mesh_index, since a shallow instance's
+  // path is always a string prefix of every deeper descendant's path too.
+  // C++ never had that bug - each mesh's name is set once, correctly, at
+  // creation time from its own path, with no later backfill/cascading
+  // pass at all - but this test locks that in so it can't regress toward
+  // the same bug the other four languages had.
+  auto builder = create();
+  auto& leaf = builder->add_component_definition("Leaf");
+  leaf.add_face({{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}});
+  leaf.close();
+  auto& middle = builder->add_component_definition("Middle");
+  middle.add_face({{0, 0, 10}, {1, 0, 10}, {1, 1, 10}, {0, 1, 10}});
+  InstanceOptions leaf_inst;
+  leaf_inst.name = "LeafInstance";
+  middle.add_instance(leaf, leaf_inst);
+  middle.close();
+  auto& outer = builder->add_component_definition("Outer");
+  outer.add_face({{0, 0, 20}, {1, 0, 20}, {1, 1, 20}, {0, 1, 20}});
+  InstanceOptions middle_inst;
+  middle_inst.name = "MiddleInstance";
+  outer.add_instance(middle, middle_inst);
+  outer.close();
+  InstanceOptions outer_inst;
+  outer_inst.name = "OuterInstance";
+  builder->add_instance(outer, outer_inst);
+
+  Scene scene = SkpFile::from_buffer(builder->to_bytes()).build_scene();
+  std::vector<std::string> names;
+  for (const auto& [geom_name, meta] : scene.mesh_index) names.push_back(meta.name);
+  std::sort(names.begin(), names.end());
+  EXPECT_EQ(names, (std::vector<std::string>{"LeafInstance", "MiddleInstance", "OuterInstance"}));
+}
+
+TEST(Create, DefinitionCannotNestAnInstanceOfItself) {
+  auto builder = create();
+  auto& a = builder->add_component_definition("A");
+  a.add_face({{0, 0, 0}, {1, 0, 0}, {1, 1, 0}});
+  EXPECT_THROW(a.add_instance(a), SkpWriteError);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rotation + hidden.
+// ---------------------------------------------------------------------------------------------
+
+TEST(Create, RotationConvenienceProducesARotationMatrix) {
+  auto builder = create();
+  auto& part = builder->add_component_definition("Part");
+  part.add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}});
+  part.close();
+
+  InstanceOptions opts;
+  opts.rotation = Rotation{Point3{0, 0, 1}, kPi / 2.0};
+  builder->add_instance(part, opts);
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.root().instances.size(), 1u);
+  const auto& m = model.root().instances[0].matrix;
+  ASSERT_GE(m.size(), 9u);
+  // Row-major 3x3 rotation by +90 degrees around Z: (1,0,0)->(0,1,0), i.e. m[0]=cos=0, m[1]=-sin=-1
+  EXPECT_NEAR(m[0], 0.0, 1e-9);
+  EXPECT_NEAR(m[1], -1.0, 1e-9);
+  EXPECT_NEAR(m[3], 1.0, 1e-9);
+  EXPECT_NEAR(m[4], 0.0, 1e-9);
+}
+
+TEST(Create, MatrixAndRotationAreMutuallyExclusive) {
+  auto builder = create();
+  auto& part = builder->add_component_definition("Part");
+  part.add_face({{0, 0, 0}, {1, 0, 0}, {1, 1, 0}});
+  part.close();
+
+  InstanceOptions opts;
+  opts.matrix3x3 = Matrix3x3{1, 0, 0, 0, 1, 0, 0, 0, 1};
+  opts.rotation = Rotation{Point3{0, 0, 1}, 1.0};
+  EXPECT_THROW(builder->add_instance(part, opts), SkpWriteError);
+}
+
+TEST(Create, HiddenFaceAndInstanceRoundTrip) {
+  auto builder = create();
+  auto& part = builder->add_component_definition("Part");
+  part.add_face({{0, 0, 0}, {1, 0, 0}, {1, 1, 0}});
+  part.close();
+  InstanceOptions iopts;
+  iopts.hidden = true;
+  builder->add_instance(part, iopts);
+
+  FaceOptions fopts;
+  fopts.hidden = true;
+  builder->add_face({{0, 0, 0}, {1, 0, 0}, {1, 1, 0}}, fopts);
+
+  SkpModel model = round_trip(*builder);
+  bool found_hidden_face = false;
+  for (const auto& [id, f] : model.root().faces) {
+    if (f.hidden) found_hidden_face = true;
+  }
+  EXPECT_TRUE(found_hidden_face);
+  ASSERT_EQ(model.root().instances.size(), 1u);
+  EXPECT_TRUE(model.root().instances[0].hidden);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Holes + auto_triangulate.
+// ---------------------------------------------------------------------------------------------
+
+TEST(Create, FaceWithHoleHasTwoLoops) {
+  auto builder = create();
+  std::vector<Point3> wall = {{0, 0, 0}, {200, 0, 0}, {200, 100, 0}, {0, 100, 0}};
+  std::vector<Point3> window = {{80, 30, 0}, {120, 30, 0}, {120, 70, 0}, {80, 70, 0}};
+  FaceOptions opts;
+  opts.holes = {window};
+  builder->add_face(wall, opts);
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.root().faces.size(), 1u);
+  const Face& f = model.root().faces.begin()->second;
+  ASSERT_EQ(f.loops.size(), 2u);
+  EXPECT_EQ(f.loops[0].size(), 4u);
+  EXPECT_EQ(f.loops[1].size(), 4u);
+  // 4 outer + 4 hole vertices/edges, all distinct (hole does not touch the boundary).
+  EXPECT_EQ(model.root().vertices.size(), 8u);
+  EXPECT_EQ(model.root().edges.size(), 8u);
+}
+
+TEST(Create, HoleNeedsAtLeast3Points) {
+  auto builder = create();
+  FaceOptions opts;
+  opts.holes = {{{1, 1, 0}, {2, 2, 0}}};
+  EXPECT_THROW(builder->add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}}, opts),
+               SkpWriteError);
+}
+
+TEST(Create, AutoTriangulateSplitsANonPlanarQuadIntoTwoFaces) {
+  auto builder = create();
+  FaceOptions opts;
+  opts.auto_triangulate = true;
+  builder->add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 5}, {0, 10, 0}}, opts);
+
+  SkpModel model = round_trip(*builder);
+  EXPECT_EQ(model.root().faces.size(), 2u);
+}
+
+TEST(Create, AutoTriangulateLeavesAnAlreadyPlanarQuadAsOneFace) {
+  auto builder = create();
+  FaceOptions opts;
+  opts.auto_triangulate = true;
+  builder->add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}}, opts);
+
+  SkpModel model = round_trip(*builder);
+  EXPECT_EQ(model.root().faces.size(), 1u);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Circles, arcs, polylines.
+// ---------------------------------------------------------------------------------------------
+
+TEST(Create, CircleProducesAFaceWithNSegmentVerticesAndEdges) {
+  auto builder = create();
+  CircleOptions opts;
+  opts.num_segments = 16;
+  builder->add_circle({50, 50, 0}, {0, 0, 1}, 40.0, opts);
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.root().faces.size(), 1u);
+  EXPECT_EQ(model.root().vertices.size(), 16u);
+  EXPECT_EQ(model.root().edges.size(), 16u);
+}
+
+TEST(Create, ArcProducesEdgesButNoFace) {
+  auto builder = create();
+  ArcOptions opts;
+  opts.num_segments = 8;
+  builder->add_arc({50, 50, 0}, {0, 0, 1}, 40.0, 0.0, kPi / 2.0, opts);
+
+  SkpModel model = round_trip(*builder);
+  EXPECT_EQ(model.root().faces.size(), 0u);
+  EXPECT_EQ(model.root().vertices.size(), 9u);  // num_segments + 1 endpoints
+  EXPECT_EQ(model.root().edges.size(), 8u);
+}
+
+TEST(Create, PolylineProducesEdgesButNoFace) {
+  auto builder = create();
+  builder->add_polyline({{0, 0, 0}, {10, 10, 0}, {20, 0, 0}, {30, 10, 0}});
+
+  SkpModel model = round_trip(*builder);
+  EXPECT_EQ(model.root().faces.size(), 0u);
+  EXPECT_EQ(model.root().vertices.size(), 4u);
+  EXPECT_EQ(model.root().edges.size(), 3u);
+}
+
+TEST(Create, ClosedPolylineConnectsLastPointToFirst) {
+  auto builder = create();
+  PolylineOptions opts;
+  opts.closed = true;
+  builder->add_polyline({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}}, opts);
+
+  SkpModel model = round_trip(*builder);
+  EXPECT_EQ(model.root().vertices.size(), 4u);
+  EXPECT_EQ(model.root().edges.size(), 4u);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Attributes.
+// ---------------------------------------------------------------------------------------------
+
+TEST(Create, InstanceAttributesRoundTrip) {
+  // Writer stores custom attributes as CAttributeNamed. The public model now
+  // keeps their types (int32/double/string), matching Python's
+  // Instance.attribute_dictionaries. properties stays the stringified
+  // dynamic_attributes view and is empty here.
+  auto builder = create();
+  auto& part = builder->add_component_definition("Part");
+  part.add_face({{0, 0, 0}, {1, 0, 0}, {1, 1, 0}});
+  part.close();
+
+  InstanceOptions opts;
+  opts.attributes["count"] = std::int32_t{42};
+  opts.attributes["label"] = std::string{"widget"};
+  opts.attributes["weight"] = 3.5;
+  builder->add_instance(part, opts);
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.root().instances.size(), 1u);
+  const auto& inst = model.root().instances[0];
+  EXPECT_TRUE(inst.properties.empty());
+  const auto& attrs = inst.attribute_dictionaries.at("attributes");
+  EXPECT_EQ(attrs.at("count").kind, ParsedAttribute::Kind::Integer);
+  EXPECT_EQ(attrs.at("count").integer, 42);
+  EXPECT_EQ(attrs.at("label"), "widget");
+  EXPECT_EQ(attrs.at("weight").kind, ParsedAttribute::Kind::Float);
+  EXPECT_DOUBLE_EQ(attrs.at("weight").number, 3.5);
+}
+
+TEST(Create, InstanceBooleanAndLengthAttributesKeepTheirTypes) {
+  // SketchUp's own boolean (type 7) and Length (type 12) - Python's `bool` / `create.Length` -
+  // used to be unwritable here (a bool had to go out as an int32, a Length as a plain double)
+  // and read back as Integer / Float.
+  auto builder = create();
+  auto& part = builder->add_component_definition("Part");
+  part.add_face({{0, 0, 0}, {1, 0, 0}, {1, 1, 0}});
+  part.close();
+
+  InstanceOptions opts;
+  opts.attributes["visible"] = AttributeBool{true};
+  opts.attributes["hidden"] = AttributeBool{false};
+  opts.attributes["depth"] = AttributeLength{15.5};
+  opts.attributes["weight"] = 3.5;
+  builder->add_instance(part, opts);
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.root().instances.size(), 1u);
+  const auto& attrs = model.root().instances[0].attribute_dictionaries.at("attributes");
+  EXPECT_EQ(attrs.at("visible").kind, ParsedAttribute::Kind::Boolean);
+  EXPECT_EQ(attrs.at("visible").integer, 1);
+  EXPECT_EQ(attrs.at("hidden").kind, ParsedAttribute::Kind::Boolean);
+  EXPECT_EQ(attrs.at("hidden").integer, 0);
+  EXPECT_EQ(attrs.at("depth").kind, ParsedAttribute::Kind::Length);
+  EXPECT_DOUBLE_EQ(attrs.at("depth").number, 15.5);
+  EXPECT_EQ(attrs.at("weight").kind, ParsedAttribute::Kind::Float);
+  // Stringified views keep the integer / float text they always had.
+  EXPECT_EQ(attrs.at("visible").to_string(), "1");
+  EXPECT_EQ(attrs.at("depth").to_string(), "15.5");
+}
+
+TEST(Create, LayerExtraDictionariesRoundTrip) {
+  auto builder = create();
+  LayerOptions opts;
+  opts.extra_dictionaries["plugin"]["n"] = std::int32_t{7};
+  builder->add_layer("Walls", opts);
+  builder->add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}});
+
+  SkpModel model = round_trip(*builder);
+  const Layer* walls = nullptr;
+  for (const auto& layer : model.layers) {
+    if (layer.name == "Walls") walls = &layer;
+  }
+  ASSERT_NE(walls, nullptr);
+  ASSERT_TRUE(walls->attribute_dictionaries.count("plugin"));
+  EXPECT_EQ(walls->attribute_dictionaries.at("plugin").at("n"), "7");
+}
+
+TEST(Create, FaceAndDefinitionAttributesDoNotThrow) {
+  // The reader's public model doesn't expose face/definition-level attributes (see edit.hpp's
+  // own documented gap), so this is a smoke test that writing them at least succeeds and
+  // produces a file our own reader still parses without error - not a content assertion.
+  auto builder = create();
+  DefinitionOptions dopts;
+  dopts.attributes["material_code"] = std::string{"ABC-123"};
+  auto& part = builder->add_component_definition("Part", dopts);
+  FaceOptions fopts;
+  fopts.attributes["area_sqft"] = 12.5;
+  part.add_face({{0, 0, 0}, {1, 0, 0}, {1, 1, 0}}, fopts);
+  part.close();
+  builder->add_instance(part);
+
+  EXPECT_NO_THROW(round_trip(*builder));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Explicit texture positioning (front_uv/back_uv).
+// ---------------------------------------------------------------------------------------------
+
+std::filesystem::path write_fake_png(const char* name) {
+  auto path = std::filesystem::temp_directory_path() / name;
+  std::ofstream f(path, std::ios::binary);
+  ByteBuffer png = fake_png_bytes();
+  f.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+  return path;
+}
+
+void expect_matrix(const std::array<double, 9>& m, const std::array<double, 9>& expected,
+                   double abs = 1e-9) {
+  for (int i = 0; i < 9; ++i) EXPECT_NEAR(m[i], expected[i], abs) << "m[" << i << "]";
+}
+
+TEST(Create, ExplicitFrontUvRoundTrips) {
+  auto builder = create();
+  int brick = builder->add_material("Brick", Color3{150, 100, 50});
+  FaceOptions opts;
+  opts.material = brick;
+  opts.front_uv = UvCorrespondence{
+      {Point3{0, 0, 0}, {0.0, 0.0}},
+      {Point3{50, 0, 0}, {1.0, 0.0}},
+      {Point3{0, 50, 0}, {0.0, 1.0}},
+  };
+  builder->add_face({{0, 0, 0}, {100, 0, 0}, {100, 100, 0}, {0, 100, 0}}, opts);
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.root().faces.size(), 1u);
+  const Face& f = model.root().faces.begin()->second;
+  EXPECT_TRUE(f.uv_transform.has_value());
+}
+
+TEST(Create, VertexOrderDoesNotTurnTheMapping) {
+  // Same 100×100 square listed from a different corner so the first edge runs +Y,
+  // pinned to u = x/50, v = y/50. SketchUp's basis is the normal alone ((X, Y)
+  // for a horizontal face), so the stored matrix must stay diag(50, 50). The
+  // writer used to solve in a first-edge basis and turned this face 90°.
+  auto png = write_fake_png("openskp_uv_vertex_order.png");
+  auto builder = create();
+  int tex = builder->add_texture_material("Brick", png);
+  FaceOptions opts;
+  opts.material = tex;
+  opts.front_uv = UvCorrespondence{
+      {Point3{0, 0, 0}, {0.0, 0.0}},
+      {Point3{50, 0, 0}, {1.0, 0.0}},
+      {Point3{0, 50, 0}, {0.0, 1.0}},
+  };
+  builder->add_face({{100, 0, 0}, {100, 100, 0}, {0, 100, 0}, {0, 0, 0}}, opts);
+
+  SkpModel model = round_trip(*builder);
+  std::filesystem::remove(png);
+  ASSERT_EQ(model.root().faces.size(), 1u);
+  const Face& f = model.root().faces.begin()->second;
+  ASSERT_TRUE(f.uv_transform.has_value());
+  expect_matrix(*f.uv_transform, {50.0, 0.0, 0.0, 0.0, 50.0, 0.0, 0.0, 0.0, 1.0});
+}
+
+TEST(Create, DownwardFaceUsesMinusXPlusY) {
+  // Clockwise XY loop → normal −Z. Pins (0,0)→(0,0), (2,0)→(1,0), (0,2)→(0,1)
+  // in SketchUp's downward (−X, +Y) basis store xf = diag(−2, 2). The old
+  // first-edge writer produced diag(2, −2); the (X, −Y) reader mirror turned
+  // every underside.
+  auto png = write_fake_png("openskp_uv_downward.png");
+  auto builder = create();
+  int tex = builder->add_texture_material("Brick", png);
+  FaceOptions opts;
+  opts.material = tex;
+  opts.front_uv = UvCorrespondence{
+      {Point3{0, 0, 0}, {0.0, 0.0}},
+      {Point3{2, 0, 0}, {1.0, 0.0}},
+      {Point3{0, 2, 0}, {0.0, 1.0}},
+  };
+  builder->add_face({{0, 2, 0}, {2, 2, 0}, {2, 0, 0}, {0, 0, 0}}, opts);
+
+  SkpModel model = round_trip(*builder);
+  std::filesystem::remove(png);
+  ASSERT_EQ(model.root().faces.size(), 1u);
+  const Face& f = model.root().faces.begin()->second;
+  ASSERT_TRUE(f.normal.has_value());
+  EXPECT_NEAR((*f.normal)[2], -1.0, 1e-9);
+  ASSERT_TRUE(f.uv_transform.has_value());
+  expect_matrix(*f.uv_transform, {-2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 1.0});
+}
+
+TEST(Create, PinsAreInTilesWhateverTheAppliedSize) {
+  // Pins are in tiles; SketchUp stores the matrix in texture-inches. A 10 in
+  // tile with (50,0)→(1,0) must store a 5× scale, not the unscaled 50 that
+  // made a 2 m water tile 78.74× too big.
+  auto png = write_fake_png("openskp_uv_tile_size.png");
+  auto builder = create();
+  int tex = builder->add_texture_material("Brick", png, 10.0, 10.0);
+  FaceOptions opts;
+  opts.material = tex;
+  opts.front_uv = UvCorrespondence{
+      {Point3{0, 0, 0}, {0.0, 0.0}},
+      {Point3{50, 0, 0}, {1.0, 0.0}},
+      {Point3{0, 50, 0}, {0.0, 1.0}},
+  };
+  builder->add_face({{0, 0, 0}, {100, 0, 0}, {100, 100, 0}, {0, 100, 0}}, opts);
+
+  SkpModel model = round_trip(*builder);
+  std::filesystem::remove(png);
+  ASSERT_EQ(model.root().faces.size(), 1u);
+  const Face& f = model.root().faces.begin()->second;
+  ASSERT_TRUE(f.uv_transform.has_value());
+  expect_matrix(*f.uv_transform, {5.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 1.0});
+}
+
+TEST(Create, TiltedFaceEdgeAlignedMappingIsAPureScale) {
+  auto png = write_fake_png("openskp_uv_tilted.png");
+  auto builder = create();
+  int tex = builder->add_texture_material("Brick", png);
+  constexpr double s = 70.71067811865476;  // 100 / sqrt(2)
+  FaceOptions opts;
+  opts.material = tex;
+  opts.front_uv = UvCorrespondence{
+      {Point3{0, 0, 0}, {0.0, 0.0}},
+      {Point3{100, 0, 0}, {1.0, 0.0}},
+      {Point3{0, s, s}, {0.0, 1.0}},
+  };
+  builder->add_face({{0, 0, 0}, {100, 0, 0}, {100, s, s}, {0, s, s}}, opts);
+
+  SkpModel model = round_trip(*builder);
+  std::filesystem::remove(png);
+  ASSERT_EQ(model.root().faces.size(), 1u);
+  const Face& f = model.root().faces.begin()->second;
+  ASSERT_TRUE(f.uv_transform.has_value());
+  expect_matrix(*f.uv_transform, {100.0, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 1.0}, 1e-6);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Exact archive-slot-32767 boundary (see create.hpp's module docstring and create.cpp's
+// ArchiveWriter::backref/new_of_known_class comments for why this exact boundary is a real,
+// previously-shipped bug class in the Python port this mirrors).
+// ---------------------------------------------------------------------------------------------
+
+TEST(Create, LargeModelCrossingTheSlotBoundaryRoundTrips) {
+  // Deliberately uses unique (non-shared) vertices per triangle - the same worst-case shape a
+  // flattened CAD import produces, landing the 0x7FFF crossing at a non-hand-picked slot.
+  auto builder = create();
+  constexpr int kTriangles = 5000;
+  for (int i = 0; i < kTriangles; ++i) {
+    double x = i * 10.0;
+    builder->add_face({{x, 0.0, 0.0}, {x + 1.0, 0.0, 0.0}, {x, 1.0, 0.0}});
+  }
+
+  SkpModel model = round_trip(*builder);
+  EXPECT_EQ(model.root().faces.size(), static_cast<std::size_t>(kTriangles));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Writer: section plane / dimension / text / construction line / construction point.
+//
+// Ports create.py's add_section_plane/add_dimension/add_text/add_construction_line/
+// add_construction_point, byte-exact against the same real-SketchUp-harvested record templates
+// (see docs/dimension-record-notes.md) Python's own writer already uses.
+//
+// SectionPlane/Text/Dimension round-trip fully - legacy.cpp's readers for them already expose
+// real data on model.root() (confirmed correct in a prior PR/test, before this writer existed).
+// ConstructionLine/ConstructionPoint only smoke-test for now: legacy.cpp's readers for those two
+// currently discard the geometry they parse rather than exposing it on model.root() at all, a
+// separate, already-tracked openskp#285 item ("Writer + reader: construction lines/points").
+// ---------------------------------------------------------------------------------------------
+
+TEST(Create, SectionPlaneTextDimensionRoundTrip) {
+  auto builder = create();
+  builder->add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}});
+  builder->add_section_plane({10, 20, 30}, {0, 0, 1});
+  builder->add_text("Hello", {5, 5, 5});
+  builder->add_dimension({0, 0, 0}, {10, 0, 0});
+
+  SkpModel model = round_trip(*builder);
+
+  ASSERT_EQ(model.root().section_planes.size(), 1u);
+  const auto& sp = model.root().section_planes[0];
+  EXPECT_NEAR(sp.plane[0], 0.0, 1e-6);
+  EXPECT_NEAR(sp.plane[1], 0.0, 1e-6);
+  EXPECT_NEAR(sp.plane[2], 1.0, 1e-6);
+  EXPECT_NEAR(sp.plane[3], -30.0, 1e-6);
+  EXPECT_FALSE(sp.hidden);
+
+  ASSERT_EQ(model.root().texts.size(), 1u);
+  EXPECT_EQ(model.root().texts[0].text, "Hello");
+  EXPECT_FALSE(model.root().texts[0].hidden);
+
+  EXPECT_EQ(model.root().dimensions.size(), 1u);
+}
+
+TEST(Create, SectionPlaneNormalizesANonUnitNormal) {
+  auto builder = create();
+  builder->add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}});
+  builder->add_section_plane({0, 0, 5}, {0, 0, 2});
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.root().section_planes.size(), 1u);
+  EXPECT_NEAR(model.root().section_planes[0].plane[2], 1.0, 1e-6);
+  EXPECT_NEAR(model.root().section_planes[0].plane[3], -5.0, 1e-6);
+}
+
+TEST(Create, TwoDimensionsShareOneEmbeddedFont) {
+  // add_dimension/add_text only ever embed the CSkFont payload inline on the FIRST call and
+  // back-ref it afterwards - exercise that shared-state path across a call pair without
+  // asserting on font bytes directly (the point here is that a second dimension doesn't corrupt
+  // the archive's slot numbering).
+  auto builder = create();
+  builder->add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}});
+  builder->add_dimension({0, 0, 0}, {10, 0, 0});
+  builder->add_dimension({0, 5, 0}, {10, 5, 0});
+  builder->add_text("First", {1, 1, 1});
+
+  SkpModel model = round_trip(*builder);
+  EXPECT_EQ(model.root().dimensions.size(), 2u);
+  EXPECT_EQ(model.root().texts.size(), 1u);
+}
+
+TEST(Create, AnnotationDrawingPropertiesRoundTrip) {
+  auto builder = create();
+  const int layer = builder->add_layer("Annotations");
+  DimensionOptions dim_options;
+  dim_options.layer = layer;
+  dim_options.hidden = true;
+  TextOptions text_options;
+  text_options.layer = layer;
+  text_options.hidden = true;
+  auto& nested = builder->add_component_definition("TextOnly");
+  text_options.screen_position = std::array<double, 2>{0.23, 0.67};
+  nested.add_text("Screen label", {0, 0, 0}, {0, 0, 0}, text_options);
+  nested.close();
+  builder->add_instance(nested);
+  text_options.screen_position.reset();
+  builder->add_text("Root label", {2, 3, 4}, {0, 0, 5}, text_options);
+  builder->add_dimension({0, 0, 0}, {10, 0, 0}, Point3{0, 3, 0}, dim_options);
+
+  const auto model = round_trip(*builder);
+  ASSERT_EQ(model.root().dimensions.size(), 1u);
+  EXPECT_EQ(model.root().dimensions[0].layer, "Annotations");
+  EXPECT_TRUE(model.root().dimensions[0].hidden);
+  ASSERT_EQ(model.root().texts.size(), 1u);
+  const auto& text = model.root().texts[0];
+  EXPECT_EQ(text.layer, "Annotations");
+  EXPECT_TRUE(text.hidden);
+  ASSERT_TRUE(text.point && text.label_point);
+  EXPECT_EQ(*text.point, (Vec3{2, 3, 4}));
+  EXPECT_EQ(*text.label_point, (Vec3{2, 3, 9}));
+  const Definition* definition = nullptr;
+  for (const auto& pair : model.definitions)
+    if (pair.second.name == "TextOnly") definition = &pair.second;
+  ASSERT_NE(definition, nullptr);
+  ASSERT_EQ(definition->texts.size(), 1u);
+  const auto& screen = definition->texts[0];
+  EXPECT_EQ(screen.layer, "Annotations");
+  EXPECT_TRUE(screen.hidden);
+  EXPECT_EQ(screen.leader_type, 0);
+  ASSERT_TRUE(screen.screen_position);
+  EXPECT_EQ(*screen.screen_position, (std::array<double, 2>{0.23, 0.67}));
+}
+
+TEST(Create, LeaderlessModelTextRetainsBothPointsAndVisibility) {
+  auto builder = create();
+  const auto add = [](auto& sink) {
+    for (int type : {0, 1, 2}) {
+      for (bool display : {false, true}) {
+        TextOptions options;
+        options.leader_type = type;
+        options.display_leader = display;
+        sink.add_text("Model label", {5, 6, 7}, {2, 3, 4}, options);
+      }
+    }
+    TextOptions screen;
+    screen.screen_position = std::array<double, 2>{0.23, 0.67};
+    sink.add_text("Screen label", {0, 0, 0}, {0, 0, 0}, screen);
+  };
+  auto& nested = builder->add_component_definition("Leader visibility");
+  add(nested);
+  nested.close();
+  builder->add_instance(nested);
+  add(*builder);
+  const auto model = round_trip(*builder);
+  const auto verify = [](const Definition& owner) {
+    ASSERT_EQ(owner.texts.size(), 7u);
+    for (std::size_t i = 0; i < 6; ++i) {
+      const auto& text = owner.texts[i];
+      ASSERT_TRUE(text.point && text.label_point);
+      EXPECT_EQ(*text.point, (Vec3{5, 6, 7}));
+      EXPECT_EQ(*text.label_point, (Vec3{7, 9, 11}));
+      EXPECT_NE(text.leader_type, 0);  // zero would turn it into screen text in SketchUp
+      EXPECT_EQ(text.display_leader, i == 3 || i == 5);
+    }
+    EXPECT_EQ(owner.texts[6].leader_type, 0);
+    ASSERT_TRUE(owner.texts[6].screen_position);
+    EXPECT_EQ(*owner.texts[6].screen_position, (std::array<double, 2>{0.23, 0.67}));
+  };
+  verify(model.root());
+  ASSERT_EQ(model.definitions.size(), 1u);
+  verify(model.definitions.begin()->second);
+}
+
+TEST(Create, InvalidAnnotationOptionsLeaveArchiveUsable) {
+  auto builder = create();
+  DimensionOptions dim_options;
+  dim_options.layer = 999;
+  EXPECT_THROW(builder->add_dimension({0, 0, 0}, {10, 0, 0}, Point3{0, 3, 0}, dim_options),
+               SkpWriteError);
+  TextOptions text_options;
+  text_options.layer = 999;
+  EXPECT_THROW(builder->add_text("Bad layer", {0, 0, 0}, {1, 0, 0}, text_options), SkpWriteError);
+  text_options.layer.reset();
+  text_options.screen_position = std::array<double, 2>{-1, 0.5};
+  EXPECT_THROW(builder->add_text("Bad position", {0, 0, 0}, {1, 0, 0}, text_options),
+               SkpWriteError);
+  builder->add_text("Valid", {0, 0, 0}, {1, 0, 0});
+  const auto model = round_trip(*builder);
+  EXPECT_TRUE(model.root().dimensions.empty());
+  ASSERT_EQ(model.root().texts.size(), 1u);
+  EXPECT_EQ(model.root().texts[0].text, "Valid");
+}
+
+TEST(Create, ConstructionLineAndPointDoNotCorruptTheFile) {
+  auto builder = create();
+  builder->add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}});
+  builder->add_construction_point({1, 2, 3});
+  builder->add_construction_line({0, 0, 0}, Point3{10, 0, 0});
+  builder->add_construction_line({0, 0, 0}, std::nullopt, Point3{0, 0, 1});
+  builder->add_section_plane({10, 20, 30}, {0, 0, 1});  // still readable afterwards
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.root().section_planes.size(), 1u);
+  EXPECT_NEAR(model.root().section_planes[0].plane[3], -30.0, 1e-6);
+}
+
+TEST(Create, GuideOptionsRoundTripHiddenFlagAndLayer) {
+  auto builder = create();
+  const int guides = builder->add_layer("Guides");
+  builder->add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}});
+  builder->add_construction_point({1, 2, 3}, GuideOptions{std::nullopt, true});
+  builder->add_construction_point({4, 5, 6}, GuideOptions{guides, false});
+  builder->add_construction_line({0, 0, 0}, Point3{10, 0, 0}, std::nullopt,
+                                 GuideOptions{guides, true});
+  builder->add_construction_line({0, 0, 4}, std::nullopt, Point3{0, 0, 1});
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.root().construction_points.size(), 2u);
+  EXPECT_TRUE(model.root().construction_points[0].hidden);
+  EXPECT_TRUE(model.root().construction_points[0].layer.empty());
+  EXPECT_FALSE(model.root().construction_points[1].hidden);
+  EXPECT_EQ(model.root().construction_points[1].layer, "Guides");
+  ASSERT_EQ(model.root().construction_lines.size(), 2u);
+  EXPECT_TRUE(model.root().construction_lines[0].hidden);
+  EXPECT_EQ(model.root().construction_lines[0].layer, "Guides");
+  EXPECT_FALSE(model.root().construction_lines[1].hidden);
+  EXPECT_TRUE(model.root().construction_lines[1].layer.empty());
+}
+
+TEST(Create, GuideOptionsRejectAForeignLayerHandle) {
+  auto builder = create();
+  builder->add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}});
+  EXPECT_THROW(builder->add_construction_point({1, 2, 3}, GuideOptions{42, false}), SkpWriteError);
+}
+
+TEST(Create, AddSectionPlaneRejectsAZeroNormal) {
+  auto builder = create();
+  builder->add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}});
+  EXPECT_THROW(builder->add_section_plane({0, 0, 0}, {0, 0, 0}), SkpWriteError);
+}
+
+TEST(Create, AddConstructionLineRequiresExactlyOneOfPoint2OrDirection) {
+  auto builder = create();
+  builder->add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}});
+  EXPECT_THROW(builder->add_construction_line({0, 0, 0}), SkpWriteError);
+  EXPECT_THROW(builder->add_construction_line({0, 0, 0}, Point3{1, 0, 0}, Point3{0, 1, 0}),
+               SkpWriteError);
+}
+
+TEST(Create, NestedDefinitionConstructionRoundTrips) {
+  // Construction is last in the nested definition on purpose: that is the
+  // case that used to desync legacy_walk (cline trailer calibration
+  // against the definition's nrel=0 tail). Root-level guides follow, so
+  // a wrong cached trailer length would also corrupt those.
+  auto builder = create();
+  auto& nested = builder->add_component_definition("GuideGroup");
+  nested.add_face({{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}});
+  nested.add_construction_point({4.0, 5.0, 6.0});
+  nested.add_construction_line({1.0, 1.0, 1.0}, Point3{2.0, 2.0, 2.0});
+  nested.close();
+  builder->add_instance(nested);
+  builder->add_construction_point({1.0, 2.0, 3.0});
+  builder->add_construction_line({0.0, 0.0, 0.0}, Point3{12.0, 0.0, 0.0});
+  builder->add_construction_line({0.0, 0.0, 4.0}, std::nullopt, Point3{0.0, 0.0, 1.0});
+
+  SkpModel model = round_trip(*builder);
+  ASSERT_EQ(model.root().construction_points.size(), 1u);
+  EXPECT_NEAR(model.root().construction_points[0].position[0], 1.0, 1e-9);
+  EXPECT_NEAR(model.root().construction_points[0].position[1], 2.0, 1e-9);
+  EXPECT_NEAR(model.root().construction_points[0].position[2], 3.0, 1e-9);
+
+  ASSERT_EQ(model.root().construction_lines.size(), 2u);
+  ASSERT_TRUE(model.root().construction_lines[0].start && model.root().construction_lines[0].end);
+  EXPECT_NEAR((*model.root().construction_lines[0].end)[0], 12.0, 1e-9);
+  EXPECT_FALSE(model.root().construction_lines[1].start);
+  EXPECT_FALSE(model.root().construction_lines[1].end);
+  EXPECT_NEAR(model.root().construction_lines[1].point[2], 4.0, 1e-9);
+
+  const Definition* group = nullptr;
+  for (const auto& kv : model.definitions) {
+    if (kv.second.name == "GuideGroup") group = &kv.second;
+  }
+  ASSERT_NE(group, nullptr);
+  ASSERT_EQ(group->construction_points.size(), 1u);
+  EXPECT_NEAR(group->construction_points[0].position[0], 4.0, 1e-9);
+  ASSERT_EQ(group->construction_lines.size(), 1u);
+  ASSERT_TRUE(group->construction_lines[0].start && group->construction_lines[0].end);
+}
+
+TEST(Create, ModelGuidIsUniquePerBuilderAndStableAcrossWrites) {
+  auto first = create();
+  auto second = create();
+  first->add_face(square_pts());
+  second->add_face(square_pts());
+  const auto a = first->to_bytes(), b = second->to_bytes(), again = first->to_bytes();
+  ASSERT_GE(a.size(), 68u);
+  ASSERT_GE(b.size(), 68u);
+  ASSERT_GE(again.size(), 68u);
+  const ByteBuffer guid(a.begin() + 52, a.begin() + 68);
+  EXPECT_NE(guid, ByteBuffer(b.begin() + 52, b.begin() + 68));
+  EXPECT_EQ(guid, ByteBuffer(again.begin() + 52, again.begin() + 68));
+  // Version/variant bits in Windows GUID order.
+  EXPECT_EQ(guid[7] & 0xf0, 0x40);
+  EXPECT_EQ(guid[8] & 0xc0, 0x80);
+}
+
+TEST(Create, ExplicitModelGuidUsesNativeByteOrder) {
+  auto builder = create();
+  builder->add_face(square_pts());
+  const ByteBuffer native{0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x46,
+                          0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+  for (const auto* guid :
+       {"00112233-4455-4677-8899-aabbccddeeff", "00112233445546778899AABBCCDDEEFF"}) {
+    builder->set_guid(guid);
+    const auto data = builder->to_bytes();
+    ASSERT_GE(data.size(), 68u);
+    EXPECT_EQ(ByteBuffer(data.begin() + 52, data.begin() + 68), native);
+  }
+  EXPECT_THROW(builder->set_guid("not-a-guid"), SkpWriteError);
+  EXPECT_THROW(builder->set_guid("00112233445546778899AABBCCDDEEFZ"), SkpWriteError);
+  EXPECT_THROW(builder->set_guid("00112233-4455-4677-8899a-abbccddeeff"), SkpWriteError);
+  const auto unchanged = builder->to_bytes();
+  EXPECT_EQ(ByteBuffer(unchanged.begin() + 52, unchanged.begin() + 68), native);
+  builder->set_guid("");
+  const auto reset = builder->to_bytes();
+  EXPECT_NE(ByteBuffer(reset.begin() + 52, reset.begin() + 68), native);
+}
+
+TEST(Create, DefinitionGuidPreservedInArchiveAndPublicModel) {
+  for (const auto* guid :
+       {"00112233-4455-4677-8899-aabbccddeeff", "00112233445546778899AABBCCDDEEFF"}) {
+    auto builder = create();
+    DefinitionOptions options;
+    options.guid = guid;
+    auto& def = builder->add_component_definition("Identified", options);
+    def.add_face(square_pts());
+    def.close();
+    builder->add_instance(def);
+    const auto data = builder->to_bytes();
+    const ByteBuffer native{0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x46,
+                            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    EXPECT_NE(std::search(data.begin(), data.end(), native.begin(), native.end()), data.end());
+    const auto model = SkpFile::from_buffer(data).parse();
+    ASSERT_EQ(model.definitions.size(), 1u);
+    EXPECT_EQ(model.definitions.begin()->second.guid, "00112233445546778899AABBCCDDEEFF");
+    ASSERT_EQ(model.root().instances.size(), 1u);
+    ASSERT_TRUE(model.root().instances[0].ref_idx.has_value());
+    EXPECT_EQ(model.definitions.at(*model.root().instances[0].ref_idx).guid,
+              "00112233445546778899AABBCCDDEEFF");
+  }
+}
+
+TEST(Create, InvalidDefinitionGuidDoesNotPartiallyAddDefinition) {
+  auto builder = create();
+  DefinitionOptions options;
+  options.guid = "not-a-guid";
+  EXPECT_THROW(builder->add_component_definition("Invalid", options), SkpWriteError);
+  auto& good = builder->add_component_definition("Valid");
+  good.add_face(square_pts());
+  good.close();
+  builder->add_instance(good);
+  const auto model = round_trip(*builder);
+  ASSERT_EQ(model.definitions.size(), 1u);
+  EXPECT_EQ(model.definitions.begin()->second.name, "Valid");
+}
+
+TEST(Create, DefaultDefinitionGuidsAreDistinctAndStable) {
+  auto builder = create();
+  auto& a = builder->add_component_definition("Same name");
+  a.add_face(square_pts());
+  a.close();
+  auto& b = builder->add_component_definition("Same name");
+  b.add_face(square_pts());
+  b.close();
+  builder->add_instance(a);
+  builder->add_instance(b);
+  const auto first = round_trip(*builder), second = round_trip(*builder);
+  ASSERT_EQ(first.definitions.size(), 2u);
+  auto it = first.definitions.begin();
+  const auto guid = it++->second.guid;
+  EXPECT_NE(guid, it->second.guid);
+  for (const auto& entry : first.definitions)
+    EXPECT_EQ(entry.second.guid, second.definitions.at(entry.first).guid);
+}
+
+TEST(Create, AttributeStringsCrossMfcLengthBoundaries) {
+  for (const std::size_t length : {254u, 255u, 256u, 65533u, 65534u, 65535u, 65536u}) {
+    SCOPED_TRACE(length);
+    auto builder = create();
+    auto& definition = builder->add_component_definition("TextCarrier");
+    definition.add_face({{0, 0, 0}, {1, 0, 0}, {0, 1, 0}});
+    definition.close();
+    InstanceOptions options;
+    options.attribute_dict_name = "RoundTrip";
+    const std::string ascii(length, 'x');
+    const std::string unicode = std::string(length - 2, 'x') + u8"\U0001F600";
+    options.attributes["ascii"] = ascii;
+    options.attributes["unicode"] = unicode;
+    builder->add_instance(definition, options);
+    const auto model = round_trip(*builder);
+    ASSERT_EQ(model.root().instances.size(), 1u);
+    const auto& attrs = model.root().instances.front().attribute_dictionaries.at("RoundTrip");
+    EXPECT_EQ(attrs.at("ascii").text, ascii);
+    EXPECT_EQ(attrs.at("unicode").text, unicode);
+  }
+}
+
+TEST(Create, MalformedUtf16AttributeStringsUseReplacementCharacters) {
+  auto builder = create();
+  auto& definition = builder->add_component_definition("TextCarrier");
+  definition.add_face({{0, 0, 0}, {1, 0, 0}, {0, 1, 0}});
+  definition.close();
+  InstanceOptions options;
+  options.attribute_dict_name = "RoundTrip";
+  options.attributes["damaged"] = "WXYZQ";
+  options.attributes["intact"] = "still readable";
+  builder->add_instance(definition, options);
+
+  auto bytes = builder->to_bytes();
+  const ByteBuffer original = {'W', 0, 'X', 0, 'Y', 0, 'Z', 0, 'Q', 0};
+  // Lone low surrogate, high followed by ASCII, then a valid pair at the end.
+  const ByteBuffer malformed = {0x00, 0xDC, 0x00, 0xD8, 'Y', 0, 0x3D, 0xD8, 0x00, 0xDE};
+  const auto start = std::search(bytes.begin(), bytes.end(), original.begin(), original.end());
+  ASSERT_NE(start, bytes.end());
+  std::copy(malformed.begin(), malformed.end(), start);
+  const auto parsed = SkpFile::from_buffer(bytes).parse();
+  ASSERT_EQ(parsed.root().instances.size(), 1u);
+  const auto& attrs = parsed.root().instances.front().attribute_dictionaries.at("RoundTrip");
+  EXPECT_EQ(attrs.at("damaged").text, u8"\uFFFD\uFFFDY\U0001F600");
+  EXPECT_EQ(attrs.at("intact").text, "still readable");
+
+  // A trailing high surrogate cannot read into the next archive field.
+  *(start + 9) = 0xD8;
+  const auto trailing = SkpFile::from_buffer(bytes).parse();
+  ASSERT_EQ(trailing.root().instances.size(), 1u);
+  EXPECT_EQ(
+      trailing.root().instances.front().attribute_dictionaries.at("RoundTrip").at("damaged").text,
+      u8"\uFFFD\uFFFDY\uFFFD\uFFFD");
+}
+
+}  // namespace
+}  // namespace openskp

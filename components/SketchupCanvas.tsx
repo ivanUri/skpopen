@@ -1,0 +1,518 @@
+"use client";
+
+import { OrthographicCamera, OrbitControls, PerspectiveCamera } from "@react-three/drei";
+import { Canvas, useThree } from "@react-three/fiber";
+import { useCallback, useEffect, useRef, useState } from "react";
+import * as THREE from "three";
+import { buildScene, isDrawableEdge, parseSkp } from "skp-core-custom";
+import type { Definition, Edge, SkpModel } from "skp-core-custom";
+
+export type RenderStyle = "shaded" | "hidden-line" | "monochrome" | "wireframe" | "xray";
+export type Projection = "perspective" | "orthographic";
+
+export type InstallationItem = {
+  id: string;
+  name: string;
+  definitionName: string;
+  layer: string;
+  count: number;
+  sizeMm: [number, number, number];
+  positionMm: [number, number, number];
+  properties: Record<string, string>;
+};
+
+export type SceneGroup = {
+  id: string;
+  path: string;
+  name: string;
+  definitionName: string;
+  layer: string;
+  depth: number;
+  count: number;
+  sizeMm: [number, number, number];
+  positionMm: [number, number, number];
+};
+
+type ModelStats = {
+  version?: string;
+  definitions: number;
+  layers: number;
+  layerNames?: string[];
+  materials: number;
+  primitives: number;
+  edges: number;
+  scenes: number;
+  bounds?: [number, number, number];
+};
+
+type Props = {
+  buffer: ArrayBuffer | null;
+  showGrid: boolean;
+  showEdges: boolean;
+  showAxes: boolean;
+  renderStyle: RenderStyle;
+  projection: Projection;
+  activeLayer: string;
+  selectedInstallId: string | null;
+  selectedGroupPath: string | null;
+  viewPreset: "iso" | "front" | "top";
+  onStats: (stats: ModelStats) => void;
+  onInstallationItems: (items: InstallationItem[]) => void;
+  onGroups: (groups: SceneGroup[]) => void;
+  onProgress: (value: number) => void;
+  onError: (message: string | null) => void;
+};
+
+type GltfMaterialDefinition = {
+  pbrMetallicRoughness?: {
+    baseColorFactor?: number[];
+    baseColorTexture?: { index: number };
+  };
+  alphaMode?: "OPAQUE" | "MASK" | "BLEND";
+};
+
+type Matrix = number[];
+type Point = [number, number, number];
+
+const IDENTITY: Matrix = [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1];
+const INCH_TO_METRE = 0.0254;
+
+function multiplyMatrices(a: Matrix, b: Matrix): Matrix {
+  const aa = a.length === 16 ? a : [...a.slice(0, 12), 1];
+  const bb = b.length === 16 ? b : [...b.slice(0, 12), 1];
+  if (aa.length === 16 && bb.length === 16) {
+    const result = new Array(16).fill(0);
+    for (let row = 0; row < 4; row += 1) {
+      for (let column = 0; column < 4; column += 1) {
+        for (let k = 0; k < 4; k += 1) result[column * 4 + row] += aa[k * 4 + row] * bb[column * 4 + k];
+      }
+    }
+    return result;
+  }
+  return [
+    aa[0] * bb[0] + aa[1] * bb[3] + aa[2] * bb[6],
+    aa[0] * bb[1] + aa[1] * bb[4] + aa[2] * bb[7],
+    aa[0] * bb[2] + aa[1] * bb[5] + aa[2] * bb[8],
+    aa[3] * bb[0] + aa[4] * bb[3] + aa[5] * bb[6],
+    aa[3] * bb[1] + aa[4] * bb[4] + aa[5] * bb[7],
+    aa[3] * bb[2] + aa[4] * bb[5] + aa[5] * bb[8],
+    aa[6] * bb[0] + aa[7] * bb[3] + aa[8] * bb[6],
+    aa[6] * bb[1] + aa[7] * bb[4] + aa[8] * bb[7],
+    aa[6] * bb[2] + aa[7] * bb[5] + aa[8] * bb[8],
+    aa[0] * bb[9] + aa[1] * bb[10] + aa[2] * bb[11] + aa[9],
+    aa[3] * bb[9] + aa[4] * bb[10] + aa[5] * bb[11] + aa[10],
+    aa[6] * bb[9] + aa[7] * bb[10] + aa[8] * bb[11] + aa[11],
+    1,
+  ];
+}
+
+function transformPoint(matrix: Matrix, point: Point): Point {
+  if (matrix.length === 16) {
+    return [
+      matrix[0] * point[0] + matrix[4] * point[1] + matrix[8] * point[2] + matrix[12],
+      matrix[1] * point[0] + matrix[5] * point[1] + matrix[9] * point[2] + matrix[13],
+      matrix[2] * point[0] + matrix[6] * point[1] + matrix[10] * point[2] + matrix[14],
+    ];
+  }
+  return [
+    matrix[0] * point[0] + matrix[1] * point[1] + matrix[2] * point[2] + matrix[9],
+    matrix[3] * point[0] + matrix[4] * point[1] + matrix[5] * point[2] + matrix[10],
+    matrix[6] * point[0] + matrix[7] * point[1] + matrix[8] * point[2] + matrix[11],
+  ];
+}
+
+function toThreePoint(point: Point): Point {
+  return [point[0] * INCH_TO_METRE, point[2] * INCH_TO_METRE, -point[1] * INCH_TO_METRE];
+}
+
+function installationId(metadata: { name?: string; definitionName?: string; layer?: string }) {
+  return [metadata.name || "Component", metadata.definitionName || "", metadata.layer || "Layer0"].join("::");
+}
+
+function collectInstallationItems(parsed: ReturnType<typeof buildScene>): InstallationItem[] {
+  const grouped = new Map<string, { name: string; definitionName: string; layer: string; paths: Set<string>; boundsByPath: Map<string, { min: Point; max: Point }>; positionMm: [number, number, number]; properties: Record<string, string> }>();
+  for (const primitive of parsed.glbPrimitives) {
+    const metadata = parsed.meshIndex[primitive.geomName];
+    if (!metadata || metadata.name === "ROOT") continue;
+    const id = installationId(metadata);
+    const existing = grouped.get(id) ?? {
+      name: metadata.name,
+      definitionName: metadata.definitionName,
+      layer: metadata.layer,
+      paths: new Set<string>(),
+      boundsByPath: new Map(),
+      positionMm: metadata.positionMm,
+      properties: metadata.properties || {},
+    };
+    existing.paths.add(metadata.path);
+    const pathBounds = existing.boundsByPath.get(metadata.path) ?? {
+      min: [Infinity, Infinity, Infinity] as Point,
+      max: [-Infinity, -Infinity, -Infinity] as Point,
+    };
+    for (let index = 0; index < primitive.positions.length; index += 3) {
+      pathBounds.min[0] = Math.min(pathBounds.min[0], primitive.positions[index]);
+      pathBounds.min[1] = Math.min(pathBounds.min[1], primitive.positions[index + 1]);
+      pathBounds.min[2] = Math.min(pathBounds.min[2], primitive.positions[index + 2]);
+      pathBounds.max[0] = Math.max(pathBounds.max[0], primitive.positions[index]);
+      pathBounds.max[1] = Math.max(pathBounds.max[1], primitive.positions[index + 1]);
+      pathBounds.max[2] = Math.max(pathBounds.max[2], primitive.positions[index + 2]);
+    }
+    existing.boundsByPath.set(metadata.path, pathBounds);
+    grouped.set(id, existing);
+  }
+  return [...grouped.entries()]
+    .map(([id, item]) => ({
+      id,
+      name: item.name,
+      definitionName: item.definitionName,
+      layer: item.layer,
+      count: item.paths.size,
+      sizeMm: [
+        Math.round(Math.max(...[...item.boundsByPath.values()].map((bounds) => bounds.max[0] - bounds.min[0])) * 1000),
+        Math.round(Math.max(...[...item.boundsByPath.values()].map((bounds) => bounds.max[1] - bounds.min[1])) * 1000),
+        Math.round(Math.max(...[...item.boundsByPath.values()].map((bounds) => bounds.max[2] - bounds.min[2])) * 1000),
+      ] as [number, number, number],
+      positionMm: item.positionMm,
+      properties: item.properties,
+    }))
+    .filter((item) => item.count > 0)
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+}
+
+function collectSceneGroups(parsed: ReturnType<typeof buildScene>): SceneGroup[] {
+  const grouped = new Map<string, {
+    name: string;
+    definitionName: string;
+    layer: string;
+    depth: number;
+    paths: Set<string>;
+    positionMm: [number, number, number];
+    min: Point;
+    max: Point;
+  }>();
+
+  for (const primitive of parsed.glbPrimitives) {
+    const metadata = parsed.meshIndex[primitive.geomName];
+    if (!metadata || metadata.path === "ROOT") continue;
+    const segments = metadata.path.split(" / ");
+    for (let index = 0; index < segments.length; index += 1) {
+      const path = segments.slice(0, index + 1).join(" / ");
+      const existing = grouped.get(path) ?? {
+        name: segments[index] || "Group",
+        definitionName: metadata.definitionName,
+        layer: metadata.layer,
+        depth: index,
+        paths: new Set<string>(),
+        positionMm: metadata.positionMm,
+        min: [Infinity, Infinity, Infinity] as Point,
+        max: [-Infinity, -Infinity, -Infinity] as Point,
+      };
+      if (metadata.path === path) {
+        existing.name = metadata.name || existing.name;
+        existing.definitionName = metadata.definitionName || existing.definitionName;
+        existing.layer = metadata.layer || existing.layer;
+        existing.positionMm = metadata.positionMm;
+      }
+      existing.paths.add(metadata.path);
+      for (let vertex = 0; vertex < primitive.positions.length; vertex += 3) {
+        existing.min[0] = Math.min(existing.min[0], primitive.positions[vertex]);
+        existing.min[1] = Math.min(existing.min[1], primitive.positions[vertex + 1]);
+        existing.min[2] = Math.min(existing.min[2], primitive.positions[vertex + 2]);
+        existing.max[0] = Math.max(existing.max[0], primitive.positions[vertex]);
+        existing.max[1] = Math.max(existing.max[1], primitive.positions[vertex + 1]);
+        existing.max[2] = Math.max(existing.max[2], primitive.positions[vertex + 2]);
+      }
+      grouped.set(path, existing);
+    }
+  }
+
+  return [...grouped.entries()]
+    .map(([path, group]) => ({
+      id: path,
+      path,
+      name: group.name,
+      definitionName: group.definitionName,
+      layer: group.layer,
+      depth: group.depth,
+      count: group.paths.size,
+      sizeMm: [
+        Math.round((group.max[0] - group.min[0]) * 1000),
+        Math.round((group.max[1] - group.min[1]) * 1000),
+        Math.round((group.max[2] - group.min[2]) * 1000),
+      ] as [number, number, number],
+      positionMm: group.positionMm,
+    }))
+    .filter((group) => group.count > 0)
+    .sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function collectSketchupEdges(model: SkpModel) {
+  const positions: number[] = [];
+  const visit = (definition: Definition, matrix: Matrix, stack: Set<number>) => {
+    const vertices = new Map(definition.vertices.map((vertex) => [vertex.id, [vertex.x, vertex.y, vertex.z] as Point]));
+    definition.edges.forEach((edge: Edge) => {
+      if (!isDrawableEdge(edge)) return;
+      const start = vertices.get(edge.v1Id);
+      const end = vertices.get(edge.v2Id);
+      if (!start || !end) return;
+      const a = toThreePoint(transformPoint(matrix, start));
+      const b = toThreePoint(transformPoint(matrix, end));
+      positions.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+    });
+    definition.instances.forEach((instance) => {
+      if (instance.hidden || stack.has(instance.refIdx)) return;
+      const child = model.definitions.get(instance.refIdx);
+      if (!child) return;
+      const nextStack = new Set(stack);
+      nextStack.add(instance.refIdx);
+      visit(child, multiplyMatrices(matrix, instance.matrix), nextStack);
+    });
+  };
+  visit(model.root, IDENTITY, new Set([model.root.id]));
+  return new Float32Array(positions);
+}
+
+function materialColor(definition: GltfMaterialDefinition | undefined) {
+  const factor = definition?.pbrMetallicRoughness?.baseColorFactor ?? [0.72, 0.73, 0.7, 1];
+  return { color: new THREE.Color(factor[0], factor[1], factor[2]), alpha: factor[3] ?? 1 };
+}
+
+function makeMaterials(definition: GltfMaterialDefinition | undefined, texture?: THREE.Texture | null) {
+  const { color, alpha } = materialColor(definition);
+  const transparent = definition?.alphaMode === "BLEND" || alpha < 0.999;
+  const mapProps = texture ? { map: texture } : {};
+  return {
+    shaded: new THREE.MeshLambertMaterial({ ...mapProps, color, flatShading: true, side: THREE.DoubleSide, transparent, opacity: alpha, depthWrite: !transparent }),
+    hiddenLine: new THREE.MeshBasicMaterial({ color: "#eeeae1", side: THREE.DoubleSide }),
+    monochrome: new THREE.MeshLambertMaterial({ color: "#dedbd0", flatShading: true, side: THREE.DoubleSide }),
+    wireframe: new THREE.MeshBasicMaterial({ color: "#566064", wireframe: true, side: THREE.DoubleSide }),
+    xray: new THREE.MeshBasicMaterial({ ...mapProps, color: "#aabfc0", side: THREE.DoubleSide, transparent: true, opacity: 0.34, depthWrite: false }),
+  };
+}
+
+function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, selectedInstallId, selectedGroupPath, onStats, onInstallationItems, onGroups, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "projection" | "viewPreset"> & { onReady: (root: THREE.Object3D) => void }) {
+  const { scene } = useThree();
+  const modelRef = useRef<THREE.Group | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    const textureUrls: string[] = [];
+    if (!buffer) return undefined;
+    onError(null);
+    onProgress(34);
+
+    const load = async () => {
+      try {
+        const model = parseSkp(buffer);
+        const parsed = buildScene(buffer, { frontSideOnly: true });
+        if (disposed) return;
+        onProgress(67);
+        const textureLoader = new THREE.TextureLoader();
+        const textureCache = new Map<number, THREE.Texture>();
+        const getTexture = async (index: number) => {
+          const existing = textureCache.get(index);
+          if (existing) return existing;
+          const textureInfo = parsed.textures?.[index];
+          if (!textureInfo?.data) return null;
+          const textureBytes = new Uint8Array(textureInfo.data.length);
+          textureBytes.set(textureInfo.data);
+          const url = URL.createObjectURL(new Blob([textureBytes.buffer], { type: textureInfo.mimeType }));
+          textureUrls.push(url);
+          try {
+            const texture = await textureLoader.loadAsync(url);
+            texture.colorSpace = THREE.SRGBColorSpace;
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            texture.anisotropy = 4;
+            textureCache.set(index, texture);
+            return texture;
+          } catch {
+            return null;
+          }
+        };
+
+        const root = new THREE.Group();
+        root.name = "SKP_NATIVE_STYLE_SCENE";
+        const materialVariants = new Map<number, ReturnType<typeof makeMaterials>>();
+        for (const primitive of parsed.glbPrimitives) {
+          if (disposed) return;
+          const geometry = new THREE.BufferGeometry();
+          geometry.setAttribute("position", new THREE.BufferAttribute(primitive.positions, 3));
+          geometry.setAttribute("normal", new THREE.BufferAttribute(primitive.normals, 3));
+          if (primitive.uvs?.length) geometry.setAttribute("uv", new THREE.BufferAttribute(primitive.uvs, 2));
+          geometry.setIndex(new THREE.BufferAttribute(primitive.indices, 1));
+          geometry.computeBoundingSphere();
+
+          let variants = materialVariants.get(primitive.materialIndex);
+          if (!variants) {
+            const definition = parsed.gltfMaterials?.[primitive.materialIndex] as GltfMaterialDefinition | undefined;
+            const textureIndex = definition?.pbrMetallicRoughness?.baseColorTexture?.index;
+            variants = makeMaterials(definition, textureIndex === undefined ? null : await getTexture(textureIndex));
+            materialVariants.set(primitive.materialIndex, variants);
+          }
+          const mesh = new THREE.Mesh(geometry, variants.shaded);
+          const metadata = parsed.meshIndex[primitive.geomName];
+          mesh.name = metadata?.name || primitive.geomName;
+          mesh.userData = {
+            isSkpMesh: true,
+            geomName: primitive.geomName,
+            layer: metadata?.layer || "Layer0",
+            installId: metadata ? installationId(metadata) : "",
+            groupPath: metadata?.path || "ROOT",
+            materialIndex: primitive.materialIndex,
+            variants,
+          };
+          root.add(mesh);
+        }
+
+        const edgePositions = collectSketchupEdges(model);
+        const edgeGeometry = new THREE.BufferGeometry();
+        edgeGeometry.setAttribute("position", new THREE.BufferAttribute(edgePositions, 3));
+        const edgeMaterial = new THREE.LineBasicMaterial({ color: "#4d5859", transparent: true, opacity: 0.78 });
+        const edges = new THREE.LineSegments(edgeGeometry, edgeMaterial);
+        edges.name = "SKP_VISIBLE_EDGES";
+        edges.userData = { edgeMaterial };
+        root.add(edges);
+        root.userData = { materialVariants, edgeMaterial, edges };
+
+        if (disposed) return;
+        scene.add(root);
+        modelRef.current = root;
+        onReady(root);
+        onInstallationItems(collectInstallationItems(parsed));
+        onGroups(collectSceneGroups(parsed));
+        onStats({
+          definitions: model.definitions.size,
+          layers: model.layers?.length ?? 0,
+          layerNames: model.layers?.map((layer) => layer.name) ?? [],
+          materials: model.materials?.length ?? 0,
+          primitives: parsed.glbPrimitives?.length ?? 0,
+          edges: edgePositions.length / 6,
+          scenes: model.pages?.length ?? 0,
+          bounds: parsed.bounds?.size,
+          version: model.version,
+        });
+        onProgress(100);
+      } catch (error) {
+        console.error(error);
+        onError("OpenSKP không thể phân tích file này.");
+      }
+    };
+    void load();
+
+    return () => {
+      disposed = true;
+      if (modelRef.current) {
+        scene.remove(modelRef.current);
+        modelRef.current.traverse((object) => {
+          if (object instanceof THREE.Mesh || object instanceof THREE.LineSegments) object.geometry.dispose();
+        });
+        const variants = modelRef.current.userData.materialVariants as Map<number, ReturnType<typeof makeMaterials>> | undefined;
+        variants?.forEach((items) => Object.values(items).forEach((material) => material.dispose()));
+        (modelRef.current.userData.edgeMaterial as THREE.Material | undefined)?.dispose();
+        modelRef.current = null;
+      }
+      textureUrls.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, [buffer, onError, onGroups, onInstallationItems, onProgress, onReady, onStats, scene]);
+
+  useEffect(() => {
+    const root = modelRef.current;
+    if (!root) return;
+    root.traverse((object) => {
+      if (!(object instanceof THREE.Mesh) || !object.userData.variants) return;
+      const variants = object.userData.variants as ReturnType<typeof makeMaterials>;
+      const materialKey = renderStyle === "hidden-line" ? "hiddenLine" : renderStyle;
+      object.material = variants[materialKey];
+      const layerVisible = activeLayer === "All layers" || object.userData.layer === activeLayer;
+      const installVisible = !selectedInstallId || object.userData.installId === selectedInstallId;
+      const meshGroupPath = String(object.userData.groupPath || "ROOT");
+      const groupVisible = !selectedGroupPath || meshGroupPath === selectedGroupPath || meshGroupPath.startsWith(`${selectedGroupPath} / `);
+      object.visible = layerVisible && installVisible && groupVisible;
+    });
+    const edges = root.userData.edges as THREE.LineSegments | undefined;
+    if (edges) {
+      edges.visible = showEdges && renderStyle !== "wireframe" && activeLayer === "All layers" && !selectedInstallId && !selectedGroupPath;
+      (edges.material as THREE.LineBasicMaterial).opacity = renderStyle === "hidden-line" ? 0.95 : renderStyle === "xray" ? 0.62 : 0.78;
+    }
+  }, [activeLayer, renderStyle, selectedGroupPath, selectedInstallId, showEdges]);
+
+  return null;
+}
+
+function FitCamera({ model, preset, projection, selectedInstallId, selectedGroupPath }: { model: THREE.Object3D | null; preset: "iso" | "front" | "top"; projection: Projection; selectedInstallId: string | null; selectedGroupPath: string | null }) {
+  const { camera } = useThree();
+  const controls = useRef<any>(null);
+
+  const frameModel = useCallback((nextPreset: "iso" | "front" | "top" = preset) => {
+    if (!model) return;
+    const box = new THREE.Box3();
+    model.traverse((object) => {
+      if (!(object instanceof THREE.Mesh) || !object.visible) return;
+      if (selectedInstallId && object.userData.installId !== selectedInstallId) return;
+      box.expandByObject(object);
+    });
+    if (box.isEmpty()) return;
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const maxSize = Math.max(size.x, size.y, size.z, 1);
+    const distance = maxSize * 1.75;
+    if (nextPreset === "top") camera.position.set(center.x, center.y + distance, center.z + 0.01);
+    else if (nextPreset === "front") camera.position.set(center.x, center.y + distance * 0.12, center.z + distance);
+    else camera.position.set(center.x + distance, center.y + distance * 0.72, center.z + distance);
+    if (camera instanceof THREE.OrthographicCamera) {
+      camera.zoom = Math.min(1.55 / maxSize, 1.8);
+      camera.near = 0.001;
+      camera.far = Math.max(distance * 100, 1000);
+    } else {
+      camera.near = Math.max(distance / 1000, 0.001);
+      camera.far = Math.max(distance * 100, 1000);
+    }
+    camera.updateProjectionMatrix();
+    controls.current?.target.copy(center);
+    controls.current?.update();
+  }, [camera, model, preset, selectedGroupPath, selectedInstallId]);
+
+  useEffect(() => frameModel(), [frameModel, projection]);
+
+  useEffect(() => {
+    const fit = () => frameModel();
+    const zoomIn = () => {
+      if (!model || !controls.current) return;
+      const target = controls.current.target as THREE.Vector3;
+      const nextPosition = camera.position.clone().sub(target).multiplyScalar(0.82).add(target);
+      camera.position.copy(nextPosition);
+      controls.current.update();
+    };
+    window.addEventListener("skp-fit-model", fit);
+    window.addEventListener("skp-zoom-in", zoomIn);
+    return () => {
+      window.removeEventListener("skp-fit-model", fit);
+      window.removeEventListener("skp-zoom-in", zoomIn);
+    };
+  }, [camera, frameModel, model]);
+
+  return <OrbitControls ref={controls} makeDefault enableDamping dampingFactor={0.06} minDistance={0.03} maxDistance={10000} screenSpacePanning />;
+}
+
+export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, renderStyle, projection, activeLayer, selectedInstallId, selectedGroupPath, viewPreset, onStats, onInstallationItems, onGroups, onProgress, onError }: Props) {
+  const [model, setModel] = useState<THREE.Object3D | null>(null);
+  const onReady = useCallback((root: THREE.Object3D) => setModel(root), []);
+
+  return (
+    <Canvas className="three-canvas" dpr={[1, 2]} camera={{ position: [5, 4, 5], fov: 38 }} gl={{ antialias: true, alpha: false }} onCreated={({ gl }) => {
+      gl.toneMapping = THREE.NoToneMapping;
+      gl.outputColorSpace = THREE.SRGBColorSpace;
+    }}>
+      {projection === "orthographic" ? <OrthographicCamera makeDefault position={[5, 4, 5]} zoom={1} /> : <PerspectiveCamera makeDefault position={[5, 4, 5]} fov={38} />}
+      <color attach="background" args={["#e4e8e6"]} />
+      <hemisphereLight args={["#ffffff", "#88918e", 0.66]} />
+      <ambientLight intensity={0.42} />
+      <directionalLight position={[5, 9, 6]} intensity={0.42} color="#fffdf6" />
+      {showGrid && <gridHelper args={[100, 100, "#aeb9b5", "#cbd2cf"]} position={[0, -0.015, 0]} />}
+      {showAxes && <axesHelper args={[2.6]} />}
+      <ModelLoader buffer={buffer} renderStyle={renderStyle} showEdges={showEdges} activeLayer={activeLayer} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} onStats={onStats} onInstallationItems={onInstallationItems} onGroups={onGroups} onProgress={onProgress} onError={onError} onReady={onReady} />
+      <FitCamera model={model} preset={viewPreset} projection={projection} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} />
+    </Canvas>
+  );
+}

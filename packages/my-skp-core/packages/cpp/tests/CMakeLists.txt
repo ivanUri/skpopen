@@ -1,0 +1,75 @@
+include(GoogleTest)
+
+add_executable(
+  openskp_tests
+  codegen_test.cpp
+  create_test.cpp
+  io_fidelity_test.cpp
+  native_compatibility_test.cpp
+  dxf_export_test.cpp
+  dxf_unicode_safety_test.cpp
+  edit_test.cpp
+  face_instance_hidden_test.cpp
+  fragments_export_test.cpp
+  geometry_test.cpp
+  glb_test.cpp
+  glb_textures_test.cpp
+  ifc_export_test.cpp
+  instanced_glb_test.cpp
+  arc_curves_test.cpp
+  definition_is_group_test.cpp
+  instance_scale_term_test.cpp
+  legacy_scenes_test.cpp
+  legacy_text_arrows_test.cpp
+  legacy_textured_colorize_test.cpp
+  legacy_empty_model_test.cpp
+  scene_without_camera_test.cpp
+  instanced_scene_test.cpp
+  json_export_test.cpp
+  layer_hidden_test.cpp
+  legacy_anchored_texts_test.cpp
+  legacy_dimension_paths_test.cpp
+  legacy_dimension_geometry_test.cpp
+  legacy_single_material_test.cpp
+  legacy_zero_material_custom_layer_test.cpp
+  legacy_v20_filler_test.cpp
+  legacy_v20_test.cpp
+  legacy_v3_format_test.cpp
+  legacy_v4_v5_v2019_test.cpp
+  legacy_v6_attribute_trailer_test.cpp
+  lowlevel_test.cpp
+  meta_units_test.cpp
+  obj_export_test.cpp
+  obj_material_names_test.cpp
+  observability_test.cpp
+  pages_dimensions_test.cpp
+  parser_limits_test.cpp
+  parser_test.cpp
+  ply_export_test.cpp
+  scene_test.cpp
+  stl_export_test.cpp
+  texture_test.cpp
+  triangulator_test.cpp
+  vff_layer_hidden_test.cpp
+  xml_entities_test.cpp
+  zip_entry_size_cap_test.cpp
+)
+
+target_link_libraries(openskp_tests PRIVATE OpenSkp::OpenSkp GTest::gtest_main)
+
+target_include_directories(
+  openskp_tests
+  PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${OPENSKP_MINIZ_INCLUDE_DIR}
+    ${miniz_SOURCE_DIR}
+    ${tinygltf_SOURCE_DIR}
+    ${flatbuffers_SOURCE_DIR}/include
+)
+
+target_compile_definitions(
+  openskp_tests
+  PRIVATE OPENSKP_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+)
+
+gtest_discover_tests(openskp_tests)
