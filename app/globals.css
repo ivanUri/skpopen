@@ -75,6 +75,7 @@ h1 { margin: 0; max-width: 190px; overflow: hidden; text-overflow: ellipsis; whi
 .stat-card strong { color: #334b4c; font: 500 17px 'DM Mono', monospace; }
 .section-count { color: #8a9696; font: 500 9px 'DM Mono', monospace; }
 .section-caption { margin: -3px 0 10px; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.model-meta-caption { margin-bottom: 10px; color: #819092; font: 8px 'DM Mono', monospace; }
 .export-installation { display: inline-flex; align-items: center; gap: 4px; padding: 5px 6px; border: 1px solid #c7d4d0; border-radius: 5px; background: #f6faf8; color: #4f6d6c; font: 500 8px 'DM Mono', monospace; }
 .export-installation:hover:not(:disabled) { background: #e2ece8; color: #2e5050; }
 .export-installation:disabled { cursor: not-allowed; opacity: .45; }
@@ -142,6 +143,7 @@ h1 { margin: 0; max-width: 190px; overflow: hidden; text-overflow: ellipsis; whi
 .group-selection-chip svg { flex: 0 0 auto; color: #4f8a6d; }
 .group-selection-chip span { color: #78908a; font: 8px 'DM Mono', monospace; letter-spacing: .08em; }
 .group-selection-chip strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+.model-dimension-label { display: block; padding: 3px 5px; border: 1px solid #e3b18d; border-radius: 4px; color: #774b30; background: rgba(255,246,238,.96); box-shadow: 0 3px 10px rgba(100,67,48,.14); font: 500 9px 'DM Mono', monospace; white-space: nowrap; }
 .measure-mode-chip { position: absolute; z-index: 20; left: 18px; top: 78px; display: flex; align-items: center; gap: 7px; max-width: min(390px, calc(100% - 36px)); padding: 7px 8px 7px 9px; border: 1px solid #e3b18d; border-radius: 6px; color: #774b30; background: rgba(255,246,238,.96); box-shadow: 0 5px 16px rgba(100,67,48,.12); }
 .measure-mode-chip > svg { flex: 0 0 auto; color: var(--accent); }
 .measure-mode-chip span { color: #a56b44; font: 8px 'DM Mono', monospace; letter-spacing: .08em; }
@@ -155,6 +157,17 @@ h1 { margin: 0; max-width: 190px; overflow: hidden; text-overflow: ellipsis; whi
 .entity-grid span { color: #8a9898; font-size: 9px; }
 .entity-grid strong { overflow: hidden; color: #526a6a; font: 500 9px 'DM Mono', monospace; text-overflow: ellipsis; white-space: nowrap; }
 .entity-path { display: block; margin-top: 8px; overflow: hidden; color: #9aa6a5; font: 8px 'DM Mono', monospace; text-overflow: ellipsis; white-space: nowrap; }
+.entity-properties { display: flex; flex-direction: column; gap: 5px; margin-top: 9px; padding: 9px; border: 1px solid #dde5e2; border-radius: 6px; background: #f8faf9; }
+.entity-properties > strong { color: #526a6a; font-size: 9px; }
+.entity-properties > span { display: flex; justify-content: space-between; gap: 10px; color: #718083; font: 8px 'DM Mono', monospace; }
+.entity-properties em { overflow: hidden; color: #98a5a3; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.annotation-toggle-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+.annotation-toggle-grid button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-height: 32px; border: 1px solid transparent; border-radius: 5px; background: #edf1ef; color: #718083; font-size: 9px; }
+.annotation-toggle-grid button:hover, .annotation-toggle-grid button.selected { border-color: #b8cac5; background: #e0ebe7; color: #365657; }
+.section-subtitle { margin: 14px 0 7px; color: #899696; font: 8px 'DM Mono', monospace; letter-spacing: .08em; text-transform: uppercase; }
+.section-plane-list { display: flex; flex-direction: column; gap: 3px; }
+.section-plane-list button { width: 100%; padding: 7px 8px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: #718083; text-align: left; font-size: 9px; }
+.section-plane-list button:hover, .section-plane-list button.selected { border-color: #e3b18d; background: #fff1e8; color: #774b30; }
 .empty-state { position: absolute; z-index: 4; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(420px, 90%); padding: 34px; border: 1px solid #c8d2cf; border-radius: 10px; text-align: center; background: rgba(249,251,250,.92); box-shadow: 0 20px 60px rgba(57, 70, 69, .14); }
 .empty-icon { width: 50px; height: 50px; display: grid; place-items: center; margin: 0 auto 18px; border: 1px solid #c5d0cd; border-radius: 10px; color: var(--blue); background: #eaf0ee; }
 .empty-state h2 { margin: 0 0 9px; font-size: 17px; }

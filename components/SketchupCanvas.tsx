@@ -1,11 +1,11 @@
 "use client";
 
-import { Line, OrthographicCamera, OrbitControls, PerspectiveCamera } from "@react-three/drei";
+import { Html, Line, OrthographicCamera, OrbitControls, PerspectiveCamera } from "@react-three/drei";
 import { Canvas, useThree } from "@react-three/fiber";
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
-import { buildScene, isDrawableEdge, parseSkp } from "skp-core-custom";
-import type { Definition, Edge, SkpModel } from "skp-core-custom";
+import { isDrawableEdge, parseSkpWithInstancedScene, parseSkpWithScene } from "skp-core-custom";
+import type { ConstructionLine, ConstructionPoint, Definition, Dimension, Edge, InstancedMeshResource, InstancedNode, InstancedScene, SectionPlane, SkpModel, SkpScene, TextEntity } from "skp-core-custom";
 
 export type RenderStyle = "shaded" | "hidden-line" | "monochrome" | "wireframe" | "xray";
 export type Projection = "perspective" | "orthographic";
@@ -53,6 +53,18 @@ export type PickedEntity = {
   sizeMm: [number, number, number];
   positionMm: [number, number, number];
   properties: Record<string, string>;
+  attributeDictionaries: Record<string, Record<string, string>>;
+};
+
+export type ModelInfo = {
+  units: string | null;
+  bounds: [number, number, number] | null;
+  dimensions: Dimension[];
+  sectionPlanes: SectionPlane[];
+  constructionLines: ConstructionLine[];
+  constructionPoints: ConstructionPoint[];
+  texts: TextEntity[];
+  hiddenLayers: string[];
 };
 
 type ModelStats = {
@@ -64,6 +76,10 @@ type ModelStats = {
   primitives: number;
   edges: number;
   scenes: number;
+  dimensions: number;
+  sectionPlanes: number;
+  guides: number;
+  units?: string | null;
   bounds?: [number, number, number];
 };
 
@@ -72,6 +88,8 @@ type Props = {
   showGrid: boolean;
   showEdges: boolean;
   showAxes: boolean;
+  showDimensions: boolean;
+  showGuides: boolean;
   renderStyle: RenderStyle;
   projection: Projection;
   fov: number;
@@ -80,6 +98,7 @@ type Props = {
   selectedInstallId: string | null;
   selectedGroupPath: string | null;
   activeScene: ScenePage | null;
+  activeSectionPlane: SectionPlane | null;
   measureMode: boolean;
   measurementPoints: Point[];
   viewPreset: "iso" | "front" | "top";
@@ -87,6 +106,7 @@ type Props = {
   onInstallationItems: (items: InstallationItem[]) => void;
   onGroups: (groups: SceneGroup[]) => void;
   onScenes: (scenes: ScenePage[]) => void;
+  onModelInfo: (info: ModelInfo) => void;
   onEntitySelect: (entity: PickedEntity | null) => void;
   onMeasurePoint: (point: Point) => void;
   onProgress: (value: number) => void;
@@ -155,11 +175,24 @@ function toThreePoint(point: Point): Point {
   return [point[0] * INCH_TO_METRE, point[2] * INCH_TO_METRE, -point[1] * INCH_TO_METRE];
 }
 
+function sectionPlaneToThree(section: SectionPlane) {
+  const [a, b, c, d] = section.plane;
+  const lengthSquared = a * a + b * b + c * c;
+  if (lengthSquared < 1e-12) return null;
+  const point = toScenePoint([
+    (-d * a) / lengthSquared,
+    (-d * b) / lengthSquared,
+    (-d * c) / lengthSquared,
+  ]);
+  const normal = new THREE.Vector3(a, c, -b).normalize();
+  return new THREE.Plane(normal, -normal.dot(point));
+}
+
 function installationId(metadata: { name?: string; definitionName?: string; layer?: string }) {
   return [metadata.name || "Component", metadata.definitionName || "", metadata.layer || "Layer0"].join("::");
 }
 
-function collectInstallationItems(parsed: ReturnType<typeof buildScene>): InstallationItem[] {
+function collectInstallationItems(parsed: SkpScene): InstallationItem[] {
   const grouped = new Map<string, { name: string; definitionName: string; layer: string; paths: Set<string>; boundsByPath: Map<string, { min: Point; max: Point }>; positionMm: [number, number, number]; properties: Record<string, string> }>();
   for (const primitive of parsed.glbPrimitives) {
     const metadata = parsed.meshIndex[primitive.geomName];
@@ -209,7 +242,7 @@ function collectInstallationItems(parsed: ReturnType<typeof buildScene>): Instal
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
 }
 
-function collectSceneGroups(parsed: ReturnType<typeof buildScene>): SceneGroup[] {
+function collectSceneGroups(parsed: SkpScene): SceneGroup[] {
   const grouped = new Map<string, {
     name: string;
     definitionName: string;
@@ -276,6 +309,116 @@ function collectSceneGroups(parsed: ReturnType<typeof buildScene>): SceneGroup[]
     .sort((a, b) => a.path.localeCompare(b.path));
 }
 
+function instancedNodeLabel(node: InstancedNode) {
+  return node.name || node.definitionName || "Group";
+}
+
+function instancedWorldBox(resource: InstancedMeshResource, world: THREE.Matrix4) {
+  const box = new THREE.Box3();
+  const point = new THREE.Vector3();
+  for (const primitive of resource.primitives) {
+    for (let index = 0; index < primitive.positions.length; index += 3) {
+      point.set(primitive.positions[index], primitive.positions[index + 1], primitive.positions[index + 2]).applyMatrix4(world);
+      box.expandByPoint(point);
+    }
+  }
+  return box;
+}
+
+function walkInstancedScene(scene: InstancedScene, callback: (node: InstancedNode, path: string, world: THREE.Matrix4) => void) {
+  const walk = (node: InstancedNode, parentPath: string, parentWorld: THREE.Matrix4) => {
+    const path = node.name === "ROOT" ? "ROOT" : parentPath === "ROOT" ? instancedNodeLabel(node) : `${parentPath} / ${instancedNodeLabel(node)}`;
+    const world = parentWorld.clone().multiply(new THREE.Matrix4().fromArray(node.matrix));
+    callback(node, path, world);
+    node.children.forEach((child) => walk(child, path, world));
+  };
+  walk(scene.sceneHierarchy, "ROOT", new THREE.Matrix4());
+}
+
+function collectInstancedInstallationItems(scene: InstancedScene): InstallationItem[] {
+  const resources = new Map(scene.meshResources.map((resource) => [resource.id, resource]));
+  const grouped = new Map<string, { name: string; definitionName: string; layer: string; paths: Set<string>; size: THREE.Vector3; positionMm: [number, number, number]; properties: Record<string, string> }>();
+  walkInstancedScene(scene, (node, path, world) => {
+    if (path === "ROOT" || !node.meshResourceId) return;
+    const resource = resources.get(node.meshResourceId);
+    if (!resource) return;
+    const id = installationId({ name: node.name || resource.definitionName, definitionName: node.definitionName || resource.definitionName, layer: node.layer });
+    const box = instancedWorldBox(resource, world);
+    const size = box.getSize(new THREE.Vector3());
+    const existing = grouped.get(id) ?? {
+      name: node.name || resource.definitionName || "Component",
+      definitionName: node.definitionName || resource.definitionName,
+      layer: node.layer || "Layer0",
+      paths: new Set<string>(),
+      size: new THREE.Vector3(),
+      positionMm: node.positionMm,
+      properties: node.properties || {},
+    };
+    existing.paths.add(path);
+    existing.size.max(size);
+    grouped.set(id, existing);
+  });
+  return [...grouped.entries()].map(([id, item]) => ({
+    id,
+    name: item.name,
+    definitionName: item.definitionName,
+    layer: item.layer,
+    count: item.paths.size,
+    sizeMm: [Math.round(item.size.x * 1000), Math.round(item.size.y * 1000), Math.round(item.size.z * 1000)] as [number, number, number],
+    positionMm: item.positionMm,
+    properties: item.properties,
+  })).sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+}
+
+function collectInstancedGroups(scene: InstancedScene): SceneGroup[] {
+  const resources = new Map(scene.meshResources.map((resource) => [resource.id, resource]));
+  const grouped = new Map<string, { name: string; definitionName: string; layer: string; depth: number; paths: Set<string>; min: THREE.Vector3; max: THREE.Vector3; positionMm: [number, number, number] }>();
+  walkInstancedScene(scene, (node, path, world) => {
+    if (path === "ROOT" || !node.meshResourceId) return;
+    const resource = resources.get(node.meshResourceId);
+    if (!resource) return;
+    const box = instancedWorldBox(resource, world);
+    const segments = path.split(" / ");
+    for (let index = 0; index < segments.length; index += 1) {
+      const groupPath = segments.slice(0, index + 1).join(" / ");
+      const existing = grouped.get(groupPath) ?? {
+        name: segments[index],
+        definitionName: node.definitionName || resource.definitionName,
+        layer: node.layer || "Layer0",
+        depth: index,
+        paths: new Set<string>(),
+        min: new THREE.Vector3(Infinity, Infinity, Infinity),
+        max: new THREE.Vector3(-Infinity, -Infinity, -Infinity),
+        positionMm: node.positionMm,
+      };
+      existing.paths.add(path);
+      existing.min.min(box.min);
+      existing.max.max(box.max);
+      if (groupPath === path) {
+        existing.name = node.name || existing.name;
+        existing.definitionName = node.definitionName || existing.definitionName;
+        existing.layer = node.layer || existing.layer;
+        existing.positionMm = node.positionMm;
+      }
+      grouped.set(groupPath, existing);
+    }
+  });
+  return [...grouped.entries()].map(([path, group]) => {
+    const size = group.max.clone().sub(group.min);
+    return {
+      id: path,
+      path,
+      name: group.name,
+      definitionName: group.definitionName,
+      layer: group.layer,
+      depth: group.depth,
+      count: group.paths.size,
+      sizeMm: [Math.round(size.x * 1000), Math.round(size.y * 1000), Math.round(size.z * 1000)] as [number, number, number],
+      positionMm: group.positionMm,
+    };
+  }).filter((group) => group.count > 0).sort((a, b) => a.path.localeCompare(b.path));
+}
+
 function collectSketchupEdges(model: SkpModel) {
   const positions: number[] = [];
   const visit = (definition: Definition, matrix: Matrix, stack: Set<number>) => {
@@ -320,7 +463,7 @@ function makeMaterials(definition: GltfMaterialDefinition | undefined, texture?:
   };
 }
 
-function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, onStats, onInstallationItems, onGroups, onScenes, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "onEntitySelect" | "onMeasurePoint"> & { onReady: (root: THREE.Object3D) => void }) {
+function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeSectionPlane, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "showDimensions" | "showGuides" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "onEntitySelect" | "onMeasurePoint" | "onModelInfo"> & { activeSectionPlane: SectionPlane | null; onModelInfo: (info: ModelInfo) => void; onReady: (root: THREE.Object3D) => void }) {
   const { scene } = useThree();
   const modelRef = useRef<THREE.Group | null>(null);
 
@@ -333,8 +476,7 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
 
     const load = async () => {
       try {
-        const model = parseSkp(buffer);
-        const parsed = buildScene(buffer, { frontSideOnly: true });
+        const { model, scene: parsed } = parseSkpWithScene(buffer, { frontSideOnly: true, respectEdgeVisibility: true });
         if (disposed) return;
         onProgress(67);
         const textureLoader = new THREE.TextureLoader();
@@ -392,6 +534,7 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
             definitionName: metadata?.definitionName || "",
             positionMm: metadata?.positionMm || [0, 0, 0],
             properties: metadata?.properties || {},
+            attributeDictionaries: metadata?.attributeDictionaries || {},
             displayName: metadata?.name || primitive.geomName,
             materialIndex: primitive.materialIndex,
             variants,
@@ -415,6 +558,16 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
         onReady(root);
         onInstallationItems(collectInstallationItems(parsed));
         onGroups(collectSceneGroups(parsed));
+        onModelInfo({
+          units: model.units,
+          bounds: parsed.bounds?.size ?? null,
+          dimensions: model.dimensions,
+          sectionPlanes: model.root.sectionPlanes,
+          constructionLines: model.root.constructionLines,
+          constructionPoints: model.root.constructionPoints,
+          texts: model.root.texts,
+          hiddenLayers: model.layers.filter((layer) => layer.hidden).map((layer) => layer.name),
+        });
         onScenes(model.pages.map((page) => ({
           name: page.name,
           eye: page.eye,
@@ -433,6 +586,10 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
           primitives: parsed.glbPrimitives?.length ?? 0,
           edges: edgePositions.length / 6,
           scenes: model.pages?.length ?? 0,
+          dimensions: model.dimensions.length,
+          sectionPlanes: model.root.sectionPlanes.length,
+          guides: model.root.constructionLines.length + model.root.constructionPoints.length,
+          units: model.units,
           bounds: parsed.bounds?.size,
           version: model.version,
         });
@@ -458,7 +615,7 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
       }
       textureUrls.forEach((url) => URL.revokeObjectURL(url));
     };
-  }, [buffer, onError, onGroups, onInstallationItems, onProgress, onReady, onScenes, onStats, scene]);
+  }, [buffer, onError, onGroups, onInstallationItems, onModelInfo, onProgress, onReady, onScenes, onStats, scene]);
 
   useEffect(() => {
     const root = modelRef.current;
@@ -468,6 +625,8 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
       const variants = object.userData.variants as ReturnType<typeof makeMaterials>;
       const materialKey = renderStyle === "hidden-line" ? "hiddenLine" : renderStyle;
       object.material = variants[materialKey];
+      const clippingPlane = activeSectionPlane ? sectionPlaneToThree(activeSectionPlane) : null;
+      (object.material as THREE.Material).clippingPlanes = clippingPlane ? [clippingPlane] : [];
       const layerVisible = !hiddenLayers.includes(String(object.userData.layer || "Layer0")) && (activeLayer === "All layers" || object.userData.layer === activeLayer);
       const installVisible = !selectedInstallId || object.userData.installId === selectedInstallId;
       const meshGroupPath = String(object.userData.groupPath || "ROOT");
@@ -477,9 +636,222 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
     const edges = root.userData.edges as THREE.LineSegments | undefined;
     if (edges) {
       edges.visible = showEdges && renderStyle !== "wireframe" && activeLayer === "All layers" && !selectedInstallId && !selectedGroupPath;
+      const clippingPlane = activeSectionPlane ? sectionPlaneToThree(activeSectionPlane) : null;
+      (edges.material as THREE.LineBasicMaterial).clippingPlanes = clippingPlane ? [clippingPlane] : [];
       (edges.material as THREE.LineBasicMaterial).opacity = renderStyle === "hidden-line" ? 0.95 : renderStyle === "xray" ? 0.62 : 0.78;
     }
-  }, [activeLayer, hiddenLayers, renderStyle, selectedGroupPath, selectedInstallId, showEdges]);
+  }, [activeLayer, activeSectionPlane, hiddenLayers, renderStyle, selectedGroupPath, selectedInstallId, showEdges]);
+
+  return null;
+}
+
+function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeSectionPlane, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "showDimensions" | "showGuides" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "onEntitySelect" | "onMeasurePoint" | "onModelInfo"> & { activeSectionPlane: SectionPlane | null; onModelInfo: (info: ModelInfo) => void; onReady: (root: THREE.Object3D) => void }) {
+  const { scene } = useThree();
+  const modelRef = useRef<THREE.Group | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    const textureUrls: string[] = [];
+    if (!buffer) return undefined;
+    onError(null);
+    onProgress(34);
+
+    const load = async () => {
+      try {
+        const { model, scene: parsed } = parseSkpWithInstancedScene(buffer, { frontSideOnly: true, respectEdgeVisibility: true });
+        if (disposed) return;
+        onProgress(67);
+        const textureLoader = new THREE.TextureLoader();
+        const textureCache = new Map<number, THREE.Texture>();
+        const getTexture = async (index: number) => {
+          const existing = textureCache.get(index);
+          if (existing) return existing;
+          const textureInfo = parsed.textures?.[index];
+          if (!textureInfo?.data) return null;
+          const textureBytes = new Uint8Array(textureInfo.data.length);
+          textureBytes.set(textureInfo.data);
+          const url = URL.createObjectURL(new Blob([textureBytes.buffer], { type: textureInfo.mimeType }));
+          textureUrls.push(url);
+          try {
+            const texture = await textureLoader.loadAsync(url);
+            texture.colorSpace = THREE.SRGBColorSpace;
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            texture.anisotropy = 4;
+            textureCache.set(index, texture);
+            return texture;
+          } catch {
+            return null;
+          }
+        };
+
+        const root = new THREE.Group();
+        root.name = "SKP_NATIVE_INSTANCED_SCENE";
+        const materialVariants = new Map<number, ReturnType<typeof makeMaterials>>();
+        const resourceGeometries = new Map<string, THREE.BufferGeometry[]>();
+        const resources = new Map(parsed.meshResources.map((resource) => [resource.id, resource]));
+        const getMaterialVariants = async (materialIndex: number) => {
+          const existing = materialVariants.get(materialIndex);
+          if (existing) return existing;
+          const definition = parsed.gltfMaterials?.[materialIndex] as GltfMaterialDefinition | undefined;
+          const textureIndex = definition?.pbrMetallicRoughness?.baseColorTexture?.index;
+          const variants = makeMaterials(definition, textureIndex === undefined ? null : await getTexture(textureIndex));
+          materialVariants.set(materialIndex, variants);
+          return variants;
+        };
+        const getResourceGeometries = (resource: InstancedMeshResource) => {
+          const existing = resourceGeometries.get(resource.id);
+          if (existing) return existing;
+          const geometries = resource.primitives.map((primitive) => {
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute("position", new THREE.BufferAttribute(primitive.positions, 3));
+            geometry.setAttribute("normal", new THREE.BufferAttribute(primitive.normals, 3));
+            if (primitive.uvs?.length) geometry.setAttribute("uv", new THREE.BufferAttribute(primitive.uvs, 2));
+            geometry.setIndex(new THREE.BufferAttribute(primitive.indices, 1));
+            geometry.computeBoundingSphere();
+            return geometry;
+          });
+          resourceGeometries.set(resource.id, geometries);
+          return geometries;
+        };
+        const addNode = async (node: InstancedNode, parent: THREE.Object3D, parentPath: string) => {
+          const path = node.name === "ROOT" ? "ROOT" : parentPath === "ROOT" ? instancedNodeLabel(node) : `${parentPath} / ${instancedNodeLabel(node)}`;
+          const nodeGroup = node.name === "ROOT" ? parent : new THREE.Group();
+          if (nodeGroup !== parent) {
+            nodeGroup.name = path;
+            nodeGroup.matrixAutoUpdate = false;
+            nodeGroup.matrix.fromArray(node.matrix);
+            parent.add(nodeGroup);
+          }
+          if (node.meshResourceId) {
+            const resource = resources.get(node.meshResourceId);
+            if (resource) {
+              const geometries = getResourceGeometries(resource);
+              for (let index = 0; index < resource.primitives.length; index += 1) {
+                const primitive = resource.primitives[index];
+                const mesh = new THREE.Mesh(geometries[index], (await getMaterialVariants(primitive.materialIndex)).shaded);
+                mesh.name = node.name || resource.definitionName || resource.id;
+                mesh.userData = {
+                  isSkpMesh: true,
+                  geomName: `${resource.id}:${index}`,
+                  layer: node.layer || "Layer0",
+                  installId: installationId({ name: node.name || resource.definitionName, definitionName: node.definitionName || resource.definitionName, layer: node.layer }),
+                  groupPath: path,
+                  definitionName: node.definitionName || resource.definitionName,
+                  positionMm: node.positionMm,
+                  properties: node.properties || {},
+                  attributeDictionaries: node.attributeDictionaries || {},
+                  displayName: node.name || resource.definitionName || resource.id,
+                  materialIndex: primitive.materialIndex,
+                  variants: await getMaterialVariants(primitive.materialIndex),
+                };
+                nodeGroup.add(mesh);
+              }
+            }
+          }
+          for (const child of node.children) await addNode(child, nodeGroup, path);
+        };
+        await addNode(parsed.sceneHierarchy, root, "ROOT");
+
+        const edgePositions = collectSketchupEdges(model);
+        const edgeGeometry = new THREE.BufferGeometry();
+        edgeGeometry.setAttribute("position", new THREE.BufferAttribute(edgePositions, 3));
+        const edgeMaterial = new THREE.LineBasicMaterial({ color: "#4d5859", transparent: true, opacity: 0.78 });
+        const edges = new THREE.LineSegments(edgeGeometry, edgeMaterial);
+        edges.name = "SKP_VISIBLE_EDGES";
+        root.add(edges);
+        root.userData = { materialVariants, edgeMaterial, edges, resourceGeometries };
+
+        if (disposed) return;
+        scene.add(root);
+        modelRef.current = root;
+        onReady(root);
+        onInstallationItems(collectInstancedInstallationItems(parsed));
+        onGroups(collectInstancedGroups(parsed));
+        onModelInfo({
+          units: model.units,
+          bounds: parsed.bounds?.size ?? null,
+          dimensions: model.dimensions,
+          sectionPlanes: model.root.sectionPlanes,
+          constructionLines: model.root.constructionLines,
+          constructionPoints: model.root.constructionPoints,
+          texts: model.root.texts,
+          hiddenLayers: model.layers.filter((layer) => layer.hidden).map((layer) => layer.name),
+        });
+        onScenes(model.pages.map((page) => ({
+          name: page.name,
+          eye: page.eye,
+          target: page.target,
+          up: page.up,
+          fov: page.fov,
+          parallel: page.parallel,
+          orthoHeight: page.orthoHeight,
+          hiddenLayers: page.hiddenLayers,
+        })));
+        onStats({
+          definitions: model.definitions.size,
+          layers: model.layers?.length ?? 0,
+          layerNames: model.layers?.map((layer) => layer.name) ?? [],
+          materials: model.materials?.length ?? 0,
+          primitives: parsed.meshResources.reduce((total, resource) => total + resource.primitives.length, 0),
+          edges: edgePositions.length / 6,
+          scenes: model.pages?.length ?? 0,
+          dimensions: model.dimensions.length,
+          sectionPlanes: model.root.sectionPlanes.length,
+          guides: model.root.constructionLines.length + model.root.constructionPoints.length,
+          units: model.units,
+          bounds: parsed.bounds?.size,
+        });
+        onProgress(100);
+      } catch (error) {
+        console.error(error);
+        onError("OpenSKP không thể phân tích file này.");
+      }
+    };
+    void load();
+
+    return () => {
+      disposed = true;
+      if (modelRef.current) {
+        scene.remove(modelRef.current);
+        const geometries = modelRef.current.userData.resourceGeometries as Map<string, THREE.BufferGeometry[]> | undefined;
+        geometries?.forEach((items) => items.forEach((geometry) => geometry.dispose()));
+        const variants = modelRef.current.userData.materialVariants as Map<number, ReturnType<typeof makeMaterials>> | undefined;
+        variants?.forEach((items) => Object.values(items).forEach((material) => material.dispose()));
+        (modelRef.current.userData.edgeMaterial as THREE.Material | undefined)?.dispose();
+        modelRef.current.traverse((object) => {
+          if (object instanceof THREE.LineSegments) object.geometry.dispose();
+        });
+        modelRef.current = null;
+      }
+      textureUrls.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, [buffer, onError, onGroups, onInstallationItems, onModelInfo, onProgress, onReady, onScenes, onStats, scene]);
+
+  useEffect(() => {
+    const root = modelRef.current;
+    if (!root) return;
+    root.traverse((object) => {
+      if (!(object instanceof THREE.Mesh) || !object.userData.variants) return;
+      const variants = object.userData.variants as ReturnType<typeof makeMaterials>;
+      const materialKey = renderStyle === "hidden-line" ? "hiddenLine" : renderStyle;
+      object.material = variants[materialKey];
+      const clippingPlane = activeSectionPlane ? sectionPlaneToThree(activeSectionPlane) : null;
+      (object.material as THREE.Material).clippingPlanes = clippingPlane ? [clippingPlane] : [];
+      const layerVisible = !hiddenLayers.includes(String(object.userData.layer || "Layer0")) && (activeLayer === "All layers" || object.userData.layer === activeLayer);
+      const installVisible = !selectedInstallId || object.userData.installId === selectedInstallId;
+      const meshGroupPath = String(object.userData.groupPath || "ROOT");
+      const groupVisible = !selectedGroupPath || meshGroupPath === selectedGroupPath || meshGroupPath.startsWith(`${selectedGroupPath} / `);
+      object.visible = layerVisible && installVisible && groupVisible;
+    });
+    const edges = root.userData.edges as THREE.LineSegments | undefined;
+    if (edges) {
+      edges.visible = showEdges && renderStyle !== "wireframe" && activeLayer === "All layers" && !selectedInstallId && !selectedGroupPath;
+      const clippingPlane = activeSectionPlane ? sectionPlaneToThree(activeSectionPlane) : null;
+      (edges.material as THREE.LineBasicMaterial).clippingPlanes = clippingPlane ? [clippingPlane] : [];
+      (edges.material as THREE.LineBasicMaterial).opacity = renderStyle === "hidden-line" ? 0.95 : renderStyle === "xray" ? 0.62 : 0.78;
+    }
+  }, [activeLayer, activeSectionPlane, hiddenLayers, renderStyle, selectedGroupPath, selectedInstallId, showEdges]);
 
   return null;
 }
@@ -530,6 +902,7 @@ function ModelPicker({ model, measureMode, onEntitySelect, onMeasurePoint }: { m
         sizeMm: [Math.round(size.x * 1000), Math.round(size.y * 1000), Math.round(size.z * 1000)],
         positionMm: (data.positionMm || [0, 0, 0]) as [number, number, number],
         properties: (data.properties || {}) as Record<string, string>,
+        attributeDictionaries: (data.attributeDictionaries || {}) as Record<string, Record<string, string>>,
       });
     };
     element.addEventListener("pointerdown", handleDown);
@@ -552,6 +925,51 @@ function MeasurementOverlay({ points }: { points: Point[] }) {
       </mesh>
     ))}
     {points.length === 2 && <Line points={points} color="#d47b48" lineWidth={3} dashed={false} />}
+  </>;
+}
+
+function formatMeasure(metres: number) {
+  if (metres >= 1) return `${metres.toFixed(2)} m`;
+  return `${Math.round(metres * 1000)} mm`;
+}
+
+function ModelAnnotations({ info, showDimensions, showGuides, activeSectionPlane }: { info: ModelInfo | null; showDimensions: boolean; showGuides: boolean; activeSectionPlane: SectionPlane | null }) {
+  if (!info) return null;
+  const section = activeSectionPlane ? sectionPlaneToThree(activeSectionPlane) : null;
+  const sectionSize = info.bounds ? Math.max(...info.bounds) * 1.35 : 4;
+  const sectionCenter = section ? section.normal.clone().multiplyScalar(-section.constant) : null;
+  const sectionQuaternion = section && sectionCenter ? new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), section.normal) : null;
+  return <>
+    {showDimensions && info.dimensions.filter((dimension) => !dimension.hidden && dimension.a && dimension.b).map((dimension, index) => {
+      const a = toScenePoint(dimension.a!);
+      const b = toScenePoint(dimension.b!);
+      const distance = a.distanceTo(b);
+      return <group key={`dimension-${index}`}>
+        <Line points={[a, b]} color="#d47b48" lineWidth={2} dashed={false} />
+        <mesh position={a}><sphereGeometry args={[0.018, 10, 10]} /><meshBasicMaterial color="#d47b48" /></mesh>
+        <mesh position={b}><sphereGeometry args={[0.018, 10, 10]} /><meshBasicMaterial color="#d47b48" /></mesh>
+        <Html position={a.clone().lerp(b, 0.5)} center distanceFactor={8} style={{ pointerEvents: "none" }}>
+          <span className="model-dimension-label">{dimension.text || formatMeasure(distance)}</span>
+        </Html>
+      </group>;
+    })}
+    {showGuides && info.constructionLines.map((line, index) => {
+      const center = toScenePoint(line.point);
+      const direction = new THREE.Vector3(line.direction[0], line.direction[2], -line.direction[1]).normalize();
+      const start = line.start ? toScenePoint(line.start) : center.clone().addScaledVector(direction, -5);
+      const end = line.end ? toScenePoint(line.end) : center.clone().addScaledVector(direction, 5);
+      return <Line key={`guide-line-${index}`} points={[start, end]} color="#7294a4" lineWidth={1} dashed dashSize={0.08} gapSize={0.05} />;
+    })}
+    {showGuides && info.constructionPoints.map((point, index) => (
+      <mesh key={`guide-point-${index}`} position={toScenePoint(point.position)}>
+        <sphereGeometry args={[0.035, 10, 10]} />
+        <meshBasicMaterial color="#7294a4" />
+      </mesh>
+    ))}
+    {section && sectionCenter && sectionQuaternion && <mesh position={sectionCenter} quaternion={sectionQuaternion}>
+      <planeGeometry args={[sectionSize, sectionSize]} />
+      <meshBasicMaterial color="#d47b48" transparent opacity={0.13} side={THREE.DoubleSide} depthWrite={false} />
+    </mesh>}
   </>;
 }
 
@@ -629,12 +1047,21 @@ function FitCamera({ model, preset, projection, fov, activeScene, selectedInstal
   return <OrbitControls ref={controls} makeDefault enableDamping dampingFactor={0.06} minDistance={0.03} maxDistance={10000} screenSpacePanning />;
 }
 
-export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, renderStyle, projection, fov, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeScene, measureMode, measurementPoints, viewPreset, onStats, onInstallationItems, onGroups, onScenes, onEntitySelect, onMeasurePoint, onProgress, onError }: Props) {
+export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, showDimensions, showGuides, renderStyle, projection, fov, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeScene, activeSectionPlane, measureMode, measurementPoints, viewPreset, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onEntitySelect, onMeasurePoint, onProgress, onError }: Props) {
   const [model, setModel] = useState<THREE.Object3D | null>(null);
+  const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
+  const useInstancedScene = Boolean(buffer && buffer.byteLength >= 8 * 1024 * 1024);
   const onReady = useCallback((root: THREE.Object3D) => setModel(root), []);
+  const handleModelInfo = useCallback((info: ModelInfo) => {
+    setModelInfo(info);
+    onModelInfo(info);
+  }, [onModelInfo]);
+  useEffect(() => {
+    if (!buffer) setModelInfo(null);
+  }, [buffer]);
 
   return (
-    <Canvas className="three-canvas" dpr={[1, 2]} camera={{ position: [5, 4, 5], fov: 38 }} gl={{ antialias: true, alpha: false }} onCreated={({ gl }) => {
+    <Canvas className="three-canvas" dpr={[1, 2]} camera={{ position: [5, 4, 5], fov: 38 }} gl={{ antialias: true, alpha: false, localClippingEnabled: true }} onCreated={({ gl }) => {
       gl.toneMapping = THREE.NoToneMapping;
       gl.outputColorSpace = THREE.SRGBColorSpace;
     }}>
@@ -645,9 +1072,10 @@ export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, 
       <directionalLight position={[5, 9, 6]} intensity={0.42} color="#fffdf6" />
       {showGrid && <gridHelper args={[100, 100, "#aeb9b5", "#cbd2cf"]} position={[0, -0.015, 0]} />}
       {showAxes && <axesHelper args={[2.6]} />}
-      <ModelLoader buffer={buffer} renderStyle={renderStyle} showEdges={showEdges} activeLayer={activeLayer} hiddenLayers={hiddenLayers} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} onStats={onStats} onInstallationItems={onInstallationItems} onGroups={onGroups} onScenes={onScenes} onProgress={onProgress} onError={onError} onReady={onReady} />
+      {useInstancedScene ? <InstancedModelLoader buffer={buffer} renderStyle={renderStyle} showEdges={showEdges} activeLayer={activeLayer} hiddenLayers={hiddenLayers} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} activeSectionPlane={activeSectionPlane} onStats={onStats} onInstallationItems={onInstallationItems} onGroups={onGroups} onScenes={onScenes} onModelInfo={handleModelInfo} onProgress={onProgress} onError={onError} onReady={onReady} /> : <ModelLoader buffer={buffer} renderStyle={renderStyle} showEdges={showEdges} activeLayer={activeLayer} hiddenLayers={hiddenLayers} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} activeSectionPlane={activeSectionPlane} onStats={onStats} onInstallationItems={onInstallationItems} onGroups={onGroups} onScenes={onScenes} onModelInfo={handleModelInfo} onProgress={onProgress} onError={onError} onReady={onReady} />}
       <ModelPicker model={model} measureMode={measureMode} onEntitySelect={onEntitySelect} onMeasurePoint={onMeasurePoint} />
       <MeasurementOverlay points={measurementPoints} />
+      <ModelAnnotations info={modelInfo} showDimensions={showDimensions} showGuides={showGuides} activeSectionPlane={activeSectionPlane} />
       <FitCamera model={model} preset={viewPreset} projection={projection} fov={fov} activeScene={activeScene} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} />
     </Canvas>
   );

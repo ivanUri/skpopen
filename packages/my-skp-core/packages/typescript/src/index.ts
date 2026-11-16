@@ -358,6 +358,43 @@ export function parseSkp(buffer: ArrayBuffer, options?: ParseOptions): SkpModel 
 }
 
 /**
+ * Parse a SketchUp file once and return both the lightweight model metadata
+ * and the baked render scene. This is the preferred entry point for viewers
+ * that need camera/pages, dimensions, layers and renderable geometry together.
+ *
+ * `parseSkp()` and `buildScene()` remain independent APIs for callers that
+ * only need one representation. Calling both separately reparses the source
+ * container; this combined helper shares the same raw parse and avoids that
+ * duplicate work.
+ */
+export function parseSkpWithScene(
+  buffer: ArrayBuffer,
+  options?: ParseOptions & SceneOptions,
+): { model: SkpModel; scene: SkpScene } {
+  const parsed = parseToRaw(buffer, options);
+  return {
+    model: buildModelFromParsed(parsed),
+    scene: buildSceneFromParsed(parsed, options),
+  };
+}
+
+/**
+ * Parse a SketchUp file once and return the model plus an instancing-preserving
+ * scene. Viewers can use this variant for files with many repeated components
+ * to avoid duplicating local vertex buffers for every placement.
+ */
+export function parseSkpWithInstancedScene(
+  buffer: ArrayBuffer,
+  options?: ParseOptions & SceneOptions,
+): { model: SkpModel; scene: InstancedScene } {
+  const parsed = parseToRaw(buffer, options);
+  return {
+    model: buildModelFromParsed(parsed),
+    scene: buildInstancedSceneFromParsed(parsed, options),
+  };
+}
+
+/**
  * Bake every instance actually placed in the model into world-space,
  * triangulated mesh data, ready for a GLB export or any other renderer.
  * See {@link buildSceneFromParsed} for the full explanation of why this is

@@ -24,7 +24,7 @@ import {
   Upload,
   ZoomIn,
 } from "lucide-react";
-import SketchupCanvas, { InstallationItem, PickedEntity, Projection, RenderStyle, SceneGroup, ScenePage } from "../components/SketchupCanvas";
+import SketchupCanvas, { InstallationItem, ModelInfo, PickedEntity, Projection, RenderStyle, SceneGroup, ScenePage } from "../components/SketchupCanvas";
 
 type ModelStats = {
   version?: string;
@@ -35,10 +35,14 @@ type ModelStats = {
   primitives: number;
   edges: number;
   scenes: number;
+  dimensions: number;
+  sectionPlanes: number;
+  guides: number;
+  units?: string | null;
   bounds?: [number, number, number];
 };
 
-const initialStats: ModelStats = { definitions: 0, layers: 0, materials: 0, primitives: 0, edges: 0, scenes: 0 };
+const initialStats: ModelStats = { definitions: 0, layers: 0, materials: 0, primitives: 0, edges: 0, scenes: 0, dimensions: 0, sectionPlanes: 0, guides: 0 };
 
 const renderStyles: { value: RenderStyle; label: string }[] = [
   { value: "shaded", label: "Shaded" },
@@ -73,6 +77,8 @@ export default function HomePage() {
   const [showGrid, setShowGrid] = useState(true);
   const [showEdges, setShowEdges] = useState(true);
   const [showAxes, setShowAxes] = useState(true);
+  const [showDimensions, setShowDimensions] = useState(true);
+  const [showGuides, setShowGuides] = useState(true);
   const [renderStyle, setRenderStyle] = useState<RenderStyle>("shaded");
   const [projection, setProjection] = useState<Projection>("perspective");
   const [fov, setFov] = useState(35);
@@ -84,6 +90,8 @@ export default function HomePage() {
   const [sceneGroups, setSceneGroups] = useState<SceneGroup[]>([]);
   const [scenes, setScenes] = useState<ScenePage[]>([]);
   const [activeSceneIndex, setActiveSceneIndex] = useState<number | null>(null);
+  const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
+  const [activeSectionPlaneIndex, setActiveSectionPlaneIndex] = useState<number | null>(null);
   const [selectedInstallId, setSelectedInstallId] = useState<string | null>(null);
   const [selectedGroupPath, setSelectedGroupPath] = useState<string | null>(null);
   const [selectedEntity, setSelectedEntity] = useState<PickedEntity | null>(null);
@@ -105,6 +113,8 @@ export default function HomePage() {
     setSceneGroups([]);
     setScenes([]);
     setActiveSceneIndex(null);
+    setModelInfo(null);
+    setActiveSectionPlaneIndex(null);
     setHiddenLayers([]);
     setMeasureMode(false);
     setMeasurementPoints([]);
@@ -156,6 +166,13 @@ export default function HomePage() {
   }, [activeLayer, layers]);
 
   const activeScene = activeSceneIndex === null ? null : scenes[activeSceneIndex] ?? null;
+  const activeSectionPlane = activeSectionPlaneIndex === null ? null : modelInfo?.sectionPlanes[activeSectionPlaneIndex] ?? null;
+
+  const handleModelInfo = useCallback((info: ModelInfo) => {
+    setModelInfo(info);
+    setHiddenLayers(info.hiddenLayers);
+    setActiveSectionPlaneIndex(info.sectionPlanes.length > 0 ? 0 : null);
+  }, []);
 
   const selectScene = useCallback((index: number) => {
     const scene = scenes[index];
@@ -244,7 +261,7 @@ export default function HomePage() {
                 <button onClick={() => { inputRef.current?.click(); setOpenMenu(null); }}><Upload size={14} /> Mở file SketchUp <span>⌘O</span></button>
                 <button disabled={installationItems.length === 0} onClick={() => { exportInstallationCsv(); setOpenMenu(null); }}><Download size={14} /> Xuất danh sách lắp đặt <span>CSV</span></button>
                 <div className="header-menu-divider" />
-                <button onClick={() => { setBuffer(null); setFile(null); setStats(initialStats); setActiveLayer("All layers"); setHiddenLayers([]); setInstallationItems([]); setSceneGroups([]); setScenes([]); setActiveSceneIndex(null); setSelectedInstallId(null); setSelectedGroupPath(null); setSelectedEntity(null); setMeasureMode(false); setMeasurementPoints([]); setError(null); setOpenMenu(null); }}><Box size={14} /> Đóng model</button>
+                <button onClick={() => { setBuffer(null); setFile(null); setStats(initialStats); setActiveLayer("All layers"); setHiddenLayers([]); setInstallationItems([]); setSceneGroups([]); setScenes([]); setActiveSceneIndex(null); setModelInfo(null); setActiveSectionPlaneIndex(null); setSelectedInstallId(null); setSelectedGroupPath(null); setSelectedEntity(null); setMeasureMode(false); setMeasurementPoints([]); setError(null); setOpenMenu(null); }}><Box size={14} /> Đóng model</button>
               </div>
             )}
           </div>
@@ -255,6 +272,8 @@ export default function HomePage() {
                 <button onClick={() => setShowGrid((value) => !value)}><Grid3X3 size={14} /> Lưới <span>{showGrid ? "Đang bật" : "Đang tắt"}</span></button>
                 <button onClick={() => setShowAxes((value) => !value)}><Scan size={14} /> Trục XYZ <span>{showAxes ? "Đang bật" : "Đang tắt"}</span></button>
                 <button onClick={() => setShowEdges((value) => !value)}><Eye size={14} /> SketchUp edges <span>{showEdges ? "Đang bật" : "Đang tắt"}</span></button>
+                <button onClick={() => setShowDimensions((value) => !value)}><Ruler size={14} /> Kích thước SketchUp <span>{showDimensions ? "Đang bật" : "Đang tắt"}</span></button>
+                <button onClick={() => setShowGuides((value) => !value)}><Scan size={14} /> Guide lines / points <span>{showGuides ? "Đang bật" : "Đang tắt"}</span></button>
                 <div className="header-menu-divider" />
                 {renderStyles.map((style) => (
                   <button key={style.value} className={renderStyle === style.value ? "menu-option-active" : ""} onClick={() => { setRenderStyle(style.value); setOpenMenu(null); }}><span className={`menu-style-dot menu-style-${style.value}`} /> {style.label} {renderStyle === style.value && <span>✓</span>}</button>
@@ -307,7 +326,7 @@ export default function HomePage() {
           <button className="rail-button active" title="Select"><MousePointer2 size={17} /></button>
           <button className="rail-button" title="Orbit"><Rotate3D size={17} /></button>
           <button className="rail-button" title="Pan"><Hand size={17} /></button>
-          <button className="rail-button" title="Measure"><Ruler size={17} /></button>
+          <button className={`rail-button ${measureMode ? "active" : ""}`} title="Measure" onClick={() => { setMeasureMode((value) => !value); setMeasurementPoints([]); setSelectedEntity(null); }}><Ruler size={17} /></button>
           <span className="rail-divider" />
           <button className={`rail-button ${showGrid ? "active" : ""}`} title="Grid" onClick={() => setShowGrid((value) => !value)}><Grid3X3 size={17} /></button>
         </div>
@@ -323,6 +342,7 @@ export default function HomePage() {
 
             <div className="sidebar-section stats-section">
               <div className="section-title-row"><span>Overview</span><Scan size={15} /></div>
+              <p className="section-caption model-meta-caption">{modelInfo?.units ? `Units: ${modelInfo.units}` : "Units: unknown"} · {stats.dimensions || 0} dimensions · {stats.sectionPlanes || 0} section planes</p>
               <div className="stats-grid">
                 <div className="stat-card"><span>Definitions</span><strong>{stats.definitions || "—"}</strong></div>
                 <div className="stat-card"><span>Materials</span><strong>{stats.materials || "—"}</strong></div>
@@ -399,6 +419,24 @@ export default function HomePage() {
               </div>
             </div>
 
+            <div className="sidebar-section annotations-section">
+              <div className="section-title-row"><span>SketchUp annotations</span><span className="section-count">{(modelInfo?.dimensions.length ?? 0) + (modelInfo?.constructionLines.length ?? 0) + (modelInfo?.constructionPoints.length ?? 0)}</span></div>
+              <p className="section-caption">Giữ lại kích thước và guide từ file gốc để thợ đối chiếu khi lắp đặt.</p>
+              <div className="annotation-toggle-grid">
+                <button className={showDimensions ? "selected" : ""} onClick={() => setShowDimensions((value) => !value)}><Ruler size={13} /> Dimensions</button>
+                <button className={showGuides ? "selected" : ""} onClick={() => setShowGuides((value) => !value)}><Scan size={13} /> Guides</button>
+              </div>
+              {(modelInfo?.sectionPlanes.length ?? 0) > 0 && <>
+                <div className="section-subtitle">Section planes</div>
+                <div className="section-plane-list">
+                  <button className={activeSectionPlaneIndex === null ? "selected" : ""} onClick={() => setActiveSectionPlaneIndex(null)}>Off</button>
+                  {modelInfo?.sectionPlanes.map((section, index) => (
+                    <button key={`${section.name}-${index}`} className={activeSectionPlaneIndex === index ? "selected" : ""} onClick={() => setActiveSectionPlaneIndex(index)}>{section.name || section.label || `Section ${index + 1}`}</button>
+                  ))}
+                </div>
+              </>}
+            </div>
+
             {selectedEntity && (
               <div className="sidebar-section entity-section">
                 <div className="section-title-row"><span>Entity info</span><span className="section-count">PICKED</span></div>
@@ -409,6 +447,8 @@ export default function HomePage() {
                   <span>Size</span><strong>{formatDimension(selectedEntity.sizeMm[0])} × {formatDimension(selectedEntity.sizeMm[1])} × {formatDimension(selectedEntity.sizeMm[2])}</strong>
                   <span>Position</span><strong>{Math.round(selectedEntity.positionMm[0])}, {Math.round(selectedEntity.positionMm[1])}, {Math.round(selectedEntity.positionMm[2])} mm</strong>
                 </div>
+                {Object.entries(selectedEntity.properties).length > 0 && <div className="entity-properties"><strong>Dynamic attributes</strong>{Object.entries(selectedEntity.properties).slice(0, 8).map(([key, value]) => <span key={key}><em>{key}</em>{value}</span>)}</div>}
+                {Object.entries(selectedEntity.attributeDictionaries).slice(0, 4).map(([dictionary, values]) => <div className="entity-properties" key={dictionary}><strong>{dictionary}</strong>{Object.entries(values).slice(0, 8).map(([key, value]) => <span key={key}><em>{key}</em>{value}</span>)}</div>)}
                 <small className="entity-path">{selectedEntity.groupPath}</small>
               </div>
             )}
@@ -471,6 +511,8 @@ export default function HomePage() {
             showGrid={showGrid}
             showEdges={showEdges}
             showAxes={showAxes}
+            showDimensions={showDimensions}
+            showGuides={showGuides}
             renderStyle={renderStyle}
             projection={projection}
             fov={fov}
@@ -479,6 +521,7 @@ export default function HomePage() {
             selectedInstallId={selectedInstallId}
             selectedGroupPath={selectedGroupPath}
             activeScene={activeScene}
+            activeSectionPlane={activeSectionPlane}
             measureMode={measureMode}
             measurementPoints={measurementPoints}
             viewPreset={viewPreset}
@@ -486,6 +529,7 @@ export default function HomePage() {
             onInstallationItems={setInstallationItems}
             onGroups={setSceneGroups}
             onScenes={setScenes}
+            onModelInfo={handleModelInfo}
             onEntitySelect={handleEntitySelect}
             onMeasurePoint={handleMeasurePoint}
             onProgress={setProgress}
@@ -522,7 +566,7 @@ export default function HomePage() {
           </div>
 
           <div className="viewport-status"><span>{projection === "perspective" ? "Perspective" : "Orthographic"}</span><span className="status-separator" /><span>{renderStyles.find((style) => style.value === renderStyle)?.label}</span><span className="status-separator" /><span>{activeLayer}</span><span className="status-separator" /><span className="status-ok">● Loaded</span></div>
-          <div className="statusbar"><span>Measurements: metres</span><span className="statusbar-divider" /><span>Orbit · Pan · Zoom</span><span className="statusbar-spacer" /><span className="axis-x">X</span><span className="axis-y">Y</span><span className="axis-z">Z</span></div>
+          <div className="statusbar"><span>Units: {modelInfo?.units ?? "metres"}</span><span className="statusbar-divider" /><span>Orbit · Pan · Zoom</span><span className="statusbar-spacer" /><span className="axis-x">X</span><span className="axis-y">Y</span><span className="axis-z">Z</span></div>
           {isDragging && <div className="drop-overlay"><FileUp size={27} /><strong>Thả để mở mô hình</strong></div>}
         </section>
       </div>
