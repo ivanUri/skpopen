@@ -24,7 +24,7 @@ import {
   Upload,
   ZoomIn,
 } from "lucide-react";
-import SketchupCanvas, { AbfVisibility, InstallationItem, ModelInfo, PickedEntity, Projection, RenderStyle, SceneGroup, ScenePage } from "../components/SketchupCanvas";
+import SketchupCanvas, { AbfPart, AbfVisibility, InstallationItem, ModelInfo, PickedEntity, Projection, RenderStyle, SceneGroup, ScenePage } from "../components/SketchupCanvas";
 
 type ModelStats = {
   version?: string;
@@ -609,6 +609,8 @@ export default function HomePage() {
             activeSectionPlane={activeSectionPlane}
             abfVisibility={abfVisibility}
             explodeFactor={explodeFactor}
+            selectedEntity={selectedEntity}
+            selectedAbfPart={selectedAbfPart}
             measureMode={measureMode}
             measurementPoints={measurementPoints}
             viewPreset={viewPreset}

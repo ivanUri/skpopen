@@ -167,6 +167,8 @@ type Props = {
   activeSectionPlane: SectionPlane | null;
   abfVisibility: AbfVisibility;
   explodeFactor: number;
+  selectedEntity: PickedEntity | null;
+  selectedAbfPart: AbfPart | null;
   measureMode: boolean;
   measurementPoints: Point[];
   viewPreset: "iso" | "front" | "top";
@@ -819,7 +821,7 @@ function makeMaterials(definition: GltfMaterialDefinition | undefined, texture?:
   };
 }
 
-function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeSectionPlane, abfVisibility, explodeFactor, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "showDimensions" | "showGuides" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "onEntitySelect" | "onMeasurePoint" | "onModelInfo"> & { activeSectionPlane: SectionPlane | null; onModelInfo: (info: ModelInfo) => void; onReady: (root: THREE.Object3D) => void }) {
+function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeSectionPlane, abfVisibility, explodeFactor, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "showDimensions" | "showGuides" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "onEntitySelect" | "onMeasurePoint" | "onModelInfo" | "selectedEntity" | "selectedAbfPart"> & { activeSectionPlane: SectionPlane | null; onModelInfo: (info: ModelInfo) => void; onReady: (root: THREE.Object3D) => void }) {
   const { scene } = useThree();
   const modelRef = useRef<THREE.Group | null>(null);
 
@@ -1008,7 +1010,7 @@ function ModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers
   return null;
 }
 
-function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeSectionPlane, abfVisibility, explodeFactor, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "showDimensions" | "showGuides" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "onEntitySelect" | "onMeasurePoint" | "onModelInfo"> & { activeSectionPlane: SectionPlane | null; onModelInfo: (info: ModelInfo) => void; onReady: (root: THREE.Object3D) => void }) {
+function InstancedModelLoader({ buffer, renderStyle, showEdges, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeSectionPlane, abfVisibility, explodeFactor, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onProgress, onError, onReady }: Omit<Props, "showGrid" | "showAxes" | "showDimensions" | "showGuides" | "projection" | "fov" | "activeScene" | "measureMode" | "measurementPoints" | "viewPreset" | "onEntitySelect" | "onMeasurePoint" | "onModelInfo" | "selectedEntity" | "selectedAbfPart"> & { activeSectionPlane: SectionPlane | null; onModelInfo: (info: ModelInfo) => void; onReady: (root: THREE.Object3D) => void }) {
   const { scene } = useThree();
   const modelRef = useRef<THREE.Group | null>(null);
 
@@ -1324,6 +1326,37 @@ function AbfLabelsOverlay({ model, visible, showNesting }: { model: THREE.Object
   return <>{labels.map((label) => <Html key={label.id} position={label.position} center distanceFactor={8} style={{ pointerEvents: "none" }}><span className="abf-board-label">{label.text}</span></Html>)}</>;
 }
 
+function SelectedAbfOverlay({ model, part }: { model: THREE.Object3D | null; part: AbfPart | null }) {
+  const marker = useMemo<{ position: THREE.Vector3; name: string } | null>(() => {
+    if (!model || !part) return null;
+    let result: { position: THREE.Vector3; name: string } | null = null;
+    model.updateMatrixWorld(true);
+    model.traverse((object) => {
+      if (result || !(object instanceof THREE.Mesh) || !object.userData.isSkpMesh) return;
+      const abf = object.userData.abf as AbfEntityInfo | null;
+      if (!abf?.boardIndex || abf.boardIndex !== part.boardIndex) return;
+      const box = new THREE.Box3().setFromObject(object);
+      if (box.isEmpty()) return;
+      const size = box.getSize(new THREE.Vector3());
+      result = { position: new THREE.Vector3(box.getCenter(new THREE.Vector3()).x, box.max.y + Math.max(size.y * 0.16, 0.08), box.getCenter(new THREE.Vector3()).z), name: part.name.replace(/^__\d+\.?\s*/, "") };
+    });
+    return result;
+  }, [model, part]);
+
+  if (!marker || !part) return null;
+  return <Html position={marker.position} center distanceFactor={7} style={{ pointerEvents: "none" }}>
+    <div className="selected-board-overlay">
+      <strong>#{part.boardIndex} · {marker.name}</strong>
+      <span>{part.material} · {formatOverlayDimension(part.sizeMm)}</span>
+      <span>{part.edgeBandTypes ? `Cạnh dán: ${part.edgeBandTypes}` : "Không có cạnh dán"}</span>
+    </div>
+  </Html>;
+}
+
+function formatOverlayDimension(size: [number, number, number]) {
+  return `${Math.round(size[0])} × ${Math.round(size[1])} × ${Math.round(size[2])} mm`;
+}
+
 function formatMeasure(metres: number) {
   if (metres >= 1) return `${metres.toFixed(2)} m`;
   return `${Math.round(metres * 1000)} mm`;
@@ -1443,7 +1476,7 @@ function FitCamera({ model, preset, projection, fov, activeScene, selectedInstal
   return <OrbitControls ref={controls} makeDefault enableDamping dampingFactor={0.06} minDistance={0.03} maxDistance={10000} screenSpacePanning />;
 }
 
-export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, showDimensions, showGuides, renderStyle, projection, fov, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeScene, activeSectionPlane, abfVisibility, explodeFactor, measureMode, measurementPoints, viewPreset, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onEntitySelect, onMeasurePoint, onProgress, onError }: Props) {
+export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, showDimensions, showGuides, renderStyle, projection, fov, activeLayer, hiddenLayers, selectedInstallId, selectedGroupPath, activeScene, activeSectionPlane, abfVisibility, explodeFactor, selectedEntity, selectedAbfPart, measureMode, measurementPoints, viewPreset, onStats, onInstallationItems, onGroups, onScenes, onModelInfo, onEntitySelect, onMeasurePoint, onProgress, onError }: Props) {
   const [model, setModel] = useState<THREE.Object3D | null>(null);
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
   const useInstancedScene = Boolean(buffer && buffer.byteLength >= 8 * 1024 * 1024);
@@ -1472,6 +1505,7 @@ export default function SketchupCanvas({ buffer, showGrid, showEdges, showAxes, 
       <ModelPicker model={model} measureMode={measureMode} onEntitySelect={onEntitySelect} onMeasurePoint={onMeasurePoint} />
       <MeasurementOverlay points={measurementPoints} />
       <AbfLabelsOverlay model={model} visible={abfVisibility.labels} showNesting={abfVisibility.nesting} />
+      <SelectedAbfOverlay model={model} part={selectedEntity ? selectedAbfPart : null} />
       <ModelAnnotations info={modelInfo} showDimensions={showDimensions} showGuides={showGuides} activeSectionPlane={activeSectionPlane} />
       <FitCamera model={model} preset={viewPreset} projection={projection} fov={fov} activeScene={activeScene} selectedInstallId={selectedInstallId} selectedGroupPath={selectedGroupPath} />
     </Canvas>

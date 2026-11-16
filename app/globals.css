@@ -194,6 +194,9 @@ h1 { margin: 0; max-width: 190px; overflow: hidden; text-overflow: ellipsis; whi
 .production-data-list > div strong { color: #365657; }
 .production-empty { margin: 0; padding: 7px; border: 1px dashed #cad6d2; border-radius: 5px; color: #899696; font-size: 8px; line-height: 1.5; }
 .abf-board-label { display: block; max-width: 180px; padding: 3px 5px; border: 1px solid #d4a07e; border-radius: 4px; color: #70452d; background: rgba(255,246,238,.95); box-shadow: 0 3px 10px rgba(100,67,48,.14); font: 500 8px 'DM Mono', monospace; white-space: nowrap; }
+.selected-board-overlay { display: flex; flex-direction: column; gap: 4px; min-width: 190px; max-width: 260px; padding: 9px 10px; border: 1px solid #8eafa4; border-radius: 7px; color: #526a6a; background: rgba(247,252,249,.97); box-shadow: 0 8px 24px rgba(42,70,65,.2); font: 8px 'DM Mono', monospace; }
+.selected-board-overlay strong { overflow: hidden; color: #2f5552; font: 700 10px 'Manrope', sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+.selected-board-overlay span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .entity-abf-properties { border-color: #c8ddd5; background: #f0f7f4; }
 .section-subtitle { margin: 14px 0 7px; color: #899696; font: 8px 'DM Mono', monospace; letter-spacing: .08em; text-transform: uppercase; }
 .section-plane-list { display: flex; flex-direction: column; gap: 3px; }
